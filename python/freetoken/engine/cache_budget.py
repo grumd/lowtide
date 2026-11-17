@@ -147,6 +147,13 @@ def prefill_reserve_bytes(prefill_reserve_gb: float | None, chunk_tokens: int) -
     return (256 << 20) + PREFILL_BYTES_PER_TOKEN * chunk_tokens
 
 
+def kv_session_pages(config) -> int:
+    """KV pages of every running request at full context: the most a KV pool that trades VRAM
+    with the experts ever backs. The prefixes of finished conversations stay cached only in
+    what the running requests leave free, so they never cost the experts more than that."""
+    return max(1, config.max_running_req) * div_ceil(config.max_seq_len, config.page_size)
+
+
 def plan_elastic_geometry(
     *,
     budget_bytes: int,

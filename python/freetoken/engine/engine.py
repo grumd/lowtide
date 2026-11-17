@@ -876,7 +876,8 @@ class Engine:
         """Elastic VRAM: size the virtual reservations of the expert banks and the KV pool from
         the VRAM free now, before either exists. The physical pool is settled in finalize()."""
         from freetoken.engine.cache_budget import (
-            PREFILL_BYTES_PER_TOKEN, expert_bytes_per_slot, plan_elastic_geometry, prefill_reserve_bytes,
+            PREFILL_BYTES_PER_TOKEN, expert_bytes_per_slot, kv_session_pages, plan_elastic_geometry,
+            prefill_reserve_bytes,
         )
         from freetoken.engine.elastic import ElasticVram
 
@@ -902,6 +903,7 @@ class Engine:
             max_slots=method.slot_limit() if method is not None else None,
             lendable_bytes=self._elastic_reserve if config.elastic_lend_after > 0 else 0,
         )
+        cap_pages = max(min_pages, min(cap_pages, kv_session_pages(config)))
         self.elastic = ElasticVram(
             self.device,
             min_pages=min_pages,
