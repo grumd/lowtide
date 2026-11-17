@@ -778,7 +778,8 @@ class CacheManager:
         if int((free_pages >= target).sum()) < active - target:
             in_use = torch.ones(active, dtype=torch.bool, device=self.device)
             in_use[free_pages.long()] = False
-            if self.is_hybrid:
+            # --kv-tier: a page's VRAM is only its index-slab rows, not worth moving GBs of host K/V
+            if self.is_hybrid and not getattr(getattr(el, "kv_pool", None), "tiered", False):
                 # move the prefix tree's pages above the target into free pages below it; it is
                 # their only owner here, while anything else above the target stays put
                 owned = torch.zeros(active, dtype=torch.bool, device=self.device)

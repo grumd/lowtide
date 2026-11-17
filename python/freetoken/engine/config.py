@@ -100,6 +100,11 @@ class EngineConfig:
     # workspace instead: every chunk is prefill_batch_max tokens.
     prefill_batch_min: int = 2048
     prefill_batch_max: int = 16384
+    # KV tiering (--kv-tier, QSA models): the K/V of the full-attention layers lives in pinned
+    # host RAM and VRAM keeps a cache of kv_tier_cells cells per layer that each decode selection
+    # is gathered into; prefill stages whole pages. The indexer keys stay in VRAM.
+    kv_tier: bool = False
+    kv_tier_cells: int = 32768
     # Prefix RAM tier (hybrid GDN models): pinned host RAM, total across TP ranks, that evicted
     # prefixes and their GDN snapshots spill to instead of being dropped; 0 disables it.
     cache_ram_gb: float = 0.0

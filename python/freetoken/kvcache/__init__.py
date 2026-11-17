@@ -109,6 +109,8 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             if config.cache_type == "swa_radix"
             else _naive_swa_num_tokens(config)
         )
+    from .qsa_pool import kv_tier_cells_for
+
     return create_kvcache_pool(
         model_config=model_config,
         num_pages=num_pages + 1,  # +1 for dummy page
@@ -117,6 +119,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        kv_tier_cells=kv_tier_cells_for(config),
     )
 
 
@@ -128,7 +131,10 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
+    kv_tier_cells: int = 0,
 ) -> BaseKVCachePool:
+    if kv_tier_cells and model_config.has_swa_attention:
+        raise ValueError("--kv-tier serves QSA (Qwen3.8-Flash-Next) pools only")
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
 
@@ -217,7 +223,10 @@ def create_kvcache_pool(
                 spec.index_ratio, QSAKVCache.speculative_depth(model_config)
             ),
             layer_ids=spec.layer_ids,
+            kv_tier_cells=kv_tier_cells,
         )
+    if kv_tier_cells:
+        raise ValueError("--kv-tier serves QSA (Qwen3.8-Flash-Next) pools only")
 
     if len(kv_specs) == 1 and kv_specs[0].mla:
         from .dsa_pool import DSAKVCache, KpoolDSAKVCache, MLAKVCache

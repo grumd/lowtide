@@ -326,6 +326,8 @@ class ElasticVram:
             for i in range(0, len(src), 256):  # bound the gather temporary
                 view[dst[i : i + 256]] = view[src[i : i + 256]]
         torch.cuda.synchronize(self.device)
+        if getattr(self.kv_pool, "tiered", False):
+            self.kv_pool.move_host_pages(src, dst)  # --kv-tier: the K/V pages are in host RAM
 
     def _resize(self, pages: int, slots: int, log: bool = True) -> None:
         t0 = time.perf_counter()
@@ -339,8 +341,15 @@ class ElasticVram:
             for t, row in self._banks:
                 t.set_required([(0, slots * row)])
         if pages != old_pages:
+            # --kv-tier: the K/V of these pages is host RAM, taken and given back with them, and
+            # the block cache uses what a pool this size can fill
+            tier_resize = getattr(self.kv_pool, "tier_resize", None)
+            if tier_resize is not None and pages < old_pages:
+                tier_resize(pages)
             for t, fn in self._kv:
                 t.set_required(fn(pages))
+            if tier_resize is not None and pages > old_pages:
+                tier_resize(pages)
         if slots > old_slots:
             for t, row in self._banks:
                 t.set_required([(0, slots * row)])
@@ -358,9 +367,10 @@ class ElasticVram:
         self.transitions += 1
         self.transition_ms += ms
         if log and (old_pages != pages or old_slots != slots):
+            host = getattr(self.kv_pool, "host_kv_bytes", 0)  # --kv-tier: this rank's K/V in host RAM
             logger.info_rank0(
-                f"elastic: kv {old_pages}->{pages} pages, experts "
-                f"{old_slots}->{slots} slots{f' ({moved} kept)' if moved else ''}, {ms:.1f} ms"
+                f"elastic: kv {old_pages}->{pages} pages{f' ({host / 2**30:.2f} GiB of host RAM)' if host else ''}, "
+                f"experts {old_slots}->{slots} slots{f' ({moved} kept)' if moved else ''}, {ms:.1f} ms"
             )
 
     def stats(self) -> dict:

@@ -17,6 +17,18 @@ import torch
 
 from .common import Fixture, requires_cuda, parsed_config, selection_spy
 
+
+@pytest.fixture(autouse=True)
+def _single_rank():
+    """These scenarios run on one rank. A TP size another test module left behind would send
+    every projection through an all-reduce of a process group nobody set up."""
+    import freetoken.distributed.info as info
+
+    saved = info._TP_INFO
+    info._TP_INFO = info.DistributedInfo(0, 1)
+    yield
+    info._TP_INFO = saved
+
 QSA_LAYER = 3
 
 
@@ -248,3 +260,195 @@ def test_two_qsa_layers_keep_separate_slab_slots(monkeypatch):
 
     slab = fixture.pool.cmp_k_cache
     assert not torch.equal(slab(0), slab(1))
+
+
+# ----- KV tiering (--kv-tier): host-RAM K/V + a VRAM block cache must be bit-identical -------
+# Two fixtures over the same weights, inputs and page allocation: the all-VRAM pool (main) and a
+# tiered pool whose block cache (2056 blocks = the minimum for 2 decode rows) is far smaller than
+# the 2 x ~7k-token contexts, so decode steps miss, evict and refill blocks.
+
+TIER_CELLS = 4 * 2056
+
+
+def _use(fixture: Fixture) -> None:
+    import freetoken.core as core
+
+    core._GLOBAL_CTX = fixture.ctx
+
+
+def _tier_pair(config, num_pages: int):
+    main = Fixture(config, num_pages=num_pages, max_running_req=2)
+    tier = Fixture(config, num_pages=num_pages, max_running_req=2, kv_tier_cells=TIER_CELLS)
+    assert tier.pool.tiered and not tier.pool.k_cache(QSA_LAYER).is_cuda
+    return main, tier
+
+
+def _run_both(attn, pair, x, reqs_of, phase: str):
+    outs = []
+    for fixture in pair:
+        _use(fixture)
+        outs.append(attn.forward(x, fixture.batch(reqs_of[id(fixture)], phase)))
+    return outs
+
+
+@requires_cuda
+@pytest.mark.parametrize("cut", [4096, 4000], ids=["chunk ends on a page", "chunk ends inside a page"])
+def test_kv_tier_prefill_and_decode_are_bit_identical(cut):
+    config = parsed_config()
+    pair = _tier_pair(config, num_pages=300)
+    main, tier = pair
+    attn = main.layer(QSA_LAYER)
+    lengths, steps = [7000, 5123], 10
+    inputs = _inputs(main, lengths, extra=steps)
+    reqs = {id(f): [f.req(i, 0, min(cut, n)) for i, n in enumerate(lengths)] for f in pair}
+
+    # chunked prefill: the second chunk stages the first chunk's pages from host RAM (and the
+    # page the two share), its own tokens device-side
+    head = torch.cat([row[: min(cut, n)] for row, n in zip(inputs, lengths)])
+    got, ref = _run_both(attn, pair, head, reqs, "prefill")
+    assert torch.equal(got, ref)
+    for f in pair:
+        reqs[id(f)] = [f.req(i, min(cut, n), n) for i, n in enumerate(lengths)]
+    tail = torch.cat([row[min(cut, n) : n] for row, n in zip(inputs, lengths)])
+    got, ref = _run_both(attn, pair, tail, reqs, "prefill")
+    assert torch.equal(got, ref)
+
+    for step in range(steps):
+        for f in pair:
+            for req in reqs[id(f)]:
+                f.step(req)
+        x = torch.stack([row[n + step] for row, n in zip(inputs, lengths)])
+        got, ref = _run_both(attn, pair, x, reqs, "decode")
+        assert torch.equal(got, ref), f"decode step {step} differs from the all-VRAM path"
+
+    counters = tier.pool.tier_counters()
+    assert counters["errors"] == 0
+    assert counters["misses"] > tier.pool.tier_slots, "the test never evicted a block"
+    assert counters["lookups"] > counters["misses"] > 0
+
+
+@requires_cuda
+def test_kv_tier_graph_replay_and_page_reuse_are_bit_identical():
+    """Captured decode over the tiered pool vs eager all-VRAM decode, then a request that
+    reuses the first request's pages (resident blocks of the old tenant) after it finishes."""
+    config = parsed_config()
+    pair = _tier_pair(config, num_pages=300)
+    main, tier = pair
+    attn = main.layer(QSA_LAYER)
+    lengths, steps = [6100, 3000], 6
+    bs = len(lengths)
+    inputs = _inputs(main, lengths, extra=2 * steps)
+    reqs = {id(f): [f.req(i, 0, n) for i, n in enumerate(lengths)] for f in pair}
+    x0 = torch.cat([row[:n] for row, n in zip(inputs, lengths)])
+    got, ref = _run_both(attn, pair, x0, reqs, "prefill")
+    assert torch.equal(got, ref)
+
+    # eager decode first, so blocks are resident when the graph starts
+    for step in range(steps):
+        for f in pair:
+            for req in reqs[id(f)]:
+                f.step(req)
+        x = torch.stack([row[n + step] for row, n in zip(inputs, lengths)])
+        got, ref = _run_both(attn, pair, x, reqs, "decode")
+        assert torch.equal(got, ref)
+
+    _use(tier)
+    tier.backend.init_capture_graph(max_seq_len=tier.page_table.shape[1], bs_list=[bs])
+    dummy = SimpleNamespace(
+        table_idx=tier.num_req_slots - 1, cached_len=1, device_len=2, extend_len=1
+    )
+    dummy_slot = tier.page_table[tier.num_req_slots - 1, 0].item()  # the dummy page
+    static = {
+        "x": torch.zeros(bs, config.hidden_size, device=tier.device, dtype=tier.dtype),
+        "positions": torch.zeros(bs, dtype=torch.int32, device=tier.device),
+        "out_loc": torch.full((bs,), dummy_slot, dtype=torch.int32, device=tier.device),
+    }
+    capture_batch = SimpleNamespace(
+        padded_reqs=[dummy] * bs, reqs=[dummy] * bs, phase="decode", size=bs, padded_size=bs,
+        is_prefill=False, is_decode=True, positions=static["positions"],
+        out_loc=static["out_loc"], attn_metadata=None, active_table_idx=None,
+    )
+    tier.backend.prepare_for_capture(capture_batch)
+    attn.forward(static["x"], capture_batch)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_out = attn.forward(static["x"], capture_batch)
+    torch.cuda.synchronize()
+
+    for step in range(steps, 2 * steps):
+        x = torch.stack([row[n + step] for row, n in zip(inputs, lengths)])
+        _use(main)
+        for req in reqs[id(main)]:
+            main.step(req)
+        ref = attn.forward(x, main.batch(reqs[id(main)], "decode"))
+        _use(tier)
+        for req in reqs[id(tier)]:
+            tier.step(req)
+        batch = tier.batch(reqs[id(tier)], "decode")
+        static["x"].copy_(x)
+        static["positions"].copy_(batch.positions)
+        static["out_loc"].copy_(batch.out_loc)
+        tier.backend.prepare_for_replay(batch)
+        graph.replay()
+        assert torch.equal(captured_out, ref), f"tiered graph replay diverged at step {step}"
+
+    # request 0 finishes; a new request in its table row reuses its pages (its blocks are
+    # still resident) with new content
+    for f in pair:
+        used = f.page_table[0, : reqs[id(f)][0].device_len : f.page_size] // f.page_size
+        f._free = used.tolist() + f._free
+    fresh = _inputs(main, [2500], extra=steps, seed=99)[0]
+    new = {id(f): [f.req(0, 0, 2500)] for f in pair}
+    got, ref = _run_both(attn, pair, fresh[:2500], new, "prefill")
+    assert torch.equal(got, ref)
+    for step in range(steps):
+        for f in pair:
+            f.step(new[id(f)][0])
+        got, ref = _run_both(attn, pair, fresh[2500 + step][None], new, "decode")
+        assert torch.equal(got, ref), f"page reuse: decode step {step} differs"
+    assert tier.pool.tier_counters()["errors"] == 0
+
+
+@requires_cuda
+def test_kv_tier_speculative_windows_gather_and_overwrite():
+    """An MTP / n-gram verify is a prefill-shaped forward of a few rows per request: it gathers
+    into the block cache like a decode step instead of staging the whole history. Its rejected
+    rows are written again at the same positions by the next window, and the cache copy of a
+    resident block has to follow the host copy."""
+    config = parsed_config()
+    window, rounds = 3, 14
+    cells = 4 * 2 * (2 * window) * (2048 // 4 + 2)  # two requests' windows, twice over
+    main = Fixture(config, num_pages=520, max_running_req=2)
+    tier = Fixture(config, num_pages=520, max_running_req=2, kv_tier_cells=cells)
+    pair = (main, tier)
+    assert tier.backend._tier_gather_rows == 2 * window
+    attn = main.layer(QSA_LAYER)
+    lengths = [15000, 12000]
+    inputs = _inputs(main, lengths)
+    reqs = {id(f): [f.req(i, 0, n) for i, n in enumerate(lengths)] for f in pair}
+    got, ref = _run_both(attn, pair, torch.cat(inputs), reqs, "prefill")  # staged
+    assert torch.equal(got, ref)
+    assert tier.pool.tier_counters()["lookups"] == 0, "a long chunk must not go through the cache"
+
+    generator = torch.Generator(device=main.device).manual_seed(5)
+    ends, backed = list(lengths), list(lengths)
+    for step in range(rounds):
+        x = torch.randn(2 * window, config.hidden_size, device=main.device, dtype=main.dtype,
+                        generator=generator) * 0.5
+        for f in pair:
+            rows = []
+            for i, end in enumerate(ends):
+                f.allocate(i, backed[i], max(backed[i], end + window))
+                rows.append(SimpleNamespace(table_idx=i, cached_len=end, device_len=end + window,
+                                            extend_len=window))
+            reqs[id(f)] = rows
+        backed = [max(b, end + window) for b, end in zip(backed, ends)]
+        got, ref = _run_both(attn, pair, x, reqs, "prefill")
+        assert torch.equal(got, ref), f"window {step} differs from the all-VRAM path"
+        # the verify accepts 1..window rows; the rest are overwritten by the next window
+        ends = [end + 1 + (step + i) % window for i, end in enumerate(ends)]
+
+    counters = tier.pool.tier_counters()
+    assert counters["errors"] == 0
+    assert counters["lookups"] > counters["misses"] > 0

@@ -99,8 +99,7 @@ class MHAKVCache(BaseKVCachePool):
             self._num_layers = map_size
         self.elastic = _TIER_ALLOC is not None
         page_bytes = page_size * local_kv_heads * head_dim * dtype.itemsize
-        self._kv_buffer = alloc_tier(
-            "kv",
+        self._kv_buffer = self._alloc_kv_buffer(
             (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
             dtype,
             device,
@@ -111,6 +110,9 @@ class MHAKVCache(BaseKVCachePool):
         self._v_buffer = self._kv_buffer[1]
         self._device = device
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
+
+    def _alloc_kv_buffer(self, shape, dtype, device, intervals) -> torch.Tensor:
+        return alloc_tier("kv", shape, dtype, device, intervals)
 
     def rebuild(self, num_pages: int) -> None:
         """Reallocate the KV buffer for ``num_pages`` pages IN PLACE.

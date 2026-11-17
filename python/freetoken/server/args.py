@@ -1027,6 +1027,23 @@ def parse_args(
         ),
     )
     elastic_group.add_argument(
+        "--kv-tier",
+        action="store_true",
+        default=ServerArgs.kv_tier,
+        help=(
+            "Qwen3.8-Flash-Next: keep the K/V of the full-attention layers in pinned host RAM "
+            "(~24 KiB per token, taken as the context grows) and only a block cache "
+            "of --kv-tier-cells cells per layer in VRAM; the indexer keys stay in VRAM. Frees the "
+            "VRAM the KV would take for experts. Not with --cache-ram-gb."
+        ),
+    )
+    elastic_group.add_argument(
+        "--kv-tier-cells",
+        type=int,
+        default=ServerArgs.kv_tier_cells,
+        help="With --kv-tier: VRAM block-cache cells (tokens) per full-attention layer.",
+    )
+    elastic_group.add_argument(
         "--prefill-reserve-gb",
         type=float,
         default=ServerArgs.prefill_reserve_gb,
@@ -1145,19 +1162,6 @@ def parse_args(
     )
 
     parser.add_argument(
-        "--moe-prefill-hit-d2d",
-        action="store_true",
-        dest="moe_prefill_hit_d2d",
-        default=ServerArgs.moe_prefill_hit_d2d,
-        help=(
-            "During prefill prefetch, copy cache-resident experts device-side into "
-            "the double buffer and stream only the misses over PCIe "
-            "(cudaMemcpyBatchAsync, CUDA >= 13.0). Effective with "
-            "--moe-cache-size > 2 * num_experts."
-        ),
-    )
-
-    parser.add_argument(
         "--moe-vram-only",
         action="store_true",
         dest="moe_vram_only",
@@ -1169,6 +1173,19 @@ def parse_args(
             "The expert cache itself and its sizing are unchanged; host RAM in use follows the "
             "cache size and how long experts stay cached (a cache that turns over every request "
             "saves nothing and loses nothing). Needs an FTW checkpoint and --moe-prefill-hit-d2d."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-prefill-hit-d2d",
+        action="store_true",
+        dest="moe_prefill_hit_d2d",
+        default=ServerArgs.moe_prefill_hit_d2d,
+        help=(
+            "During prefill prefetch, copy cache-resident experts device-side into "
+            "the double buffer and stream only the misses over PCIe "
+            "(cudaMemcpyBatchAsync, CUDA >= 13.0). Effective with "
+            "--moe-cache-size > 2 * num_experts."
         ),
     )
 

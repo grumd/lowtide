@@ -216,3 +216,175 @@ def test_resolve_pool_class_and_factory():
 
     with pytest.raises(ValueError, match="num_req_slots"):
         create_kvcache_pool(mc, num_pages=4, page_size=64, dtype=torch.bfloat16, device=DEV)
+
+
+# --------------------------------------------------------------------- KV tiering (--kv-tier)
+
+
+def _tier_config(spec, *, cells=16384, max_running_req=3):
+    config = _config(spec, max_running_req=max_running_req)
+    config.kv_tier, config.kv_tier_cells = True, cells
+    config.max_seq_len, config.num_page_override = 1 << 18, None
+    return config
+
+
+def test_tiered_kv_cost_pages_only_the_index_slab():
+    from freetoken.engine.cache_budget import kv_session_pages
+    from freetoken.kvcache.qsa_pool import kv_tier_cells_for
+
+    spec = _spec()
+    config = _tier_config(spec)
+    per_page, fixed, _, _ = QSAKVCache.kv_cost(config)
+    row = 32 * 4 * 2
+    # the slab rows and the prefill staging buffer (one layer's K/V): the K/V pages are host RAM
+    stage = (spec_kv_bytes_per_token(spec, config) - row // 4) // spec.num_layers
+    assert per_page == (row // 4 + stage) * 64
+    slots = 16384 // 4
+    cache = (spec_kv_bytes_per_token(spec, config) - row // 4) * 16384
+    state = 4 * 4 * (6 * slots + 16) + 4 * 4 * kv_session_pages(config) * 16
+    assert fixed == 4 * row * (QSAKVCache.ring_capacity_for(4) + 1) + cache + state + stage * 64
+    # host RAM holds every running request's full context, and the pool never backs more
+    assert kv_session_pages(config) == config.max_running_req * (1 << 18) // 64
+    assert QSAKVCache.solve_num_pages(config, 1 << 40) == kv_session_pages(config)
+    # a cache too small for two decode selections of every running request is raised
+    assert kv_tier_cells_for(_tier_config(spec, cells=4096)) == 4 * 2 * 3 * (2048 // 4 + 2)
+    config.kv_tier = False
+    assert kv_tier_cells_for(config) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned host memory needs CUDA")
+def test_tiered_pool_keeps_kv_in_host_ram():
+    pool = QSAKVCache(
+        num_kv_heads=2, num_layers=8, head_dim=64, num_pages=4, page_size=64,
+        dtype=torch.bfloat16, device=torch.device("cuda"), index_head_dim=32, num_index_layers=4,
+        index_ratio=4, num_req_slots=4, layer_ids=(1, 3, 5, 7), kv_tier_cells=4096,
+    )
+    assert pool.tiered and pool.tier_slots == 1024
+    host_k, _ = pool.host_kv(3)
+    assert not host_k.is_cuda and host_k.is_pinned() and host_k.shape == (4, 64, 2, 64)
+    assert torch.count_nonzero(pool._kv_buffer) == 0
+    cache_k, _ = pool.tier_cache(3)
+    assert cache_k.is_cuda and cache_k.shape == (1024, 4, 2, 64)
+    # VRAM per token: the slab and the staging buffer (K and V of one layer)
+    assert pool.unit_bytes()[0] == 32 * 4 * 2 // 4 + 2 * host_k[0, 0].numel() * host_k.element_size()
+    assert pool.tier_stage().is_cuda and pool.tier_stage().shape == (2, 5, 64, 2, 64)
+    assert len(pool.page_views()) == 1  # the slab; the host pages move in move_host_pages
+
+    # write-through: a resident block's slot mirrors the host copy
+    state = pool.tier_state(3)
+    state["map"][16 + 2] = 7  # page 1, block 2 -> slot 7
+    k = torch.randn(3, 2 * 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    loc = torch.tensor([64 + 9, 64 + 10, 128], dtype=torch.int32, device="cuda")
+    pool.store_kv(k, v, loc, 3)
+    torch.cuda.synchronize()
+    assert torch.equal(host_k.view(-1, 128)[loc.long().cpu()], k.cpu())
+    assert torch.equal(cache_k[7, 1:3].reshape(2, 128), k[:2])
+    assert torch.count_nonzero(cache_k[torch.arange(1024) != 7]) == 0
+
+    pool.move_host_pages(torch.tensor([1]), torch.tensor([3]))
+    assert torch.equal(host_k[3], host_k[1])
+    assert int((pool.tier_state(3)["map"] >= 0).sum()) == 0  # residency starts over
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned host memory needs CUDA")
+def test_elastic_tiered_pool_backs_host_kv_with_its_pages(monkeypatch):
+    from freetoken.kvcache.mha_pool import elastic_tier_allocator
+    from freetoken.moe import host_banks
+
+    def vram_tier(role, shape, dtype, intervals):
+        return torch.zeros(shape, dtype=dtype, device="cuda")
+
+    with elastic_tier_allocator(vram_tier):
+        pool = QSAKVCache(
+            num_kv_heads=2, num_layers=8, head_dim=64, num_pages=8 + 1, page_size=64,
+            dtype=torch.bfloat16, device=torch.device("cuda"), index_head_dim=32, num_index_layers=4,
+            index_ratio=4, num_req_slots=4, layer_ids=(1, 3, 5, 7), kv_tier_cells=4096,
+        )
+    page = 64 * 2 * 64 * 2 * 2 * 4  # one page of K and V over the four layers
+    assert pool.elastic and pool.host_kv_bytes == page  # the dummy page only
+    host_k, host_v = pool.host_kv(5)
+
+    def write(page_id):
+        k = torch.randn(64, 2 * 64, device="cuda", dtype=torch.bfloat16)
+        loc = torch.arange(64, dtype=torch.int32, device="cuda") + page_id * 64
+        pool.store_kv(k, -k, loc, 5)
+        torch.cuda.synchronize()
+        assert torch.equal(host_k[page_id].view(64, 128), k.cpu()) and torch.equal(host_v[page_id].view(64, 128), -k.cpu())
+
+    pool.back_host_pages(2)
+    assert pool.host_kv_bytes == 3 * page
+    write(0), write(1), write(8)  # 8 is the dummy page
+    pool.back_host_pages(6)
+    assert pool._host_backed == [(0, 2), (2, 6)] and pool.host_kv_bytes == 7 * page
+    write(5)
+    kept = host_k[1].clone()
+    pool.back_host_pages(3)  # a range goes back only as a whole
+    assert pool._host_backed == [(0, 2), (2, 6)]
+    pool.back_host_pages(2)
+    assert pool._host_backed == [(0, 2)] and pool.host_kv_bytes == 3 * page
+    assert torch.equal(host_k[1], kept)
+    pool.back_host_pages(8)
+    assert pool._host_backed == [(0, 2), (2, 8)]
+    assert torch.count_nonzero(host_k[5]) == 0  # released RAM comes back zeroed
+    write(5), write(7)
+    pool.back_host_pages(100)  # never past the dummy page
+    assert pool._host_backed == [(0, 2), (2, 8)]
+
+    pool.back_host_pages(2)
+    monkeypatch.setattr(host_banks, "host_ram_headroom", lambda: 0)
+    with pytest.raises(host_banks.HostRamShort, match="--kv-tier"):
+        pool.back_host_pages(4)
+    assert pool._host_backed == [(0, 2)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned host memory needs CUDA")
+def test_elastic_tiered_pool_uses_as_much_block_cache_as_it_has_blocks():
+    from freetoken.kernel.kv_tier import kv_tier_resolve
+    from freetoken.kvcache.mha_pool import elastic_tier_allocator
+
+    asked = {}
+
+    def vram_tier(role, shape, dtype, intervals):
+        asked[role] = intervals
+        return torch.zeros(shape, dtype=dtype, device="cuda")
+
+    with elastic_tier_allocator(vram_tier):
+        pool = QSAKVCache(
+            num_kv_heads=2, num_layers=8, head_dim=64, num_pages=96 + 1, page_size=64,
+            dtype=torch.bfloat16, device=torch.device("cuda"), index_head_dim=32, num_index_layers=4,
+            index_ratio=4, num_req_slots=4, layer_ids=(1, 3, 5, 7), kv_tier_cells=8192,
+        )
+    block = 4 * 2 * 64 * 2
+    # the cache is mapped block for block with the pool: 16 blocks a page, 2,048 slots at most
+    assert [b - a for a, b in asked["tier_cache"](64)] == [1024 * block] * 8
+    assert [b - a for a, b in asked["tier_cache"](96)] == [1536 * block] * 8
+    assert [b - a for a, b in asked["tier_cache"](4096)] == [2048 * block] * 8
+    assert [a for a, _ in asked["tier_cache"](64)] == [run * 2048 * block for run in range(8)]
+
+    state = pool.tier_state(3)
+    table = torch.arange(96, dtype=torch.int32, device="cuda")[None]
+    req = torch.zeros(2, dtype=torch.int32, device="cuda")
+
+    def resolve(first_block: int) -> int:
+        tokens = torch.arange(first_block * 4, (first_block + 1024) * 4, dtype=torch.int32, device="cuda")
+        kv_tier_resolve(tokens.view(2, -1).contiguous(), table, req, 97, 64, 4, state)
+        torch.cuda.synchronize()
+        assert pool.tier_counters()["errors"] == 0
+        return int(state["ctl"][2])
+
+    pool.tier_resize(64)
+    assert resolve(0) == 1024  # every block of the pool misses once and finds a slot among the first 1,024
+    placed = state["map"][:1024]
+    assert int(placed.min()) == 0 and int(placed.max()) == 1023 and placed.unique().numel() == 1024
+    assert int(state["slot_block"][1024:].max()) == -1
+    assert resolve(0) == 0
+
+    pool.tier_resize(96)
+    assert resolve(512) == 512  # blocks 1,024..1,535 are new; the cache has 1,536 slots now
+    assert int(state["map"].max()) <= 1535 and int(state["slot_block"][1536:].max()) == -1
+
+    pool.tier_resize(64)  # a smaller cache starts over
+    assert int(state["map"].max()) == -1 and int(state["ctl"][10]) == 1024
+    assert resolve(0) == 1024 and int(state["map"].max()) == 1023
+

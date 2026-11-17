@@ -27,6 +27,13 @@ Addressing: the engine pins ``page_size == 64`` (this backend's ``page_sizes``),
 64] // 64`` names both the K/V page and, viewed as ``page_size // index_ratio`` compressed
 rows, the block's slab page. Decode stages that table plus the live lengths and table_idx into
 static buffers (``prepare_for_replay``) so the whole path is CUDA-graph capturable.
+
+KV tiering (a tiered pool, ``--kv-tier``): the K/V pages are in pinned host RAM. A decode step
+makes every block of the selection resident in the VRAM block cache (``kernel/kv_tier.py``:
+resolve, which also translates the selection into cache cells, then copy the misses) and runs
+the same attend kernel over the cache; a prefill chunk stages the pages its selection reads into
+a VRAM buffer and attends over that with a remapped block table. Either way the kernel sees the same K/V values in the same
+column order as the all-VRAM path, so the output is bit-identical.
 """
 
 from __future__ import annotations
@@ -88,6 +95,8 @@ class QSASparseMetadata(BaseAttnMetadata):
     cmp_rows:         torch.Tensor | None = None  # [T] int32, compressed slab destination
     ring_rows:        torch.Tensor | None = None  # [T] int32, flat ring row or -1
     positions:        torch.Tensor | None = None  # [T] int32, logical query positions
+    # --kv-tier prefill: (source pages, staged block table, staging buffer, page count)
+    tier_plan:        tuple | None = None
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -129,6 +138,37 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._idx_slot = {lid: i for i, lid in enumerate(group.layer_ids)}
         self.rotary_config = group.rotary_config
         self._index_cos_sin: torch.Tensor | None = None
+
+        self.tiered = bool(getattr(self.kvcache, "tiered", False))
+        if self.tiered:
+            slots = self.kvcache.tier_slots
+            # A forward of up to this many query rows (a decode step, a speculative verify or
+            # draft window, a short prompt) gathers its selection into the block cache, which
+            # holds it twice over, so the CLOCK always finds victims. A longer one is a prefill
+            # chunk that reads most of the history anyway: it stages whole pages.
+            self._tier_gather_rows = slots // (2 * (self.block_topk + 2))
+            rows = max(1, self.kvcache.num_req_slots - 1)
+            if self._tier_gather_rows < rows:
+                raise ValueError(
+                    f"--kv-tier: {slots} cache blocks cannot hold two decode selections of "
+                    f"{rows} rows; raise --kv-tier-cells"
+                )
+            # the attend kernel's block table over the cache: cache cell // index_ratio is the slot
+            self._tier_ident = torch.arange(slots, dtype=torch.int32, device=self.device)[None]
+            self._tier_decode_steps = 0
+            self._tier_logged = None
+            self._tier_log_every = int(os.getenv("FREETOKEN_KVTIER_LOG_EVERY", "256"))
+            # FREETOKEN_KVTIER_STAGE_LOG=1 (debug, syncs): pages staged against pages in the history
+            self._tier_stage_log = os.getenv("FREETOKEN_KVTIER_STAGE_LOG", "0") == "1"
+            self._tier_staged = [0, 0]
+            self._tier_verify = os.getenv("FREETOKEN_KVTIER_VERIFY", "0") == "1"
+            self._tier_verify_stats = [0, 0]  # calls, mismatches
+            logger.info(
+                f"qsa_sparse: KV tiering on, {slots * self.ratio} VRAM cells per layer "
+                f"({slots} blocks, forwards of up to {self._tier_gather_rows} rows gather into them), "
+                f"K/V of {self.kvcache.k_cache(group_first(config)).shape[0]} "
+                f"pages in host RAM{', VERIFY mode' if self._tier_verify else ''}"
+            )
 
         self._block_topk_kernel = _resolve_block_topk()
         # decode staging (static buffers under CUDA graphs; eager decode snapshots per step)
@@ -193,6 +233,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             kv_len_cpu=kv_len,
         )
         batch.attn_metadata = md
+        if self.tiered:
+            self._tier_count_step(is_decode)
         if not is_decode:
             table_idx = torch.tensor([r.table_idx for r in reqs], **_CPU_PINNED)
             token_to_req = torch.repeat_interleave(
@@ -284,6 +326,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
         self._update_index_cache(index, md, slot)
         indices = self._select(index, md, slot)
+        if self.tiered:
+            return self._tiered_attention(q, k, v, batch.out_loc, indices, md, layer_id)
         return qsa_sparse_paged_attention(
             q,
             self.kvcache.k_cache(layer_id),
@@ -293,6 +337,217 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.token_to_req,
             torch.empty_like(q),
         )
+
+    # ----- KV tiering -----------------------------------------------------------------------
+    def _tiered_attention(self, q, k, v, out_loc, indices, md: QSASparseMetadata, layer_id: int) -> torch.Tensor:
+        from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
+
+        if q.shape[0] <= self._tier_gather_rows:
+            cells = self._tier_gather(indices, md, layer_id)
+            cache_k, cache_v = self.kvcache.tier_cache(layer_id)
+            table = self._tier_ident.expand(md.block_table.shape[0], -1)
+            out = qsa_sparse_paged_attention(
+                q, cache_k, cache_v, cells, table, md.token_to_req, torch.empty_like(q)
+            )
+        else:
+            stage_k, stage_v, table = self._tier_stage(indices, md, layer_id, k, v, out_loc)
+            out = qsa_sparse_paged_attention(
+                q, stage_k, stage_v, indices, table, md.token_to_req, torch.empty_like(q)
+            )
+            if os.getenv("FREETOKEN_KVTIER_UNION") == "1":
+                self._tier_union_stat(indices, md, table, layer_id)
+        if self._tier_verify and not torch.cuda.is_current_stream_capturing():
+            self._tier_verify_layer(q, indices, md, layer_id, out)
+        return out
+
+    def _tier_selection(self, indices, md: QSASparseMetadata, layer_id: int) -> tuple:
+        num_pages = self.kvcache.k_cache(layer_id).shape[0]
+        return (indices, md.block_table, md.token_to_req, num_pages, self.page_size, self.ratio)
+
+    def _tier_gather(self, indices, md: QSASparseMetadata, layer_id: int) -> torch.Tensor:
+        """A few query rows: make their selection resident and translate it to cache cells (one
+        launch), then copy the misses in."""
+        from freetoken.kernel.kv_tier import kv_tier_copy_rows, kv_tier_resolve
+
+        state = self.kvcache.tier_state(layer_id)
+        cells = self._scratch("tier_cells", indices.shape[0], self.select_width, dtype=torch.int32)
+        kv_tier_resolve(*self._tier_selection(indices, md, layer_id), state, cells)
+        host_k, host_v = self.kvcache.host_kv(layer_id)
+        cache_k, cache_v = self.kvcache.tier_cache(layer_id)
+        kv_tier_copy_rows(
+            host_k, host_v, cache_k, cache_v,
+            cache_k[0].numel() * cache_k.element_size(),
+            state["miss_block"],
+            anchor=state["map"],
+            dst_rows=state["miss_slot"],
+            count=state["ctl"][2:3],
+        )
+        return cells
+
+    def _tier_stage(self, indices, md: QSASparseMetadata, layer_id: int, k, v, out_loc):
+        """A prefill chunk: the pages of each request's [0, kvlen) that this layer's selection
+        reads, from host RAM into one VRAM buffer laid out in logical order (a page nobody reads
+        keeps whatever its row held). The chunk's own tokens (``k``/``v`` at ``out_loc``, stored
+        to host just before) are copied into the buffer device-side, and a page that holds
+        nothing else is not read back over PCIe. The layout and the buffer are shared by the
+        forward's QSA layers; which pages cross PCIe is each layer's own. A short turn on a long
+        context reads a few percent of it."""
+        from freetoken.kernel.kv_tier import kv_tier_copy_rows, kv_tier_mark_pages
+
+        host_k, host_v = self.kvcache.host_kv(layer_id)
+        size = self.page_size
+        if md.tier_plan is None:
+            lens = md.kv_len_cpu.tolist()
+            npages = [-(-int(n) // size) for n in lens]
+            total = sum(npages)
+            table = torch.full_like(md.block_table, -1)
+            # tokens each staged page holds: a full page, but for the last one of a request
+            holds = torch.full((max(total, 1),), size, dtype=torch.int32, device=self.device)
+            sources, base = [], 0
+            for row, n in enumerate(npages):
+                if n:
+                    sources.append(md.block_table[row, :n])
+                    table[row, :n] = torch.arange(
+                        base, base + n, dtype=torch.int32, device=self.device
+                    )
+                    base += n
+                    holds[base - 1 : base].fill_(int(lens[row]) - (n - 1) * size)
+            src = (
+                torch.cat(sources).contiguous()
+                if sources
+                else torch.zeros(1, dtype=torch.int32, device=self.device)
+            )
+            # the pool's staging buffer; page `total`, one more than is staged, takes the rows
+            # stored outside every staged page
+            stage = self.kvcache.tier_stage()
+            rows = torch.arange(max(total, 1), dtype=torch.int32, device=self.device)
+            own = from_host = None
+            if total:
+                # where each of the chunk's own tokens sits in the buffer, and the pages that
+                # hold a token from before the chunk: only those are read from host RAM
+                loc = out_loc.long()
+                staged = torch.full((host_k.shape[0],), total, dtype=torch.int64, device=self.device)
+                staged[src.long()] = rows.long()
+                own = staged[loc // size] * size + loc % size
+                mine = torch.zeros(total + 1, dtype=torch.int32, device=self.device)
+                mine.index_add_(0, own // size, torch.ones_like(own, dtype=torch.int32))
+                from_host = (mine[:total] != holds).to(torch.int32)
+            md.tier_plan = (src, table, stage, total, rows, own, from_host)
+        src, table, stage, total, rows, own, from_host = md.tier_plan
+        if total:
+            # compact the pages that are read to the front of the copy list; no host sync
+            used = torch.zeros(total, dtype=torch.int32, device=self.device)
+            kv_tier_mark_pages(indices, table, md.token_to_req, size, used)
+            used = used * from_host
+            rank = torch.cumsum(used, 0, dtype=torch.int32)
+            count = rank[-1:].contiguous()
+            slot = torch.where(used != 0, rank - 1, total).long()
+            dst = torch.zeros(total + 1, dtype=torch.int32, device=self.device).scatter_(0, slot, rows)[:total]
+            kv_tier_copy_rows(
+                host_k, host_v, stage[0], stage[1],
+                host_k[0].numel() * host_k.element_size(),
+                src[dst.long()],
+                anchor=table,
+                dst_rows=dst,
+                count=count,
+                grid=min(total, 1024),
+                threads=256,
+            )
+            stage[0].view(stage.shape[1] * size, -1).index_copy_(0, own, k.reshape(k.shape[0], -1))
+            stage[1].view(stage.shape[1] * size, -1).index_copy_(0, own, v.reshape(v.shape[0], -1))
+            if self._tier_stage_log:
+                self._tier_staged[0] += int(count)
+                self._tier_staged[1] += total
+                if layer_id == max(self._idx_slot):
+                    logger.info(
+                        f"kv-tier stage: {indices.shape[0]} rows staged {self._tier_staged[0]} of "
+                        f"{self._tier_staged[1]} pages over the forward's QSA layers"
+                    )
+                    self._tier_staged = [0, 0]
+        return stage[0], stage[1], table
+
+    def _tier_union_stat(self, indices, md: QSASparseMetadata, table, layer_id: int) -> None:
+        """FREETOKEN_KVTIER_UNION=1 (debug): how many of the staged pages (and indexer blocks) the
+        chunk's selection actually reads, summed over the forward's QSA layers (syncs)."""
+        total_pages = int(md.tier_plan[3])
+        valid = indices >= 0
+        req = md.token_to_req.long()[:, None].expand_as(indices)[valid]
+        tok = indices[valid].long()
+        staged = table.long()[req, tok // self.page_size]
+        pages = torch.unique(staged).numel()
+        blocks = torch.unique(staged * (self.page_size // self.ratio) + (tok % self.page_size) // self.ratio).numel()
+        acc = getattr(md, "_union_acc", [0, 0, 0, 0])
+        acc = [acc[0] + pages, acc[1] + total_pages, acc[2] + blocks, acc[3] + total_pages * (self.page_size // self.ratio)]
+        md._union_acc = acc
+        if layer_id == max(self._idx_slot):
+            logger.info(
+                f"kv-tier union: {md.qo_indptr_cpu[-1].item()} rows read {100 * acc[0] / max(1, acc[1]):.1f}% "
+                f"of the staged pages, {100 * acc[2] / max(1, acc[3]):.1f}% of the blocks "
+                f"({total_pages} pages staged per layer)"
+            )
+
+    def _tier_count_step(self, is_decode: bool) -> None:
+        """Log the block-cache counters every FREETOKEN_KVTIER_LOG_EVERY decode steps and at
+        the first prefill after a decode (each read syncs, so not every step)."""
+        if torch.cuda.is_current_stream_capturing():
+            return
+        if is_decode:
+            self._tier_decode_steps += 1
+            if not self._tier_log_every or self._tier_decode_steps % self._tier_log_every:
+                return
+        elif not self._tier_decode_steps or self._tier_logged == self._tier_decode_steps:
+            return
+        now = self.kvcache.tier_counters()
+        now["steps"] = self._tier_decode_steps
+        last = self._tier_logged_counts if self._tier_logged is not None else None
+        self._tier_logged = self._tier_decode_steps
+        self._tier_logged_counts = now
+        delta = {k: now[k] - (last[k] if last else 0) for k in ("misses", "lookups", "calls", "steps")}
+        steps = max(1, delta["steps"])
+        hit = 100.0 * (1 - delta["misses"] / max(1, delta["lookups"]))
+        block_mb = self.kvcache.tier_cache(group_first_layer(self))[0][0].numel() * 2 * 2 / 2**20
+        logger.info(
+            f"kv-tier: {delta['steps']} decode steps, block hit rate {hit:.2f}% "
+            f"({delta['misses'] / steps:.1f} misses = {delta['misses'] / steps * block_mb:.2f} MiB "
+            f"per step, {delta['lookups'] / steps:.0f} lookups per step)"
+            + (f", ERROR FLAGS {now['errors']}" if now["errors"] else "")
+            + (
+                f"; verify: {self._tier_verify_stats[0]} layer calls, "
+                f"{self._tier_verify_stats[1]} not bit-identical"
+                if self._tier_verify
+                else ""
+            )
+        )
+
+    def _tier_verify_layer(self, q, indices, md: QSASparseMetadata, layer_id: int, out) -> None:
+        """FREETOKEN_KVTIER_VERIFY=1 (eager, debug): main's exact attention -- same kernel, the
+        physical block table, a pool-shaped VRAM K/V rebuilt from the host copy with plain torch
+        copies -- must equal the tiered output bit for bit."""
+        from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
+
+        host_k, host_v = self.kvcache.host_kv(layer_id)
+        npages = [-(-int(n) // self.page_size) for n in md.kv_len_cpu.tolist()]
+        table = md.block_table.cpu()
+        pages = torch.unique(
+            torch.cat([table[row, :n] for row, n in enumerate(npages)] + [table.new_zeros(0)])
+        ).long()
+        pages = pages[(pages >= 0) & (pages < host_k.shape[0])]
+        ref_k = torch.zeros(host_k.shape, dtype=host_k.dtype, device=self.device)
+        ref_v = torch.zeros_like(ref_k)
+        dev_pages = pages.to(self.device)
+        ref_k[dev_pages] = host_k[pages].to(self.device)
+        ref_v[dev_pages] = host_v[pages].to(self.device)
+        ref = qsa_sparse_paged_attention(
+            q, ref_k, ref_v, indices, md.block_table, md.token_to_req, torch.empty_like(q)
+        )
+        self._tier_verify_stats[0] += 1
+        if not torch.equal(ref, out):
+            self._tier_verify_stats[1] += 1
+            diff = (ref.float() - out.float()).abs().max().item()
+            logger.warning(
+                f"kv-tier verify: layer {layer_id} {'decode' if md.is_decode else 'prefill'} "
+                f"output differs from the all-VRAM path (max abs diff {diff:.3g})"
+            )
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it
@@ -484,6 +739,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
         }
         if topk_scratch:
             self._graph["topk_scratch"] = empty(chunk, topk_scratch, dtype=torch.int32)
+        if self.tiered:
+            self._graph["tier_cells"] = empty(max_bs, self.select_width, dtype=torch.int32)
 
     def prepare_for_capture(self, batch: Batch) -> None:
         self.prepare_metadata(batch)
@@ -518,6 +775,11 @@ class QSASparseAttnBackend(BaseAttnBackend):
         if not self._graph:
             raise RuntimeError("init_capture_graph (decode) must run before an extend capture")
         total = n_max * t
+        if self.tiered and total > self._tier_gather_rows:
+            raise ValueError(
+                f"--kv-tier: a speculative window of {total} rows does not fit the block cache "
+                f"({self._tier_gather_rows} rows); raise --kv-tier-cells"
+            )
         width = get_global_ctx().page_table.shape[1]
         pages = -(-width // self.page_size)
         columns = pages * self.cmp_page_size
@@ -549,6 +811,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
         }
         if topk_scratch:
             store["topk_scratch"] = empty(chunk, topk_scratch, dtype=torch.int32)
+        if self.tiered:
+            store["tier_cells"] = empty(total, self.select_width, dtype=torch.int32)
         return store
 
     def _extend_metadata(self, store: dict) -> QSASparseMetadata:
@@ -655,6 +919,15 @@ class QSASparseAttnBackend(BaseAttnBackend):
         """One draft step's KV lengths [bs] from device memory (see :meth:`stage_draft_rows_dev`)."""
         store = self._graph_draft
         store["kvlen"][: store["n"]].copy_(kvlen[: store["n"]])
+
+
+def group_first(config) -> int:
+    """The first QSA layer id of the model (any layer names the pool's page count)."""
+    return QSASparseAttnBackend._qsa_group(config).layer_ids[0]
+
+
+def group_first_layer(backend: QSASparseAttnBackend) -> int:
+    return next(iter(backend._idx_slot))
 
 
 __all__ = ["QSASparseAttnBackend", "QSASparseMetadata"]

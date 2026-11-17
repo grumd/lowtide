@@ -139,6 +139,23 @@ def _fast_index_exchange_multi_spec(num_threads: int, blocks_per_bank: int) -> K
     return KernelSpec(name=_make_name("fast_index_exchange_multi", *args), build=build)
 
 
+def _kv_tier_spec() -> KernelSpec:
+    def build(build_directory: pathlib.Path) -> object:
+        return load_jit(
+            "kv_tier",
+            cuda_files=["kv_tier.cuh"],
+            cuda_wrappers=[
+                ("store", "kv_tier::store"),
+                ("resolve", "kv_tier::resolve"),
+                ("copy_rows", "kv_tier::copy_rows"),
+                ("mark_pages", "kv_tier::mark_pages"),
+            ],
+            build_directory=str(build_directory),
+        )
+
+    return KernelSpec(name=_make_name("kv_tier"), build=build)
+
+
 def _batch_memcpy_spec() -> KernelSpec:
     def build(build_directory: pathlib.Path) -> object:
         return load_jit(
@@ -172,8 +189,9 @@ def default_kernel_specs() -> tuple[KernelSpec, ...]:
     # miss-side batch H2D binding.
     specs.append(_fast_index_copy_multi_spec(num_threads=512, blocks_per_bank=64))
     specs.append(_batch_memcpy_spec())
-    # --moe-vram-only (fetch and write back in one pass)
+    # --moe-vram-only (fetch and write back in one pass) and --kv-tier
     specs.append(_fast_index_exchange_multi_spec(num_threads=512, blocks_per_bank=2))
+    specs.append(_kv_tier_spec())
     specs.append(_radix_spec())
 
     names = [spec.name for spec in specs]

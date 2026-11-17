@@ -17,7 +17,7 @@ FEATS = [65536, 512, 256, 32768, 512, 256]
 PF_MIN, PF_MAX, PF_BPT = 64, 4096, 4096
 
 
-def _build(cap_pages=1024, spare_mib=16, tp_group=None):
+def _build(cap_pages=1024, spare_mib=16, tp_group=None, kv_tier_cells=0):
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.engine.elastic import ElasticVram
     from freetoken.kvcache.mha_pool import elastic_tier_allocator
@@ -43,7 +43,7 @@ def _build(cap_pages=1024, spare_mib=16, tp_group=None):
         kv = QSAKVCache(
             num_kv_heads=1, num_layers=8, head_dim=256, num_pages=cap_pages + 1, page_size=64,
             dtype=torch.bfloat16, device=dev, index_head_dim=128, num_index_layers=2,
-            index_ratio=4, num_req_slots=2, layer_ids=[1, 3, 5, 7],
+            index_ratio=4, num_req_slots=2, layer_ids=[1, 3, 5, 7], kv_tier_cells=kv_tier_cells,
         )
     assert kv.elastic
     el.finalize(spare_mib << 20, 0, 0, tp_group)
@@ -350,6 +350,30 @@ def test_kv_growth_stops_where_experts_hit_their_floor():
     _decode(cache, 30, seed=4)
     _coherent(cache)
     _no_leak(el)
+
+
+@CUDA
+def test_tiered_kv_takes_host_ram_with_its_pages_and_gives_it_back():
+    el, _, kv = _build(kv_tier_cells=8192)
+    el.kv_pool = kv
+    kv.tier_resize(el.pages)  # what the engine does once the pool is attached
+    ctl = kv.tier_state(5)["ctl"]
+    assert int(ctl[10]) == 1024  # 64 pages hold 1,024 blocks: half of the cache's 2,048 slots
+    page = 64 * 256 * 2 * 2 * 4  # one page of K and V over the four layers
+    assert kv.host_kv_bytes == (64 + 1) * page  # the minimum pages and the dummy page
+    slots_small = el.slots
+    el.grow(20)
+    assert el.pages == 96 and kv.host_kv_bytes == (96 + 1) * page
+    assert int(ctl[10]) == 1536 and el.slots < slots_small  # the cache's growth is VRAM the experts gave
+    k = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+    loc = torch.arange(64, dtype=torch.int32, device="cuda") + 95 * 64
+    kv.store_kv(k, k, loc, 5)
+    torch.cuda.synchronize()
+    assert torch.equal(kv.host_kv(5)[0][95].view(64, 256), k.cpu())
+    el.shrink(64)
+    assert kv.host_kv_bytes == (64 + 1) * page and int(ctl[10]) == 1024 and el.slots == slots_small
+    el.grow(1)
+    assert torch.count_nonzero(kv.host_kv(5)[0][95]) == 0
 
 
 @CUDA

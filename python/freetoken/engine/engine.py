@@ -555,6 +555,8 @@ class Engine:
                 )
             assert self.kv_cache.elastic, type(self.kv_cache).__name__
             self.elastic.kv_pool = self.kv_cache
+            if getattr(self.kv_cache, "tiered", False):
+                self.kv_cache.tier_resize(self.elastic.pages)  # from here on it follows the page count
         else:
             self.ctx.kv_cache = self.kv_cache = create_kv_pool(
                 config, self.num_pages, device=self.device, dtype=self.dtype
@@ -578,6 +580,8 @@ class Engine:
             self.linear_state_pool = None
 
         self.host_prefix_pool = None
+        if config.kv_tier and config.cache_ram_gb > 0:
+            raise ValueError("--kv-tier and the prefix RAM tier (--cache-ram-gb) are exclusive")
         if config.cache_ram_gb > 0:
             self._init_host_prefix_pool(config)
 
@@ -883,6 +887,8 @@ class Engine:
 
         cache_per_page, fixed, page_tokens, _ = self._pool_cls.kv_cost(config)
         fixed += state_pool_bytes(config)
+        # --kv-tier: the part of the block cache a pool at its smallest does not map
+        fixed -= getattr(self._pool_cls, "elastic_fixed_credit", lambda config: 0)(config)
         self._elastic_page_tokens = page_tokens
         lo, hi = config.prefill_batch_min, config.max_extend_tokens
         if config.prefill_reserve_gb is not None:
