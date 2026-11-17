@@ -916,19 +916,20 @@ def test_routed_prefill_tokens_knob_extends_the_on_demand_path(monkeypatch):
 
 
 def test_routed_prefill_loads_each_routed_expert_once(monkeypatch):
-    """The LRU kernel dedups its queries in one block (<= 1024 ids), so a routed-only
-    prefill chunk hands it the unique routed set and maps every route to its slot."""
+    """A routed-only prefill chunk hands the capped ensure the unique routed set with nothing
+    left to the CPU, and maps every route to its slot."""
     layer, cache = _make_layer_and_cache()
     topk_ids = torch.tensor([[2, 1], [3, 2], [1, 2]], dtype=torch.int32)
     topk_weights = torch.full((3, 2), 0.5)
     hidden_states = torch.randn(3, 8)
     calls = {}
 
-    def fake_ensure(layer_id, expert_ids):
+    def fake_ensure(layer_id, expert_ids, fetch_fraction, counts=None):
         calls["ensure_expert_ids"] = expert_ids.clone()
+        calls["fetch_fraction"] = fetch_fraction
         expert_ids.copy_(expert_ids + 2)  # expert e -> slot e + 2
 
-    monkeypatch.setattr(cache, "ensure_experts", fake_ensure)
+    monkeypatch.setattr(cache, "ensure_experts_capped", fake_ensure)
     monkeypatch.setattr(cache, "copy_missing", lambda: calls.setdefault("copied", True))
 
     def fake_fused_decode(hidden_states, w1, w2, got_topk_weights, got_topk_ids, *args, **kwargs):
@@ -941,6 +942,7 @@ def test_routed_prefill_loads_each_routed_expert_once(monkeypatch):
 
     assert out is hidden_states
     assert calls["copied"] is True
+    assert calls["fetch_fraction"] == 1.0  # every routed expert is fetched
     assert calls["ensure_expert_ids"].tolist() == [[1, 2, 3]]
     assert calls["topk_ids"].dtype == torch.int32
     assert calls["topk_ids"].tolist() == [[4, 3], [5, 4], [3, 4]]

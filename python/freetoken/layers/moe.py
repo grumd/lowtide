@@ -439,10 +439,16 @@ class OffloadMoELayer(MoELayer):
         """Routed-only prefill chunk (``FREETOKEN_MOE_ROUTED_PREFILL_TOKENS``): make each
         routed expert resident once -- the LRU kernel gets the unique routed set, not
         every (token, expert) route -- then run the grouped GEMM over the slot cache
-        (the per-route GEMV when the format has no slot-cache prefill kernel)."""
+        (the per-route GEMV when the format has no slot-cache prefill kernel).
+
+        The set goes through the capped ensure with nothing left to the CPU, the launch the
+        CPU-assisted prefill uses: the plain ensure dedups its queries pairwise, and its
+        instance for a whole layer's experts makes the CUDA context grow its per-thread stack
+        by ~410 MiB for good (Qwen3.8-Flash-Next, 512 experts), which the prefill reserve then
+        lacks."""
         routed, inverse = torch.unique(topk_ids, return_inverse=True)
         slots = routed.to(torch.int32).view(1, -1)
-        cache.ensure_experts(self.layer_id, slots)  # expert ids -> slot ids, in place
+        cache.ensure_experts_capped(self.layer_id, slots, 1.0)  # expert ids -> slot ids, in place
         cache.copy_missing()
         cache.demote_fetched()  # a prefill chunk must not flush decode's working set
         return self._expert_gemm(
