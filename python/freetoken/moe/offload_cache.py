@@ -140,8 +140,10 @@ _HIT_GATHER_BLOCKS = 64
 
 # Host cells: idle points in a row a cached expert has to reach in its slot, used since the one
 # before each time, before it gives its host copy up. The others are the likely victims (LRU
-# evicts what is not used), and evicting an expert that has a host copy is free.
-SETTLED_AFTER = 3
+# evicts what is not used), and evicting an expert that has a host copy is free. One is enough:
+# against three it writes back twice as many experts per request (930 against 500) for 0.8% of
+# generation speed and holds 2-4 GiB less host RAM (Qwen3.8-Flash-Next, 2x3080 20 GB).
+SETTLED_AFTER = 1
 # Backing and pinning a host cell again (about 0.3 ms for a 2.6 MiB expert) costs what this many
 # write-backs add to the fetches they ride along with (45-100 us each, measured per request on
 # PCIe 4.0 x8).
