@@ -327,6 +327,25 @@ inline __m256 e2m1_decode8(__m256i codes, __m256 mag8) {
   return _mm256_xor_ps(mag, _mm256_castsi256_ps(sgn));
 }
 
+// Software-prefetch distance for the nvfp4 weight stream, in 16-K blocks (8 packed bytes
+// each). Returns -1 when FREETOKEN_CPU_MOE_PF_BLOCKS is unset: each dot then uses its own
+// default (the fp32 dot's is at its loop). The W4A8 kernel
+// uses the built-in default min(512 blocks = 4 KB, 2 rows) -- 4 KB is the empirical
+// optimum on large-row machines (Emerald Rapids sweep), while the 2-row cap keeps a small-row
+// model's overshoot bounded (the executor works in 32-row tiles, so a fixed byte
+// distance otherwise prefetches another worker's tile: duplicated DRAM traffic that
+// regresses at the bandwidth ceiling). An EXPLICIT env value is honored verbatim
+// (no clamp; 0 disables): the per-machine optimum can sit past the safe default (+20%
+// at 4 KB on a 24-thread Ice Lake with 256B rows), so the escape hatch must reach it.
+// Prefetch never faults, so overshooting a row/bank tail is safe.
+static int nvfp4_pf_blocks() {
+  static const int v = [] {
+    const char* s = getenv("FREETOKEN_CPU_MOE_PF_BLOCKS");
+    return (s && s[0]) ? atoi(s) : -1;
+  }();
+  return v;
+}
+
 // Two 16-K blocks (16 packed bytes) per iter: lo nibbles -> even-K, hi -> odd-K,
 // gathered via two vpermps. The per-16 e4m3 scale differs across the two blocks, so
 // it is applied per lane (low 8 lanes = block b, high 8 = block b+1).
@@ -350,8 +369,23 @@ float dot_nvfp4_avx512(const uint8_t* packed, const uint8_t* scale, float global
   const __m512i loma = _mm512_set1_epi32(0xF);
   __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
   const int nb = K / 16;  // 8 packed bytes + one e4m3 scale per block
+  // The rows of an expert are one stream, read once and from DRAM when the expert missed the
+  // GPU cache. Prefetching it 2.5 KiB ahead (320 blocks, whatever the row length) starts the
+  // next lines and, where the weights sit on 4 KiB pages (host cells, --moe-vram-only), the
+  // next page walk before the hardware prefetcher gets there; it stops at every page end.
+  // One cold expert of Qwen3.8-Flash on a 9800X3D: a whole expert on 8 threads 56.8 -> 55.0 us
+  // on 4 KiB pages and 53.7 -> 52.7 us on huge pages; one TP rank's band on 4 threads
+  // 40.9 -> 38.2 and 37.7 -> 35.8 us. Longer distances win on 4 threads (32 KiB: 34.7 us) and
+  // lose on 8 (16 KiB: 59.0 us), where a worker then prefetches into its neighbours' tiles.
+  // FREETOKEN_CPU_MOE_PF_BLOCKS overrides it (0 = off).
+  const int pfb = nvfp4_pf_blocks();
+  const int pf = (pfb < 0) ? 320 : pfb;
   int b = 0;
   for (; b + 4 <= nb; b += 4) {  // two blk2 calls -> 4 blocks, 2 accumulators
+    if (pf > 0 && (b & 4) == 0) {  // one packed cache line per two iterations
+      _mm_prefetch(reinterpret_cast<const char*>(packed + ((size_t)b + (size_t)pf) * 8), _MM_HINT_T0);
+      if ((b & 60) == 0) _mm_prefetch(reinterpret_cast<const char*>(scale + (size_t)b + (size_t)pf), _MM_HINT_T0);
+    }
     acc0 = _mm512_add_ps(acc0, nvfp4_blk2(packed + (size_t)b * 8, xe + (size_t)b * 8,
                                           xo + (size_t)b * 8, lut, loma, e4m3[scale[b]], e4m3[scale[b + 1]]));
     acc1 = _mm512_add_ps(acc1, nvfp4_blk2(packed + (size_t)(b + 2) * 8, xe + (size_t)(b + 2) * 8,
@@ -453,24 +487,6 @@ float dot_nvfp4_i8_vnni(const uint8_t* packed, const uint8_t* scale, float globa
 
 #if (defined(__GNUC__) && __GNUC__ >= 10) || defined(__clang__)
 #define CPU_MOE_HAS_AVX512VNNI 1
-
-// Software-prefetch distance for the W4A8 weight stream, in 16-K blocks (8 packed
-// bytes each). Returns -1 when FREETOKEN_CPU_MOE_PF_BLOCKS is unset: the kernel then
-// uses the built-in default min(512 blocks = 4 KB, 2 rows) -- 4 KB is the empirical
-// optimum on large-row machines (Emerald Rapids sweep), while the 2-row cap keeps a small-row
-// model's overshoot bounded (the executor works in 32-row tiles, so a fixed byte
-// distance otherwise prefetches another worker's tile: duplicated DRAM traffic that
-// regresses at the bandwidth ceiling). An EXPLICIT env value is honored verbatim
-// (no clamp; 0 disables): the per-machine optimum can sit past the safe default (+20%
-// at 4 KB on a 24-thread Ice Lake with 256B rows), so the escape hatch must reach it.
-// Prefetch never faults, so overshooting a row/bank tail is safe.
-static int nvfp4_pf_blocks() {
-  static const int v = [] {
-    const char* s = getenv("FREETOKEN_CPU_MOE_PF_BLOCKS");
-    return (s && s[0]) ? atoi(s) : -1;
-  }();
-  return v;
-}
 
 // AVX-512 VNNI W4A8: FOUR 16-K blocks per VPDPBUSD (64 int8) -- 2x the AVX-VNNI
 // (256-bit) path. Decode 32 packed bytes -> 64 int8 with a single _mm512_shuffle_epi8
