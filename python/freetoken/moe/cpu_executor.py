@@ -197,7 +197,10 @@ class CpuMoeExecutor:
                 )
 
         self.num_layers = int(cache.num_layers)
-        self.num_experts = int(cache.num_experts)
+        bank_layers, self.num_experts = cache.bank_sources, int(cache.num_experts)
+        if getattr(cache, "pooled", False):
+            # every layer reads the one host pool, and routes carry pool rows (OffloadMoeCache.cpu_banks)
+            bank_layers, self.num_experts = cache.cpu_banks()
         self.top_k = int(top_k)
         self.quant_format = fmt
         self.device = device
@@ -207,7 +210,7 @@ class CpuMoeExecutor:
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
         ptrs, (self.H, self.I) = self._resolve_banks(
-            {canonical_role(name): per_layer for name, per_layer in cache.bank_sources.items()}, fmt
+            {canonical_role(name): per_layer for name, per_layer in bank_layers.items()}, fmt
         )
 
         # Decide the flag handshake up front (env + device + a functional stream-memop

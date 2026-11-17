@@ -484,7 +484,8 @@ class OffloadMoELayer(MoELayer):
         route_slot = slots.view(-1)[inverse]
         on_cpu = route_slot < 0
         cpu.x[:T].copy_(hidden_states, non_blocking=True)
-        cpu.ids[:T].copy_(torch.where(on_cpu, topk_ids.to(torch.int32), -1), non_blocking=True)
+        cpu.ids[:T].copy_(torch.where(on_cpu, cache.cpu_rows(self.layer_id, topk_ids).to(torch.int32), -1),
+                          non_blocking=True)
         cpu.w[:T].copy_(topk_weights, non_blocking=True)
         cpu.meta.copy_(torch.stack([route_slot.max().long(), on_cpu.logical_not().sum(),
                                     cache.num_indices[0], routed.new_tensor(routed.numel()).long()]),

@@ -109,6 +109,11 @@ class EngineConfig:
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
+    # Save host RAM: an expert cached in VRAM gives up its host copy (its host cell is unpinned
+    # and returned to the OS), and takes a cell back when it is evicted, written over PCIe in
+    # the pass that fetches its replacement. The expert cache and elastic VRAM are unchanged
+    # (OffloadMoeCache.use_host_cells). FTW checkpoints only.
+    moe_vram_only: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.

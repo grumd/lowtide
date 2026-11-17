@@ -55,6 +55,12 @@ class ExpertBanks:
     # re-slice can dispose the abandoned full banks' pinned pages. None for loaders
     # that build their banks at rank width already (no re-slice happens).
     host_banks: dict[str, list] | None = field(default=None)
+    # --moe-vram-only: the HostPool behind each bank's sources, every expert's row a cell that
+    # pins and releases on its own (OffloadMoeCache.use_host_cells)
+    host_pools: dict | None = field(default=None)
+    # --moe-vram-only: the layers left unread for the expert cache to take straight into VRAM
+    # (checkpoint.ftw.LateLayers)
+    late_layers: object | None = field(default=None)
 
 
 def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
@@ -349,6 +355,8 @@ def load_expert_banks(
     decode_target: str = "gpu",
     layer_sink=None,
     layer_residency: list[str] | None = None,
+    pooled: bool = False,
+    late_vram_bytes: int = 0,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -371,6 +379,10 @@ def load_expert_banks(
     the generic path: the family's pieces packed by the method's kernel. Without it only the
     GGUF q4_0 format loads, through its own provider.
 
+    ``pooled`` (``--moe-vram-only``, FTW checkpoints only): each bank is one ``HostPool`` whose
+    rows pin and release one by one (``ExpertBanks.host_pools``); the layers ``late_vram_bytes``
+    of VRAM could hold are left for the cache to read (``ExpertBanks.late_layers``).
+
     ``layer_residency``: per-layer ``HostResidency`` labels applied at settle time -- explicitly on the FTW fast path, ambiently (``requested_residency``) in the slow-path providers.
     Applied labels are echoed on ``ExpertBanks.layer_residency``; a loader that settles some other way leaves it ``None`` (CPU-layer decode still works on pinned banks, it just saves no pin quota).
     """
@@ -385,13 +397,17 @@ def load_expert_banks(
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
         banks = load_ftw_banks(
             model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
-            layer_residency=layer_residency, model_config=model_config,
+            layer_residency=layer_residency, model_config=model_config, pooled=pooled,
+            late_vram_bytes=late_vram_bytes,
         )
         if banks is not None:
             if not banks.tp_sliced:
                 _tp_slice_ftw_sources(banks.sources, model_config, banks.host_banks)
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
             return banks
+
+    if pooled:
+        raise ValueError("--moe-vram-only needs an FTW checkpoint with expert banks (see `ft checkpoint`)")
 
     if parallel and not _PARALLEL_READER_SUPPORTED:
         logger.warning_rank0(

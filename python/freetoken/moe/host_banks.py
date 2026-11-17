@@ -26,6 +26,7 @@ import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
+from functools import lru_cache
 
 import torch
 
@@ -34,10 +35,51 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 _BLK = 4096  # O_DIRECT alignment (page size)
+_MADV_NOHUGEPAGE = 15
 
 
 class PinFailed(RuntimeError):
     """cudaHostRegister refused a bank: the host is out of pinnable RAM or over its pin quota."""
+
+
+class HostRamShort(RuntimeError):
+    """Host RAM that has to be pinned now is not there: experts leaving VRAM under
+    ``--moe-vram-only``, or the K/V of a growing context under ``--kv-tier``."""
+
+
+def host_ram_headroom() -> int | None:
+    """Bytes of host RAM this process can still take: ``MemAvailable``, and the room left under
+    every cgroup v2 memory limit above it (page cache counted as reclaimable). None if unknown."""
+    room = None
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    room = int(line.split()[1]) * 1024
+                    break
+        with open("/proc/self/cgroup") as f:
+            path = next((ln.strip().split("::", 1)[1] for ln in f if ln.startswith("0::")), "")
+    except OSError:
+        return room
+    node = os.path.join("/sys/fs/cgroup", path.lstrip("/"))
+    while node.startswith("/sys/fs/cgroup"):
+        try:
+            with open(os.path.join(node, "memory.max")) as f:
+                raw = f.read().strip()
+            if raw != "max":
+                with open(os.path.join(node, "memory.current")) as f:
+                    used = int(f.read())
+                with open(os.path.join(node, "memory.stat")) as f:
+                    stat = dict(ln.split() for ln in f)
+                cache = int(stat.get("inactive_file", 0)) + int(stat.get("active_file", 0))
+                left = max(0, int(raw) - used + cache)
+                room = left if room is None else min(room, left)
+        except (OSError, ValueError):
+            pass
+        if node == "/sys/fs/cgroup":
+            break
+        node = os.path.dirname(node)
+    return room
 
 
 class HostResidency(str, Enum):
@@ -86,7 +128,7 @@ class HostBank:
     __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_disposed")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
-                 *, backing: str | None = None):
+                 *, backing: str | None = None, hugepages: bool = True):
         if backing is None:
             plan = _requested_residency
             # a plan with non-pinned labels vetoes born-pinned: cudaHostAlloc spends the pin quota the plan exists to save
@@ -117,8 +159,13 @@ class HostBank:
             # faults, the cudaHostRegister pin and the unpin + free at exit walk 512x fewer
             # pages -- 4 KiB pages for ~134 GiB of banks kept every engine stop busy for over
             # a minute. Without free hugepages the kernel stays on 4 KiB.
-            if hasattr(mmap, "MADV_HUGEPAGE"):
+            if hugepages and hasattr(mmap, "MADV_HUGEPAGE"):
                 self._buf.madvise(mmap.MADV_HUGEPAGE)
+            elif not hugepages:
+                # parts of this buffer are pinned and given back on their own. Where the system
+                # THP mode is "always" that needs the opt-out: the part of a huge page that was
+                # given back stays allocated for as long as any other part of it is pinned
+                self._buf.madvise(_MADV_NOHUGEPAGE)
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False
@@ -215,6 +262,135 @@ class HostBank:
             logger.warning(f"bank lock failed; leaving this and later banks pageable: {exc}")
             return
         self._locked = True
+
+
+_MADV_POPULATE_WRITE = 23  # Linux 5.14+; not in the mmap module before Python 3.13
+
+
+class HostPool:
+    """One bank's rows for every expert of the model in one address range, each row a cell that
+    is pinned and given back to the OS on its own (``--moe-vram-only``): an expert that lives
+    in VRAM needs no host row, and an evicted one takes whichever row is free, so a row no
+    longer belongs to the layer it was loaded for. ``layers`` are the windows a loader fills and
+    pins.
+
+    A row pins on its own only when it is whole pages. A bank of smaller rows (the per-row
+    globals, a few percent of an expert at most) stays pinned as a whole and is never released.
+    No transparent hugepages (opted out, whatever the system mode): releasing one cell must
+    free exactly its pages, and pinning untouched hugepage memory took 8.7 ms per cell against
+    0.1 ms."""
+
+    def __init__(self, num_layers: int, layer_shape: tuple[int, ...], dtype: torch.dtype):
+        rows = layer_shape[0]
+        self.bank = HostBank((num_layers * rows, *layer_shape[1:]), dtype, backing="mmap", hugepages=False)
+        self.tensor = self.bank.tensor
+        self.num_cells = num_layers * rows
+        self.row_bytes = self.tensor[0].numel() * self.tensor.element_size()
+        self.releasable = self.row_bytes % _BLK == 0
+        self.layers = [_PoolLayer(self, i, rows) for i in range(num_layers)]
+
+    def _register(self, addr: int, nbytes: int) -> None:
+        from freetoken.kernel.pinned import host_register
+
+        try:
+            host_register(addr, nbytes)
+        except RuntimeError as exc:
+            raise PinFailed(f"cudaHostRegister failed for {nbytes >> 10} KiB of an expert pool") from exc
+
+    def pin_cells(self, first: int, count: int) -> None:
+        """cudaHostRegister filled cells ``[first, first + count)``: one by one, or as one range
+        when this bank's cells cannot be released (a layer's worth is whole pages either way)."""
+        base = self.bank.addr + first * self.row_bytes
+        if not self.releasable:
+            self._register(base, count * self.row_bytes)
+            return
+        for cell in range(count):
+            self._register(base + cell * self.row_bytes, self.row_bytes)
+
+    def release(self, cells) -> int:
+        """Unpin these cells and give their RAM back; returns the bytes freed. Their rows must
+        not be read or written until ``commit``."""
+        if not self.releasable:
+            return 0
+        release_ranges(self.bank._buf, self.bank.addr, [(cell * self.row_bytes, self.row_bytes) for cell in cells])
+        return len(cells) * self.row_bytes
+
+    def commit(self, cells) -> None:
+        """Back released cells with RAM again and pin them (their contents are undefined)."""
+        if not self.releasable:
+            return
+        row = self.row_bytes
+        try:
+            commit_ranges(self.bank.addr, [(cell * row, row) for cell in cells])
+        except RuntimeError as exc:
+            raise PinFailed(f"cudaHostRegister failed for {row >> 10} KiB of an expert pool") from exc
+
+
+def commit_ranges(base: int, ranges) -> None:
+    """Back the ``(offset, nbytes)`` ranges of the anonymous mapping at ``base`` with RAM and pin
+    each one (cudaHostRegister); whole pages each. A released range comes back zeroed."""
+    from freetoken.kernel.pinned import host_register
+
+    ranges = list(ranges)
+
+    def populate(part) -> None:  # ctypes drops the GIL: the page faults of the threads overlap
+        for off, nbytes in part:
+            if _libc().madvise(base + off, nbytes, _MADV_POPULATE_WRITE):
+                ctypes.memset(base + off, 0, nbytes)  # an older kernel: touching the pages does the same
+
+    threads = min(_COMMIT_THREADS, len(ranges))
+    if threads > 1:
+        with ThreadPoolExecutor(threads) as ex:
+            list(ex.map(populate, [ranges[i::threads] for i in range(threads)]))
+    else:
+        populate(ranges)
+    for off, nbytes in ranges:  # cudaHostRegister calls do not overlap (measured), so one by one
+        host_register(base + off, nbytes)
+
+
+def release_ranges(buf, base: int, ranges) -> None:
+    """Unpin ranges pinned by ``commit_ranges`` (same offsets) and give their RAM back."""
+    from freetoken.kernel.pinned import host_unregister
+
+    for off, nbytes in ranges:
+        host_unregister(base + off)
+        buf.madvise(mmap.MADV_DONTNEED, off, nbytes)
+
+
+_COMMIT_THREADS = 4  # populating 2,400 cells of 800 KiB: 210 ms on one thread, 92 on four, 81 on eight
+
+
+@lru_cache(maxsize=1)
+def _libc():
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    return libc
+
+
+class _PoolLayer:
+    """One layer's window of a :class:`HostPool`, with the part of the ``HostBank`` interface
+    the loaders use; pinning it pins the layer's cells."""
+
+    __slots__ = ("tensor", "nbytes", "_view", "_pool", "_first")
+    residency = HostResidency.PINNED
+
+    def __init__(self, pool: "HostPool", index: int, rows: int):
+        self._pool, self._first = pool, index * rows
+        self.tensor = pool.tensor[index * rows : (index + 1) * rows]
+        self.nbytes = self.tensor.numel() * self.tensor.element_size()
+        self._view = pool.bank.memoryview()[index * self.nbytes : (index + 1) * self.nbytes]
+
+    def memoryview(self) -> memoryview:
+        return self._view
+
+    def pin(self) -> None:
+        self._pool.pin_cells(self._first, self.tensor.shape[0])
+
+    def lock(self) -> None:
+        pass
+
+    def dispose(self) -> None:
+        pass
 
 
 _os_locked_total = 0  # bytes locked so far; the OS lock ceiling is a per-process quota
@@ -535,6 +711,7 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
 
 __all__ = [
     "HostBank",
+    "HostPool",
     "HostResidency",
     "LayerCompletionTracker",
     "PinPipeline",

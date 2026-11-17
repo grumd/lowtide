@@ -1158,6 +1158,21 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-vram-only",
+        action="store_true",
+        dest="moe_vram_only",
+        default=ServerArgs.moe_vram_only,
+        help=(
+            "Save host RAM: an expert that stays cached in VRAM gives up its copy in RAM, and "
+            "gets one back (written over PCIe into a spare cell) when it is evicted, so RAM holds "
+            "the experts that are not cached, the recently fetched ones and a few spare cells. "
+            "The expert cache itself and its sizing are unchanged; host RAM in use follows the "
+            "cache size and how long experts stay cached (a cache that turns over every request "
+            "saves nothing and loses nothing). Needs an FTW checkpoint and --moe-prefill-hit-d2d."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-routed-prefill-tokens",
         type=int,
         default=None,

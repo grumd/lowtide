@@ -560,3 +560,100 @@ struct MultiIndexCopyKernel {
                      device.unwrap())(kernel, params);
     }
 };
+
+
+// ---------------------------------------------------------------------------
+// Multi-bank exchange between the slot cache and a host pool that holds each expert at most
+// once. Entry i moves host row `rows[i]` into slot `slots[i]`; with `write_back[i]` == 1 the
+// slot's old bytes go to host row `store_rows[i]` in the same pass, so an expert kept only in
+// VRAM is never lost when it is evicted. `store_rows[i]` may be `rows[i]` itself (the row is
+// being vacated by the expert moving in: a swap) or any free row. `write_back[i]` == 2 only
+// stores the slot into `store_rows[i]` (an eviction with nothing coming in).
+struct MultiIndexExchangeParams {
+    const int64_t* __restrict__ slot_ptrs;    // [B] device, base addr of each bank's slot cache
+    const int64_t* __restrict__ host_ptrs;    // [B] device, GPU-visible base addr of each bank's host pool
+    const int64_t* __restrict__ feat_bytes;   // [B] device, per-row bytes (multiple of 16)
+    const int32_t* __restrict__ slots;        // [L]
+    const int32_t* __restrict__ rows;         // [L] host pool rows read into the slots
+    const int32_t* __restrict__ store_rows;   // [L] host pool rows the slots' old bytes go to
+    const int32_t* __restrict__ write_back;   // [L] 0 load, 1 load and store, 2 store
+    const int64_t* __restrict__ valid_length; // [1]
+    int num_banks;
+};
+
+template <std::size_t kNumThreads, std::size_t kBlocksPerBank>
+__global__ __launch_bounds__(kNumThreads) void fast_index_exchange_multi(
+    const __grid_constant__ MultiIndexExchangeParams p
+) {
+    const int b = static_cast<int>(blockIdx.x / kBlocksPerBank);
+    if (b >= p.num_banks) {
+        return;
+    }
+    const int blk = static_cast<int>(blockIdx.x % kBlocksPerBank);
+    auto* host = reinterpret_cast<uint8_t*>(p.host_ptrs[b]);
+    auto* slot = reinterpret_cast<uint8_t*>(p.slot_ptrs[b]);
+    const int64_t feat = p.feat_bytes[b];
+    const int64_t units = feat >> 4;  // 16-byte (uint4) units per row; feat % 16 == 0
+    const int64_t total = p.valid_length[0] * units;
+    const int64_t stride = static_cast<int64_t>(kBlocksPerBank) * kNumThreads;
+    for (int64_t u = static_cast<int64_t>(blk) * kNumThreads + threadIdx.x; u < total; u += stride) {
+        const int64_t i = u / units;
+        const int64_t col = (u - i * units) << 4;  // byte offset within the row
+        auto* h = reinterpret_cast<uint4*>(host + static_cast<int64_t>(p.rows[i]) * feat + col);
+        auto* s = reinterpret_cast<uint4*>(slot + static_cast<int64_t>(p.slots[i]) * feat + col);
+        const int32_t mode = p.write_back[i];
+        if (mode == 0) {
+            *s = *h;
+            continue;
+        }
+        auto* o = reinterpret_cast<uint4*>(host + static_cast<int64_t>(p.store_rows[i]) * feat + col);
+        const uint4 old = *s;
+        if (mode == 2) {
+            *o = old;
+            continue;
+        }
+        const uint4 in = *h;  // before the store: o is h when the two swap
+        *o = old;
+        *s = in;
+    }
+}
+
+template <std::size_t kNumThreads, std::size_t kBlocksPerBank>
+struct MultiIndexExchangeKernel {
+    static void run(
+        tvm::ffi::TensorView slot_ptrs,
+        tvm::ffi::TensorView host_ptrs,
+        tvm::ffi::TensorView feat_bytes,
+        tvm::ffi::TensorView slots,
+        tvm::ffi::TensorView rows,
+        tvm::ffi::TensorView store_rows,
+        tvm::ffi::TensorView write_back,
+        tvm::ffi::TensorView num_indices
+    ) {
+        using namespace host;
+        auto device = SymbolicDevice{};
+        auto B = SymbolicSize{"num_banks"};
+        auto L = SymbolicSize{"indices length"};
+
+        TensorMatcher({B}).with_dtype<int64_t>().with_device<kDLCUDA>(device)
+            .verify(slot_ptrs).verify(host_ptrs).verify(feat_bytes);
+        TensorMatcher({L}).with_dtype<int32_t>().with_device<kDLCUDA>(device)
+            .verify(slots).verify(rows).verify(store_rows).verify(write_back);
+        TensorMatcher({1}).with_dtype<int64_t>().with_device<kDLCUDA>(device).verify(num_indices);
+
+        const int num_banks = static_cast<int>(B.unwrap());
+        const auto params = MultiIndexExchangeParams{
+            static_cast<const int64_t*>(slot_ptrs.data_ptr()),
+            static_cast<const int64_t*>(host_ptrs.data_ptr()),
+            static_cast<const int64_t*>(feat_bytes.data_ptr()),
+            static_cast<const int32_t*>(slots.data_ptr()),
+            static_cast<const int32_t*>(rows.data_ptr()),
+            static_cast<const int32_t*>(store_rows.data_ptr()),
+            static_cast<const int32_t*>(write_back.data_ptr()),
+            static_cast<const int64_t*>(num_indices.data_ptr()),
+            num_banks,
+        };
+        LaunchKernel(static_cast<std::size_t>(kBlocksPerBank) * num_banks, kNumThreads,
+                     device.unwrap())(fast_index_exchange_multi<kNumThreads, kBlocksPerBank>, params);
+    }
+};

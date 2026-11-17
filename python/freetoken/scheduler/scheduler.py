@@ -240,7 +240,14 @@ class Scheduler(SchedulerIOMixin):
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.elastic_idle()
+        if (cache := self.engine.moe_offload_cache) is not None:
+            cache.settle_host_cells()  # --moe-vram-only: decide which cached experts keep a host copy
         self.cache_manager.check_integrity()
+
+    def idle_step(self) -> bool:
+        """One bounded piece of background work while no request is waiting; True while more is left."""
+        cache = self.engine.moe_offload_cache
+        return cache is not None and cache.settle_step()
 
     @torch.inference_mode()
     def rebuild_cache(

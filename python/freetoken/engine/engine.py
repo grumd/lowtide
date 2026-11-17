@@ -772,6 +772,8 @@ class Engine:
             if limit < self.max_seq_len:
                 logger.info_rank0(f"elastic VRAM: max context {self.max_seq_len} -> {limit} tokens")
                 self.max_seq_len = limit
+        if self.moe_offload_cache is not None and self.moe_offload_cache.pooled:
+            self._seed_vram_only()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -919,6 +921,42 @@ class Engine:
             f"of address space ({mem_GB(free)} free before the caches)"
         )
 
+    def _check_vram_only(self, config: EngineConfig, decode_target: str) -> bool:
+        """--moe-vram-only: whether the expert banks load as host cells (and why not, if asked for)."""
+        if not config.moe_vram_only:
+            return False
+        from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+        problem = None
+        if not (config.model_path and is_ftw_checkpoint(config.model_path)) or config.use_dummy_weight:
+            problem = "it needs an FTW checkpoint with expert banks (see `ft checkpoint`)"
+        elif decode_target != "gpu":
+            problem = "it needs --moe-strategy offload with GPU decode"
+        elif not (config.moe_prefill_overlap and config.moe_prefill_hit_d2d):
+            problem = "it needs --moe-prefill-hit-d2d (and prefill overlap)"
+        if problem:
+            raise ValueError(f"--moe-vram-only: {problem}")
+        return True
+
+    def _seed_vram_only(self) -> None:
+        """--moe-vram-only, once the expert cache has its settled size: fill it and release the
+        host cells of what it holds."""
+        cache = self.moe_offload_cache
+        late = self._late_expert_layers
+        late_count = len(late.layers) if late is not None else 0
+        seeded = cache.seed_vram_only()
+        self._late_expert_layers = None
+        cell = sum(pool.row_bytes for pool in cache.host_pools.values() if pool.releasable)
+        kept = sum(pool.row_bytes for pool in cache.host_pools.values() if not pool.releasable)
+        total = cache.num_layers * cache.num_experts
+        in_ram = total - int(cache._cell_out.sum())
+        logger.info_rank0(
+            f"--moe-vram-only: {seeded} of {total} experts start in VRAM only; {in_ram} host cells stay in RAM "
+            f"(spare ones included), {(total - in_ram) * cell * self.config.tp_info.size / 2**30:.1f} GiB released; "
+            f"an expert's host cell is {cell / 2**20:.2f} MiB, and {kept / 1024:.0f} KiB of small rows stay pinned; "
+            f"{late_count} layers were read one at a time on their way into VRAM"
+        )
+
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         from freetoken.env import ENV
 
@@ -975,6 +1013,7 @@ class Engine:
                 else HostResidency.PINNED.value
                 for i in range(config.model_config.num_moe_layers)
             ]
+        host_cells = self._check_vram_only(config, decode_target)
         try:
             banks = load_expert_banks(
                 config.model_path,
@@ -987,6 +1026,10 @@ class Engine:
                 workers=config.expert_load_workers,
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                 layer_residency=requested_residency,
+                pooled=host_cells,
+                # an upper bound of what the expert cache will hold: a layer left unread that
+                # turns out not to fit is read into host RAM when the cache is seeded
+                late_vram_bytes=self._sync_get_memory()[0] if host_cells else 0,
             )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
@@ -1052,6 +1095,9 @@ class Engine:
         cache.cpu_layer_ids = cpu_layer_ids
         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+        if host_cells:
+            cache.use_host_cells(banks.host_pools, banks.late_layers)
+            self._late_expert_layers = banks.late_layers
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
@@ -1161,7 +1207,10 @@ class Engine:
         from freetoken.moe.legacy_format import canonical_role
 
         roles = ("gate_up", "gate_up_zero", "gate_up_scale", "down", "down_zero", "down_scale")
-        sources = {canonical_role(k): v for k, v in cache.bank_sources.items()}
+        bank_layers, bank_rows = cache.bank_sources, cache.num_experts
+        if getattr(cache, "pooled", False):
+            bank_layers, bank_rows = cache.cpu_banks()  # one host pool, addressed by pool row
+        sources = {canonical_role(k): v for k, v in bank_layers.items()}
         nvfp4 = set(sources) == set(wcp.Nvfp4CpuPrefill.BANK_ROLES)
         sample = layers[0]
         reason = None
@@ -1180,7 +1229,7 @@ class Engine:
         tp = self.config.tp_info
         threads = _rank_cpu_threads(self.config)
         common = dict(
-            num_experts=cache.num_experts, top_k=sample.top_k,
+            num_experts=bank_rows, top_k=sample.top_k,
             max_tokens=max(_ROUTED_PREFILL_TOKENS, sample.num_experts // sample.top_k + 1),
             threads=threads, cpus=wcp.rank_cpus(threads, tp.rank, tp.size),
         )

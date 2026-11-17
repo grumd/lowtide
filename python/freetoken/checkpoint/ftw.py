@@ -805,10 +805,20 @@ def _read_band_segments(reader, bank, entry, segs, chunk: int) -> None:
                     pass
 
 
+class LateLayers:
+    """The expert layers ``load_ftw_banks`` left unread (``--moe-vram-only``): ``layers`` are
+    their ids, and ``load(layer)`` reads one into its host cells and pins them."""
+
+    def __init__(self, layers: list[int], load) -> None:
+        self.layers = layers
+        self.load = load
+
+
 def load_ftw_banks(
     path: str, *, num_layers: int, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
     layer_residency: list[str] | None = None, model_config=None,
     kind: str = "experts_bank", num_layers_meta_key: str = "expert_bank_num_layers",
+    pooled: bool = False, late_vram_bytes: int = 0,
 ):
     """Reconstruct the offload :class:`ExpertBanks` from the FTW's ``experts_bank``
     entries, on the per-layer host bank contract (one ``[num_experts, ...]``
@@ -840,17 +850,38 @@ def load_ftw_banks(
       written by its own ``add_tensor`` call, so its start is already ALIGN-aligned --
       no windowing/head-pad needed, read straight into a HostBank shaped like the entry.
 
+    ``pooled`` (``--moe-vram-only``, per-layer layout only): every layer's bank is a window of
+    one :class:`HostPool` per bank (``ExpertBanks.host_pools``), whose rows pin one by one. The
+    last layers, as many as ``late_vram_bytes`` of VRAM could hold, are left unread: the expert
+    cache reads them one at a time as it takes them into VRAM (``ExpertBanks.late_layers``), so
+    they never add to the host RAM in use.
+
     Alphas (``gate_up_alpha``/``down_alpha``) stay flat ``[num_layers*num_experts]``
     vectors, unaffected by the row split (fixed GPU residency; see
     ``cache_budget.expert_bytes_per_slot``).
     """
     from freetoken.moe.host_banks import (
-        HostBank, HostResidency, PinPipeline, alloc_banks, born_pinned_default,
+        HostBank, HostPool, HostResidency, PinPipeline, alloc_banks, born_pinned_default,
     )
     from freetoken.utils.progress import byte_bar
 
     residency = layer_residency or [HostResidency.PINNED.value] * num_layers
     assert len(residency) == num_layers, (len(residency), num_layers)
+    if pooled and any(r != HostResidency.PINNED.value for r in residency):
+        raise ValueError("pooled expert banks need every layer pinned")
+    pools: dict[str, HostPool] = {}
+
+    def _bank_for(base: str, layer_id: int, shape: tuple[int, ...], dtype: torch.dtype):
+        if not pooled:
+            return HostBank(shape, dtype, backing=_backing(layer_id))
+        if base not in pools:
+            if math.prod(shape) * _elsize(dtype) % ALIGN:
+                raise ValueError(
+                    f"bank {base!r} is {math.prod(shape) * _elsize(dtype)} bytes per layer, not a multiple of "
+                    f"{ALIGN}: its layers cannot be read side by side into one pool"
+                )
+            pools[base] = HostPool(num_layers, shape, dtype)
+        return pools[base].layers[layer_id]
 
     # TP>1: read ONLY this rank's intermediate band of every bank straight from
     # the shards (the FTW stores TP-agnostic full-width banks; reading them full
@@ -933,6 +964,10 @@ def load_ftw_banks(
     row_jobs = []  # (name, HostBank, window_off, window_len, layer_bytes) -- flat layout
     layer_jobs = []  # (name, HostBank, entry) -- per-layer layout, direct aligned read
 
+    if pooled and flat_entries:
+        reader.close()
+        raise ValueError("--moe-vram-only needs per-layer expert banks; reconvert the checkpoint with `ft checkpoint`")
+
     for e in flat_entries:
         name = e["name"]
         total, *row_shape = e["shape"]
@@ -965,7 +1000,7 @@ def load_ftw_banks(
             e = by_layer[layer_id]
             assert e["global_off"] % ALIGN == 0, (base, layer_id, e["global_off"])  # writer invariant
             if tp_loc is None:
-                bank = HostBank(tuple(e["shape"]), _dtype_of(e["dtype"]), backing=_backing(layer_id))
+                bank = _bank_for(base, layer_id, tuple(e["shape"]), _dtype_of(e["dtype"]))
                 row_hb[base].append(bank)
                 row_view_args[base].append(None)
                 layer_jobs.append((base, bank, e, layer_id))
@@ -977,12 +1012,71 @@ def load_ftw_banks(
             shape = tuple(e["shape"])
             axis = _band_axis(base, shape, expert_quant)
             sliced, segs, mem_axis = _tp_band_plan(base, shape, lo, hi, I_full, I_loc, _elsize(_dtype_of(e["dtype"])), axis=axis)
-            bank = HostBank(sliced, _dtype_of(e["dtype"]), backing=_backing(layer_id))
+            bank = _bank_for(base, layer_id, sliced, _dtype_of(e["dtype"]))
             row_hb[base].append(bank)
             row_view_args[base].append(None)
             layer_jobs.append((base, bank, e, layer_id, segs, tp_loc, mem_axis))
 
-    total_bytes = sum(e["nbytes"] for e in bank_entries)
+    late_jobs: dict[int, list] = {}
+    if pooled and late_vram_bytes > 0:
+        layer_bytes = sum(job[1].nbytes for job in layer_jobs if job[3] == 0)
+        # one layer at least loads now: until a late layer is read, its experts stand in for it
+        first_late = num_layers - min(num_layers - 1, late_vram_bytes // max(layer_bytes, 1))
+        for job in layer_jobs:
+            if job[3] >= first_late:
+                late_jobs.setdefault(job[3], []).append(job)
+        layer_jobs = [job for job in layer_jobs if job[3] < first_late]
+
+    # The down-family full-entry read is band-strided per H-row, so it reads the
+    # whole entry transiently and slices in memory. It is followed by a 3-D
+    # NumPy copy plus the bank scatter, and a nested per-call worker pool here
+    # would oversubscribe the cores (outer pool x inner pool threads) -- a single
+    # serial pread chain per job, with several jobs running concurrently, keeps
+    # the device saturated without the thrash.
+    down_sem = threading.Semaphore(_DOWN_READ_CONCURRENCY)
+
+    def _fill_layer_bank(job, reader, transients) -> None:
+        """Read one (bank, layer) job into its bank; settling the bank is the caller's."""
+        if len(job) == 4:
+            _name, bank, entry, _layer_id = job
+            reader.read_into(bank.memoryview(), entry, workers=1, chunk=chunk)
+            return
+        base, bank, entry, _layer_id, segs, tp_band, mem_axis = job
+        if segs == "full":
+            # _global banks: no intermediate axis, full-width on every rank
+            reader.read_into(bank.memoryview(),
+                             {"global_off": entry["global_off"], "nbytes": entry["nbytes"]},
+                             workers=1, chunk=chunk)
+        elif segs is None:
+            with down_sem:
+                # The intermediate axis is not the leading per-expert axis (the
+                # NVFP4 down-family, and every WNA16 bank): read the full entry
+                # transiently and slice ``mem_axis`` in memory, straight into the
+                # bank. The transient is a pooled page-aligned mmap (O_DIRECT
+                # rejects a bytearray base).
+                tmp = transients.acquire(entry["nbytes"])
+                arr = dst = None
+                try:
+                    reader.read_into(memoryview(tmp),
+                                     {"global_off": entry["global_off"], "nbytes": entry["nbytes"]},
+                                     workers=1, chunk=chunk)
+                    shape = tuple(entry["shape"])
+                    dt = _dtype_of(entry["dtype"])
+                    arr = np.frombuffer(tmp, dtype=_np_dtype(dt), count=entry["nbytes"] // _elsize(dt)).reshape(shape)
+                    dst = np.frombuffer(bank.memoryview(), dtype=_np_dtype(dt), count=bank.nbytes // _elsize(dt)).reshape(bank.tensor.shape)
+                    _slice_band_into(dst, arr, base, shape, tp_band, mem_axis, expert_quant)
+                finally:
+                    # np.frombuffer(tmp) exports a buffer on the mmap; releasing
+                    # it to the pool while the array lives would let a later
+                    # close fail ("exported pointers exist"), so drop the views first.
+                    del arr, dst
+                    transients.release(tmp)
+        else:
+            _read_band_segments(reader, bank, entry, segs, chunk)
+
+    total_bytes = sum(e["nbytes"] for e in bank_entries) - sum(
+        job[2]["nbytes"] for jobs in late_jobs.values() for job in jobs
+    )
     bar = byte_bar(total_bytes, f"Loading {kind} (FTW)", monitor=True)
 
     # Jobs are per (bank, layer) -- many small reads, so a wider pool; each bank pins
@@ -1009,53 +1103,9 @@ def load_ftw_banks(
                 pins.submit(bank, residency[layer_id])
                 bar.update(layer_bytes)
 
-            # The down-family full-entry read is band-strided per H-row, so it reads the
-            # whole entry transiently and slices in memory. It is followed by a 3-D
-            # NumPy copy plus the bank scatter, and a nested per-call worker pool here
-            # would oversubscribe the cores (outer pool x inner pool threads) -- a single
-            # serial pread chain per job, with several jobs running concurrently, keeps
-            # the device saturated without the thrash.
-            down_sem = threading.Semaphore(_DOWN_READ_CONCURRENCY)
-
             def _read_layer(job):
-                if len(job) == 7:
-                    base, bank, entry, layer_id, segs, tp_band, mem_axis = job
-                    if segs == "full":
-                        # _global banks: no intermediate axis, full-width on every rank
-                        reader.read_into(bank.memoryview(),
-                                         {"global_off": entry["global_off"], "nbytes": entry["nbytes"]},
-                                         workers=1, chunk=chunk)
-                    elif segs is None:
-                        with down_sem:
-                            # The intermediate axis is not the leading per-expert axis (the
-                            # NVFP4 down-family, and every WNA16 bank): read the full entry
-                            # transiently and slice ``mem_axis`` in memory, straight into the
-                            # bank. The transient is a pooled page-aligned mmap (O_DIRECT
-                            # rejects a bytearray base).
-                            tmp = transients.acquire(entry["nbytes"])
-                            arr = dst = None
-                            try:
-                                reader.read_into(memoryview(tmp),
-                                                 {"global_off": entry["global_off"], "nbytes": entry["nbytes"]},
-                                                 workers=1, chunk=chunk)
-                                shape = tuple(entry["shape"])
-                                dt = _dtype_of(entry["dtype"])
-                                arr = np.frombuffer(tmp, dtype=_np_dtype(dt), count=entry["nbytes"] // _elsize(dt)).reshape(shape)
-                                dst = np.frombuffer(bank.memoryview(), dtype=_np_dtype(dt), count=bank.nbytes // _elsize(dt)).reshape(bank.tensor.shape)
-                                _slice_band_into(dst, arr, base, shape, tp_band, mem_axis, expert_quant)
-                            finally:
-                                # np.frombuffer(tmp) exports a buffer on the mmap; releasing
-                                # it to the pool while the array lives would let a later
-                                # close fail ("exported pointers exist"), so drop the views first.
-                                del arr, dst
-                                transients.release(tmp)
-                    else:
-                        _read_band_segments(reader, bank, entry, segs, chunk)
-                    pins.submit(bank, residency[layer_id])
-                    bar.update(entry["nbytes"])
-                    return
-                _name, bank, entry, layer_id = job
-                reader.read_into(bank.memoryview(), entry, workers=1, chunk=chunk)
+                bank, entry, layer_id = job[1], job[2], job[3]
+                _fill_layer_bank(job, reader, transients)
                 pins.submit(bank, residency[layer_id])
                 bar.update(entry["nbytes"])
 
@@ -1069,6 +1119,22 @@ def load_ftw_banks(
         bar.close()
         reader.close()
         transients.close()
+
+    late = None
+    if late_jobs:
+        def _load_late(layer_id: int) -> None:
+            late_reader, late_transients = FTWReader(path), _TransientPool()
+            try:
+                jobs = late_jobs.pop(layer_id)
+                with ThreadPoolExecutor(len(jobs)) as ex:
+                    list(ex.map(lambda job: _fill_layer_bank(job, late_reader, late_transients), jobs))
+                for job in jobs:
+                    job[1].pin()
+            finally:
+                late_reader.close()
+                late_transients.close()
+
+        late = LateLayers(sorted(late_jobs), _load_late)
 
     sources: dict[str, list] = {}
     for name, banks in row_hb.items():
@@ -1134,6 +1200,8 @@ def load_ftw_banks(
         # canonical keys: the re-slicer matches sources' canonical roles — a legacy
         # name here would miss the dispose and keep the full banks pinned forever
         host_banks={canonical_role(name): list(banks) for name, banks in row_hb.items()},
+        host_pools={canonical_role(name): pool for name, pool in pools.items()} or None,
+        late_layers=late,
     )
 
 

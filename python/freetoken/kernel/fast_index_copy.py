@@ -150,6 +150,13 @@ def _jit_fast_index_copy_multi_module(*, num_threads: int, blocks_per_bank: int)
     )
 
 
+def build_fast_index_copy_multi(*, num_threads: int = 512, blocks_per_bank: int = 2) -> None:
+    """Compile (or load from the build cache) one grid of ``fast_index_copy_multi_jit`` now,
+    so a grid first used deep inside a request does not stall it for the compile."""
+    if not _skip_fast_index_copy_enabled():
+        _jit_fast_index_copy_multi_module(num_threads=num_threads, blocks_per_bank=blocks_per_bank)
+
+
 def fast_index_copy_multi_jit(
     dst_ptrs: torch.Tensor,
     src_ptrs: torch.Tensor,
@@ -188,6 +195,45 @@ def fast_index_copy_multi_jit(
         num_threads=num_threads, blocks_per_bank=blocks_per_bank
     )
     module.launch(dst_ptrs, src_ptrs, feat_bytes, dst_indices, src_indices, num_indices)
+
+
+@lru_cache(maxsize=None)
+def _jit_fast_index_exchange_multi_module(*, num_threads: int, blocks_per_bank: int) -> Module:
+    args = make_cpp_args(num_threads, blocks_per_bank)
+    return load_jit(
+        "fast_index_exchange_multi",
+        *args,
+        cuda_files=["fast_index_copy.cuh"],
+        cuda_wrappers=[("launch", f"&MultiIndexExchangeKernel<{args}>::run")],
+    )
+
+
+def fast_index_exchange_multi_jit(
+    slot_ptrs: torch.Tensor,
+    host_ptrs: torch.Tensor,
+    feat_bytes: torch.Tensor,
+    slots: torch.Tensor,
+    rows: torch.Tensor,
+    store_rows: torch.Tensor,
+    write_back: torch.Tensor,
+    num_indices: torch.Tensor,
+    *,
+    num_threads: int = 512,
+    blocks_per_bank: int = 2,
+) -> None:
+    """``fast_index_copy_multi_jit`` for a host pool that holds each expert at most once.
+
+    Moves host row ``rows[i]`` into slot ``slots[i]`` for every bank; where ``write_back[i]`` is
+    1 the slot's old bytes land in host row ``store_rows[i]`` in the same pass (that may be
+    ``rows[i]`` itself: the two swap), and where it is 2 the slot is only stored there. On a
+    PCIe 4.0 x8 RTX 3080 a swap moves 11.2 GB/s each way, against 13.4 GB/s for the plain copy.
+    ``host_ptrs`` are the per-bank GPU-visible pool bases; the index tensors are int32."""
+    if _skip_fast_index_copy_enabled():
+        return
+    module = _jit_fast_index_exchange_multi_module(
+        num_threads=num_threads, blocks_per_bank=blocks_per_bank
+    )
+    module.launch(slot_ptrs, host_ptrs, feat_bytes, slots, rows, store_rows, write_back, num_indices)
 
 
 def update_copy_flag_jit(sync_flag: torch.Tensor, delta: int) -> None:

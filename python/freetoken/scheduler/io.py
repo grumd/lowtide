@@ -91,6 +91,16 @@ class SchedulerIOMixin:
     def run_when_idle(self):
         raise NotImplementedError("should be implemented")
 
+    def idle_step(self) -> bool:
+        """One bounded piece of idle work; True while more is left."""
+        return False
+
+    def _idle(self, queue) -> None:
+        """Idle work until it is done or a message is waiting in ``queue``."""
+        self.run_when_idle()
+        while queue.empty() and self.idle_step():
+            pass
+
     def offline_receive_msg(self, blocking: bool = False) -> List[BaseBackendMsg]:
         raise NotImplementedError("should be implemented")
 
@@ -103,7 +113,7 @@ class SchedulerIOMixin:
     def _recv_msg_single_rank(self, blocking: bool = False) -> List[BaseBackendMsg]:
         pending_msgs: List[BaseBackendMsg] = []
         if blocking:
-            self.run_when_idle()
+            self._idle(self._recv_from_tokenizer)
             pending_msgs.append(self._recv_from_tokenizer.get())
         while not self._recv_from_tokenizer.empty():
             pending_msgs.append(self._recv_from_tokenizer.get())
@@ -112,7 +122,7 @@ class SchedulerIOMixin:
     def _recv_msg_multi_rank0(self, blocking: bool = False) -> List[BaseBackendMsg]:
         pending_msgs: List[BaseBackendMsg] = []
         if blocking:
-            self.run_when_idle()
+            self._idle(self._recv_from_tokenizer)
             raw = self._recv_from_tokenizer.get_raw()
             self._send_into_ranks.put_raw(raw)
             pending_msgs.append(self._recv_from_tokenizer.decode(raw))
@@ -137,7 +147,7 @@ class SchedulerIOMixin:
     def _recv_msg_multi_rank1(self, blocking: bool = False) -> List[BaseBackendMsg]:
         pending_msgs: List[BaseBackendMsg] = []
         if blocking:
-            self.run_when_idle()
+            self._idle(self._recv_from_rank0)
             pending_msgs.append(self._recv_from_rank0.get())
 
         # ensure all ranks have the same number of raw messages

@@ -6,6 +6,12 @@ import torch
 import triton
 import triton.language as tl
 from flashlib.kernels.slot_cache import lru_ensure
+from flashlib.kernels.slot_cache.triton.lru_ensure import (
+    _STREAMING_MAX_K,
+    _STREAMING_THRESHOLD,
+    _lru_ensure_kernel,
+    _num_warps_for,
+)
 
 # Hybrid backend: which of a step's missing experts to fetch (when capped below the miss
 # count). "recency" (default) fetches the experts most-recently active before this step
@@ -16,7 +22,7 @@ _HYBRID_FETCH_BY_RECENCY = (
 )
 
 
-def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> bool:
     """Make this layer's routed experts resident; rewrite ``expert_ids`` to slot ids.
 
     Delegates to flashlib's slot cache. ``id_base`` maps this layer's expert ids into the
@@ -24,20 +30,46 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     ``src_indices`` back, so ``copy_missing`` still resolves against this layer's own host
     tensor. ``out_indices`` aliases the input, preserving the in-place rewrite every
     downstream GEMM depends on.
+
+    With host cells (``cache.pooled``) the same launch also plans the exchange (see
+    :func:`plan_exchange`), so a decode step pays no extra launch per layer for it. Returns
+    whether it did.
     """
-    lru_ensure(
-        expert_ids,
-        cache.slot_for_id.view(-1),
-        cache.id_of_slot,
-        cache.usage,
-        cache.step,
-        expert_ids,
-        cache.src_indices,
-        cache.evict_slots,
-        cache.num_indices,
-        stats=cache.lru_stats[layer_id] if cache.collect_stats else None,
-        id_base=layer_id * cache.num_experts,
+    k = expert_ids.numel()
+    stats = cache.lru_stats[layer_id] if cache.collect_stats else None
+    # flashlib routes a very large cache with a narrow query to its streaming kernel; that
+    # shape keeps the two launches
+    if not cache.pooled or (cache.cache_size >= _STREAMING_THRESHOLD and k <= _STREAMING_MAX_K):
+        lru_ensure(
+            expert_ids,
+            cache.slot_for_id.view(-1),
+            cache.id_of_slot,
+            cache.usage,
+            cache.step,
+            expert_ids,
+            cache.src_indices,
+            cache.evict_slots,
+            cache.num_indices,
+            stats=stats,
+            id_base=layer_id * cache.num_experts,
+        )
+        return False
+    assert expert_ids.dtype == torch.int32 and expert_ids.is_contiguous()
+    block_c = triton.next_power_of_2(cache.cache_size)
+    _ensure_planned_kernel[(1,)](
+        expert_ids, cache.slot_for_id.view(-1), cache.id_of_slot, cache.usage, cache.step,
+        cache.src_indices, cache.evict_slots, cache.num_indices, stats,
+        cache.host_row, cache.vram_only_owner, cache.vram_only_span, cache.cell_free,
+        cache.spare_cells, cache.xfer_rows, cache.xfer_store_rows, cache.xfer_write_back, cache.xfer_counts,
+        k, cache.cache_size, layer_id * cache.num_experts,
+        BLOCK_K=triton.next_power_of_2(k),
+        BLOCK_C=block_c,
+        BLOCK=triton.next_power_of_2(cache.num_experts),
+        USAGE_MAX=torch.iinfo(cache.usage.dtype).max,
+        COLLECT_STATS=stats is not None,
+        num_warps=_num_warps_for(block_c),
     )
+    return True
 
 
 def ensure_experts_hybrid(
@@ -74,13 +106,20 @@ def ensure_experts_split(cache, layer_id: int, expert_ids: torch.Tensor, topk_we
     T = x.shape[0]
     R = expert_ids.numel()
     H = x.shape[1]
+    # without host cells the plan arguments are never read (HOST_ROWS compiles them out)
+    plan = (
+        (cache.host_row, cache.vram_only_owner, cache.vram_only_span, cache.cell_free, cache.spare_cells,
+         cache.xfer_rows, cache.xfer_store_rows, cache.xfer_write_back, cache.xfer_counts)
+        if cache.pooled else (cache.slot_for_id,) * 9
+    )
     _ensure_experts_split_kernel[(1,)](
         expert_ids, topk_weights, x, io["x"], io["ids"], io["w"],
         cache.slot_for_id, cache.id_of_slot, cache.usage, cache.step,
         cache.evict_slots, cache.src_indices, cache.num_indices,
         cache.expert_recency, cache.fetch_credit, cache.split_stats,
-        frac_q16, layer_id, R, x.stride(0), topk_weights.stride(0),
-        H=H, TOKENS=T, TOP_K=R // T,
+        frac_q16, *plan,
+        layer_id, R, x.stride(0), topk_weights.stride(0),
+        H=H, TOKENS=T, TOP_K=R // T, HOST_ROWS=cache.pooled,
         num_experts=cache.num_experts, cache_size=cache.cache_size,
         BLOCK_E=triton.next_power_of_2(cache.num_experts),
         BLOCK_C=triton.next_power_of_2(cache.cache_size),
@@ -109,6 +148,24 @@ def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
         2 * num_experts,
         num_experts,
         BLOCK=triton.next_power_of_2(num_experts),
+    )
+
+
+def plan_exchange(cache, slots: torch.Tensor, ids: torch.Tensor, num: torch.Tensor, id_base: int) -> None:
+    """Host side of a staged fetch (``OffloadMoeCache.use_host_cells``): look up the host cell
+    of each expert ``id_base + ids[i]`` about to enter ``slots[i]`` (-> ``xfer_rows``) and decide
+    where the slot's resident goes if it has no host copy (-> ``xfer_store_rows``,
+    ``xfer_write_back``): to a spare cell while there are some, and the incoming expert keeps
+    its own; otherwise to the incoming expert's cell, which then is VRAM-only in its place.
+    An expert entering a slot whose resident has a host copy, or an empty one, keeps its cell,
+    except while the cache is being seeded (``vram_only_span[2]``), when it gives it up to
+    ``cell_free``. One launch, no host sync; at most ``num_experts`` entries, of distinct
+    experts and slots. Decode's ensure kernels do this in their own launch."""
+    _plan_exchange_kernel[(1,)](
+        slots, ids, num, cache.host_row, cache.vram_only_owner, cache.vram_only_span, cache.cell_free,
+        cache.spare_cells, cache.xfer_rows, cache.xfer_store_rows, cache.xfer_write_back, cache.xfer_counts,
+        id_base,
+        BLOCK=triton.next_power_of_2(cache.num_experts),
     )
 
 
@@ -461,6 +518,91 @@ def _prefill_hit_compact_kernel(
     tl.store(num_ptr, tl.sum(is_hit.to(tl.int64)))
 
 
+@triton.jit
+def _plan(
+    slots_ptr,       # [n] int32: destination slots
+    ids_ptr,         # [n] int32: incoming experts, relative to id_base
+    n,               # entries; the caller made the two arrays above visible (a barrier after its stores)
+    host_row_ptr,    # [num_layers * num_experts] int32: host cell of each expert, -1 = VRAM only
+    owner_ptr,       # [cache_size] int32: the VRAM-only expert of each slot, -1 = none
+    span_ptr,        # [4] int32: the slots [first, end) that may hold VRAM-only experts, 1 while seeding, spare cells left; device memory, so a captured graph follows every change
+    free_ptr,        # [num_layers * num_experts] int32: 1 for a host cell nobody holds
+    spare_ptr,       # [...] int32: free pinned cells set aside for evicted VRAM-only experts, taken from the top
+    rows_ptr,        # [n] int32 out: host cell each incoming expert is read from
+    store_rows_ptr,  # [n] int32 out: host cell the slot's old bytes go to
+    wb_ptr,          # [n] int32 out: 1 where the slot's old bytes are stored
+    counts_ptr,      # [3] int64: running totals of experts fetched, residents written back, and of those into spare cells
+    id_base,
+    BLOCK: tl.constexpr,
+):
+    # no entry reads what another writes: the slots are distinct, an incoming expert was
+    # missing before this step, so it is nobody's VRAM-only resident, and each spare cell goes
+    # to one entry
+    off = tl.arange(0, BLOCK)
+    lane = off < n
+    slot = tl.load(slots_ptr + off, mask=lane, other=0)
+    new_id = id_base + tl.load(ids_ptr + off, mask=lane, other=0)
+    row = tl.load(host_row_ptr + new_id, mask=lane, other=0)
+    held = lane & (slot >= tl.load(span_ptr)) & (slot < tl.load(span_ptr + 1))
+    old_id = tl.load(owner_ptr + slot, mask=held, other=-1)
+    evict = held & (old_id >= 0)
+    seed = held & (old_id < 0) & (tl.load(span_ptr + 2) != 0)
+    spares = tl.load(span_ptr + 3)
+    rank = tl.cumsum(evict.to(tl.int32), axis=0) - 1
+    spared = evict & (rank < spares)
+    store_row = tl.where(spared, tl.load(spare_ptr + (spares - 1 - rank), mask=spared, other=0), row)
+    gives = (evict & (rank >= spares)) | seed  # the incoming expert gives its cell up
+    tl.store(rows_ptr + off, row, mask=lane)
+    tl.store(store_rows_ptr + off, store_row, mask=lane)
+    tl.store(wb_ptr + off, evict.to(tl.int32), mask=lane)
+    tl.store(host_row_ptr + old_id, store_row, mask=evict)
+    tl.store(host_row_ptr + new_id, -1, mask=gives)
+    tl.store(owner_ptr + slot, tl.where(spared, -1, new_id).to(tl.int32), mask=evict | seed)
+    tl.store(free_ptr + row, 1, mask=seed)
+    used = tl.sum(spared.to(tl.int32), axis=0)
+    tl.store(span_ptr + 3, spares - used)
+    # one vectorized store per counter row, not scalar ones every thread repeats
+    ci = tl.arange(0, 4)
+    add = tl.where(ci == 0, tl.sum(lane.to(tl.int64), axis=0),
+                   tl.where(ci == 1, tl.sum(evict.to(tl.int64), axis=0), used.to(tl.int64)))
+    tl.store(counts_ptr + ci, tl.load(counts_ptr + ci, mask=ci < 3, other=0) + add, mask=ci < 3)
+
+
+@triton.jit(do_not_specialize=["id_base"])
+def _plan_exchange_kernel(
+    slots_ptr, ids_ptr, num_ptr, host_row_ptr, owner_ptr, span_ptr, free_ptr, spare_ptr,
+    rows_ptr, store_rows_ptr, wb_ptr, counts_ptr, id_base,
+    BLOCK: tl.constexpr,
+):
+    n = tl.load(num_ptr)
+    if n > 0:
+        _plan(slots_ptr, ids_ptr, n, host_row_ptr, owner_ptr, span_ptr, free_ptr, spare_ptr,
+              rows_ptr, store_rows_ptr, wb_ptr, counts_ptr, id_base, BLOCK)
+
+
+@triton.jit(do_not_specialize=["K", "num_cached", "id_base"])
+def _ensure_planned_kernel(
+    query_ptr, slot_of_id_ptr, id_of_slot_ptr, usage_ptr, step_ptr,
+    src_ptr, dst_ptr, num_ptr, stats_ptr,
+    host_row_ptr, owner_ptr, span_ptr, free_ptr, spare_ptr, rows_ptr, store_rows_ptr, wb_ptr, counts_ptr,
+    K, num_cached, id_base,
+    BLOCK_K: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK: tl.constexpr,
+    USAGE_MAX: tl.constexpr, COLLECT_STATS: tl.constexpr,
+):
+    """flashlib's LRU admission (in place: the slots replace the query), then the exchange plan
+    for what it admitted (:func:`plan_exchange`), in one launch."""
+    _lru_ensure_kernel(
+        query_ptr, slot_of_id_ptr, id_of_slot_ptr, usage_ptr, step_ptr,
+        query_ptr, src_ptr, dst_ptr, num_ptr, stats_ptr, K, num_cached, id_base,
+        BLOCK_K, BLOCK_C, USAGE_MAX, COLLECT_STATS,
+    )
+    tl.debug_barrier()  # the admission's stores, before the plan loads them
+    n = tl.load(num_ptr)
+    if n > 0:
+        _plan(dst_ptr, src_ptr, n, host_row_ptr, owner_ptr, span_ptr, free_ptr, spare_ptr,
+              rows_ptr, store_rows_ptr, wb_ptr, counts_ptr, id_base, BLOCK)
+
+
 _I64_MAX = tl.constexpr(9223372036854775807)
 _I64_MIN = tl.constexpr(-1152921504606846976)
 
@@ -471,8 +613,9 @@ def _ensure_experts_split_kernel(
     slot_for_id_ptr, id_of_slot_ptr, usage_ptr, step_ptr,
     evict_slots_ptr, src_indices_ptr, num_indices_ptr,
     recency_ptr, credit_ptr, stats_ptr,
-    frac_ptr, layer_id, num_active, x_stride, w_stride,
-    H: tl.constexpr, TOKENS: tl.constexpr, TOP_K: tl.constexpr,
+    frac_ptr, host_row_ptr, owner_ptr, span_ptr, free_ptr, spare_ptr, rows_ptr, store_rows_ptr, wb_ptr,
+    counts_ptr, layer_id, num_active, x_stride, w_stride,
+    H: tl.constexpr, TOKENS: tl.constexpr, TOP_K: tl.constexpr, HOST_ROWS: tl.constexpr,
     num_experts: tl.constexpr, cache_size: tl.constexpr,
     BLOCK_E: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_H: tl.constexpr,
     STATS: tl.constexpr,
@@ -531,7 +674,12 @@ def _ensure_experts_split_kernel(
 
     s_r = tl.sum(tl.where(e_r[:, None] == off_e[None, :], new_slot[None, :], 0), axis=1)
     tl.store(ids_ptr + off_r, s_r, mask=r_mask)
-    tl.store(hids_ptr + off_r, tl.where(s_r < 0, e_r, -1), mask=r_mask)
+    if HOST_ROWS:
+        # the CPU reads a pooled host bank: its routes carry the pool row, not the expert id
+        on_cpu = r_mask & (s_r < 0)
+        tl.store(hids_ptr + off_r, tl.load(host_row_ptr + base + e_r, mask=on_cpu, other=-1), mask=r_mask)
+    else:
+        tl.store(hids_ptr + off_r, tl.where(s_r < 0, e_r, -1), mask=r_mask)
     w_off = (off_r // TOP_K) * w_stride + off_r % TOP_K
     tl.store(hw_ptr + off_r, tl.load(w_ptr + w_off, mask=r_mask, other=0.0), mask=r_mask)
     off_h = tl.arange(0, BLOCK_H)
@@ -545,3 +693,10 @@ def _ensure_experts_split_kernel(
         tl.atomic_add(row + 1, tl.sum(is_active.to(tl.int64)))
         tl.atomic_add(row + 2, num_missing.to(tl.int64))
         tl.atomic_add(row + 3, num_fetch.to(tl.int64))
+    if HOST_ROWS:
+        # the exchange plan for the fetched experts (plan_exchange), after the CPU's routes read
+        # their rows above: none of those is fetched or resident, so the plan leaves them alone
+        tl.debug_barrier()
+        if num_fetch > 0:
+            _plan(evict_slots_ptr, src_indices_ptr, num_fetch, host_row_ptr, owner_ptr, span_ptr, free_ptr,
+                  spare_ptr, rows_ptr, store_rows_ptr, wb_ptr, counts_ptr, base, BLOCK_E)
