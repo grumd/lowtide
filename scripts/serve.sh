@@ -1,5 +1,6 @@
 #!/bin/bash
-# Serve Qwen3.8-Flash-Next (INT4 or FP4 FTW checkpoint) on one or two GPUs.
+# Serve an FTW checkpoint (Qwen3.8-Flash-Next, Hy4-flash, ...) on one or two GPUs. The engine picks
+# the model- and hardware-specific settings itself; this script passes only universal ones.
 #
 #   MODEL=~/models/ftw/q38-fp4 scripts/serve.sh [ft serve flags...]
 #
@@ -17,9 +18,19 @@ HERE=$(dirname "$(readlink -f "$0")")
 : "${GPUS:=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | head -2 | paste -sd,)}"
 : "${GPUS:=0}"
 : "${PREFIX_CACHE_RAM_GB:=0}"
-: "${REQUIRED_FREE_RAM_GB:=$((75 + PREFIX_CACHE_RAM_GB))}"
-: "${RAM_LIMIT_GB:=$((78 + PREFIX_CACHE_RAM_GB))}"
 : "${MIN_FREE_RAM_GB:=2}"
+total=$(awk '/^MemTotal:/{printf "%d", $2/1048576}' /proc/meminfo)
+bank_gb=$(python3 -c 'import json, sys; t = json.load(open(sys.argv[1]))["tensors"]
+print(-(-sum(x["nbytes"] for x in t if x.get("kind") == "experts_bank") // 2**30))' "$MODEL/freetoken_weight.json" 2>/dev/null)
+if [ -n "$bank_gb" ] && [ $((bank_gb + 14 + PREFIX_CACHE_RAM_GB)) -le $((total - MIN_FREE_RAM_GB)) ]; then
+  # the banks fit the box: they, ~8 GiB of the server's own and room to grow (FP4 Qwen3.8: 64 + 14)
+  : "${RAM_LIMIT_GB:=$((bank_gb + 14 + PREFIX_CACHE_RAM_GB))}"
+  : "${REQUIRED_FREE_RAM_GB:=$((bank_gb + 11 + PREFIX_CACHE_RAM_GB))}"
+else
+  # the engine's RAM saver keeps VRAM-cached experts out of RAM; it still peaks near the banks
+  : "${RAM_LIMIT_GB:=$((total - MIN_FREE_RAM_GB))}"
+  : "${REQUIRED_FREE_RAM_GB:=$((${bank_gb:-0} + PREFIX_CACHE_RAM_GB))}"
+fi
 : "${FT_BIN:=$(dirname "$HERE")/.venv/bin/ft}"
 [ -x "$FT_BIN" ] || FT_BIN=$(command -v ft) || { echo "ft not found: install the repo or set FT_BIN" >&2; exit 1; }
 
@@ -43,18 +54,6 @@ args=(
   --enable-cache-report
 )
 [ "$PREFIX_CACHE_RAM_GB" != 0 ] && args+=(--cache-ram-gb "$PREFIX_CACHE_RAM_GB")
-# Shorter chunks load only their routed experts (the CPU computes 65% of the misses) instead of
-# streaming all of them over PCIe; the best cutoff was measured on RTX 3080s at PCIe 4.0 x8.
-if [ "$tp" = 1 ]; then
-  args+=(--moe-routed-prefill-tokens 4096)  # one GPU: a 4096-token chunk 4.8 -> 3.3 s; 8192 streams faster
-else
-  args+=(--moe-routed-prefill-tokens 3072)  # two GPUs: each streams half of every expert, so streaming wins sooner
-fi
-# One GPU: the CPU computes 90% of decode's expert-cache misses (FP4 28 -> 53 tok/s at 4k; INT4 needs
-# AVX-512 BF16). Two GPUs miss too rarely for it to pay. calibrate.sh measures the best share here.
-if [ "$tp" = 1 ] && grep -q -E '"quant_format": *"(nvfp4|w4a16)"' "$MODEL/freetoken_weight.json" 2>/dev/null; then
-  args+=(--moe-decode-fetch 0.1)
-fi
 
 # engine switches without a CLI flag; set them in the environment for A/B runs
 export FREETOKEN_WNA16_PREFILL_PRECISE=${FREETOKEN_WNA16_PREFILL_PRECISE:-1}
@@ -70,7 +69,7 @@ if [ "$avail" -lt "$REQUIRED_FREE_RAM_GB" ]; then
   exit 1
 fi
 
-echo "serve.sh: $MODEL_NAME on GPUS=$GPUS, http://$HOST:$PORT" >&2
+echo "serve.sh: $MODEL_NAME on GPUS=$GPUS, http://$HOST:$PORT, RAM cap ${RAM_LIMIT_GB} GiB" >&2
 unit=ft-serve-$$
 if command -v systemd-run >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then
   # --scope execs ft in place, so $! is the server; MemorySwapMax=0 keeps it out of zram

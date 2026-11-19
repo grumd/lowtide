@@ -71,15 +71,32 @@ def _serve(tmp_path, gpus, fmt="nvfp4", flags=(), keys=("--moe-decode-fetch", "-
     return {a: args[i + 1] for i, a in enumerate(args) if a in keys}
 
 
-@pytest.mark.parametrize("gpus,fmt,want", [("0", "nvfp4", {"--moe-decode-fetch": "0.1"}),
-                                           ("0,1", "nvfp4", {}), ("0", "w4a16", {})])
-def test_cpu_assisted_decode_default(tmp_path, gpus, fmt, want):
-    assert _serve(tmp_path, gpus, fmt) == want
+@pytest.mark.parametrize("gpus,fmt", [("0", "nvfp4"), ("0,1", "nvfp4"), ("0", "w4a16")])
+def test_model_settings_are_left_to_the_engine(tmp_path, gpus, fmt):
+    # the per-model routed-prefill cutoff and decode share are engine defaults (engine/auto_config.py)
+    assert _serve(tmp_path, gpus, fmt, keys=("--moe-decode-fetch", "--moe-routed-prefill-tokens")) == {}
 
 
-@pytest.mark.parametrize("gpus,want", [("0", "4096"), ("0,1", "3072")])
-def test_routed_prefill_cutoff_per_gpu_count(tmp_path, gpus, want):
-    assert _serve(tmp_path, gpus, keys=("--moe-routed-prefill-tokens",)) == {"--moe-routed-prefill-tokens": want}
+def _serve_stderr(tmp_path, bank_bytes):
+    snap = _snap(tmp_path)
+    banks = [{"kind": "experts_bank", "nbytes": bank_bytes - bank_bytes // 2}, {"kind": "experts_bank", "nbytes": bank_bytes // 2},
+             {"kind": "weight", "nbytes": 50 * 2**30}]
+    (snap / "freetoken_weight.json").write_text(json.dumps({"quant_format": "nvfp4", "tensors": banks}))
+    stub = tmp_path / "ft"
+    stub.write_text("#!/bin/bash\n")
+    stub.chmod(0o755)
+    env = dict(os.environ, MODEL=str(snap), FT_BIN=str(stub), GPUS="0", MIN_FREE_RAM_GB="0", PORT="1")
+    return subprocess.run(["bash", str(SCRIPTS / "serve.sh")], env=env, capture_output=True, text=True, timeout=60).stderr
+
+
+def test_ram_gates_follow_the_expert_banks(tmp_path):
+    assert "RAM cap 25 GiB" in _serve_stderr(tmp_path, 10 * 2**30 + 1)  # 11 GiB of banks + 14
+
+
+def test_banks_beyond_the_box_need_the_banks_free(tmp_path):
+    # past the box the engine's RAM saver takes over; the script still wants the banks' size free
+    err = _serve_stderr(tmp_path, 100000 * 2**30)
+    assert "REFUSING TO START" in err and "REQUIRED_FREE_RAM_GB is 100000" in err
 
 
 def test_flags_override_the_default(tmp_path):

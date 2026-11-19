@@ -2,18 +2,19 @@
 
 | Script | Purpose |
 |---|---|
-| `serve.sh` | serve Qwen3.8-Flash-Next (INT4 or FP4) on one or two GPUs |
+| `serve.sh` | serve an FTW checkpoint (Qwen3.8-Flash-Next INT4 / FP4, Hy4-flash) on one or two GPUs |
 | `calibrate.sh`, `calibrate.py` | measure the best CPU-assisted decode flags for this machine |
 | `build-release-wheels.sh`, `publish-wheels.sh`, `ci/` | upstream wheel builds and releases, used by `.github/workflows` |
 
 ## `serve.sh`
 
-Serves Qwen3.8-Flash-Next from an FTW checkpoint: experts pinned in host RAM behind a VRAM expert cache that takes whatever the live context does not need, the PLE n-gram table read from disk, the vision tower on the CPU, and hybrid CPU/GPU prefill. Up to 262144 tokens of context, one request at a time; the per-setup numbers are in the [main README](../README.md#what-to-expect).
+One command for every FTW checkpoint: `ft serve` recognises the model from the checkpoint and picks its model- and hardware-specific settings itself (see [Automatic settings](#automatic-settings)), so the script passes only universal flags. For Qwen3.8-Flash-Next: experts pinned in host RAM behind a VRAM expert cache that takes whatever the live context does not need, the PLE n-gram table read from disk, the vision tower on the CPU, and hybrid CPU/GPU prefill. Up to 262144 tokens of context, one request at a time; the per-setup numbers are in the [main README](../README.md#what-to-expect).
 
 ```bash
 MODEL=~/models/ftw/q38-fp4 scripts/serve.sh                          # every GPU, up to two
 MODEL=~/models/ftw/q38-fp4 GPUS=1 scripts/serve.sh                   # the second GPU only
 MODEL=~/models/ftw/q38-fp4 scripts/serve.sh --prefill-batch-min 1024   # any ft serve flag
+MODEL=~/models/ftw/hy4-flash-nvfp4-fp8dense scripts/serve.sh         # Hy4-flash, two GPUs
 ```
 
 The API is OpenAI/Anthropic-compatible at `http://127.0.0.1:8080/v1`, with a chat page at `/`. The script prints `model loaded` once `/health` reports ok. An FTW loads in about 1 min.
@@ -22,7 +23,7 @@ What the script does, top to bottom:
 
 1. **Settings** from the environment (table below).
 2. **The `ft serve` command line:** the tuned defaults. Flags you pass after the script name come later and override them.
-3. **RAM safety:** pinned memory cannot swap, so running out of RAM freezes the host instead of reaching the OOM killer. The script refuses to start under `REQUIRED_FREE_RAM_GB`, runs the server in a systemd user scope capped at `RAM_LIMIT_GB` with no swap (plain `setsid` without a systemd user session), and kills it if free RAM drops below `MIN_FREE_RAM_GB`.
+3. **RAM safety:** pinned memory cannot swap, so running out of RAM freezes the host instead of reaching the OOM killer. The script runs the server in a systemd user scope capped at `RAM_LIMIT_GB` with no swap (plain `setsid` without a systemd user session), refuses to start under `REQUIRED_FREE_RAM_GB`, and kills the server if free RAM drops below `MIN_FREE_RAM_GB`. Both gates follow the checkpoint's expert banks (from `freetoken_weight.json`) and the box's RAM; the engine itself refuses when even its RAM saver could not make the model fit.
 4. **Shutdown:** on TERM/INT it stops `ft`, then kills whatever is left of the server (a TP worker that outlives `ft` keeps a GPU and its pinned experts), within llama-manager's 10 s deadline.
 
 | | INT4 | FP4 |
@@ -45,8 +46,8 @@ Measured on 2x RTX 3080 20GB (PCIe 4.0 x8 each), a Ryzen 7 9800X3D, 96 GB DDR5 a
 | `HOST`, `PORT` | `127.0.0.1`, `8080` | listen address |
 | `GPUS` | every GPU `nvidia-smi` lists, at most two | nvidia-smi indices; the count sets the TP size. Context and expert cache size themselves to the VRAM |
 | `PREFIX_CACHE_RAM_GB` | `0` | whole GiB of pinned host RAM for evicted prompt prefixes (`--cache-ram-gb`). With 128 GB of RAM, `16` keeps about 520k tokens of older conversations; going back to one reloads it (13.6k tokens in 27 ms instead of 6.3 s). Raises `REQUIRED_FREE_RAM_GB` and `RAM_LIMIT_GB` by as much. Leave it off on 96 GB |
-| `REQUIRED_FREE_RAM_GB` | `75` + `PREFIX_CACHE_RAM_GB` | refuse to start with less free RAM (`MemAvailable`) than this. Lowering it can freeze the host |
-| `RAM_LIMIT_GB` | `78` + `PREFIX_CACHE_RAM_GB` | hard RAM cap of the server (its systemd scope, no swap) |
+| `RAM_LIMIT_GB` | expert banks + 14 + `PREFIX_CACHE_RAM_GB`; MemTotal - `MIN_FREE_RAM_GB` where that does not fit the box | hard RAM cap of the server (its systemd scope, no swap): the banks, ~8 GiB of the server's own and room to grow (FP4 Qwen3.8: 64 + 14 = 78). Where the box cannot hold that, the engine's RAM saver keeps VRAM-cached experts out of RAM (Hy4-flash on 96 GB: 90) |
+| `REQUIRED_FREE_RAM_GB` | expert banks + 11 + `PREFIX_CACHE_RAM_GB`; the banks + `PREFIX_CACHE_RAM_GB` where they do not fit the box | refuse to start with less free RAM (`MemAvailable`) than this (FP4 Qwen3.8: 75; Hy4-flash: 79, it peaks at 75-78 GiB with the RAM saver) |
 | `MIN_FREE_RAM_GB` | `2` | kill the server when free RAM (`MemAvailable`) drops below this; guards the rest of the desktop |
 | `FT_BIN` | `.venv/bin/ft`, else `ft` on PATH | `ft` binary |
 
@@ -56,15 +57,26 @@ Measured on 2x RTX 3080 20GB (PCIe 4.0 x8 each), a Ryzen 7 9800X3D, 96 GB DDR5 a
 |---|---|
 | `--moe-strategy offload` | experts in host RAM; KV and the expert cache share VRAM at runtime (elastic VRAM, the engine's behaviour for offload MoE), so the cache gets whatever the live context does not need (decode +16%, output identical) and the context shrinks to what fits |
 | `--max-running-requests 1` | batching loses: 3 streams at once decode slower in total than 1 |
-| `--moe-routed-prefill-tokens 4096` (one GPU), `3072` (two) | chunks up to this size load only their routed experts, the CPU computing 65% of the misses (`--moe-prefill-fetch`), instead of streaming every expert over PCIe (~2.4 s per chunk at x8 gen4). One RTX 3080, FP4, an agent turn on a cached 16k prefix: 4k new tokens 4.78 -> 3.26 s, while an 8k chunk is faster streamed (4.83 s against 5.79 routed). Two GPUs each stream half of every expert, so streaming wins from a smaller chunk. Re-tune on another link or CPU; about `1280` with `--moe-prefill-fetch 1` |
 | `--moe-prefill-hit-d2d` | longer chunks copy VRAM-cached experts device-side and stream only the misses (pp16384 -14%, output identical) |
 | `--vision-on-cpu --vision-threads 8` | the ViT would take 0.84 GiB of VRAM on every GPU; 16 threads encode a full-size image in 3.5 s, 4 in 6.8 s |
 | `--mtp off` | MTP is opt-in: one GPU `--mtp on --mtp-experts-fp4 --mtp-draft-tokens 2` (55 -> 60 tok/s on a prose reply at temperature 1.0), two GPUs `--mtp on --mtp-experts-fp4 --moe-decode-fetch 0.5` (91 -> 102). Lossless; see the main README |
 | `--ngram-spec` | Prompt-lookup drafts verified in one window, no draft model. FP4, a code edit that copies a 351-line file back: one RTX 3080 52.5 -> 84.6 tok/s, two 81.9 -> 126.7. Prose +2% on one GPU, -2% on two (its verify graphs take ~170 expert slots per GPU); agent turns even. Lossless (verified tokens only); `--no-ngram-spec` turns it off. Not measured with parallel requests yet |
 | `--enable-cache-report` | `usage.prompt_tokens_details.cached_tokens`, so clients can tell a prefix-cache hit from prefill |
-| `--moe-decode-fetch 0.1` | FP4 or INT4 on one GPU only: decode fetches 10% of its expert-cache misses over PCIe and the CPU computes the rest (FP4 28 -> 53 tok/s at 4k, 20 -> 46 at 261k; INT4 needs AVX-512 BF16). Two GPUs miss too rarely for it to pay. `calibrate.sh` finds the best value for your machine; `1` = plain decode |
 
-Prefill chunks (`ft serve` defaults, so `serve.sh` passes nothing): a chunk needs 256 MiB + 230 KiB per token of VRAM for its activations. The standing reserve covers `--prefill-batch-min` (2048) tokens at any context length, and it alone bounds the context (one 16 GB GPU: about 208k tokens). A longer prompt takes what its chunk needs beyond that from the expert cache, coldest experts first, up to `--prefill-batch-max` (16384) tokens or whatever the KV cache leaves room for, and gives it back as empty slots before its first decode step. So a 5k-token agent turn retires about 290 expert slots instead of the 1040 a fixed 16384-token borrow took. Long chunks matter because a chunk past `--moe-routed-prefill-tokens` streams every expert over PCIe once: FP4 16k prompt 12.1 -> 6.7 s on one RTX 3080 with 16384- instead of 8192-token chunks, 7.8 -> 5.3 s on two (64k: 47.5 -> 28.1 s, 30.4 -> 21.0 s). An explicit `--max-prefill-length` caps both.
+`--vision-on-cpu` and `--ngram-spec` are no-ops on a model without vision or without n-gram verify support (Hy4-flash: the server logs `--ngram-spec ignored`; greedy texts equal with and without it).
+
+### Automatic settings
+
+With `--moe-strategy offload`, `ft serve` fills these in when the command line leaves them unset, once at start for every GPU; the line `auto settings for <model> on N GPU(s): ...` in the log says what it picked and why. A flag (or its `FREETOKEN_*` variable) always wins. All are lossless.
+
+| Setting | Rule | Qwen3.8-Flash-Next | Hy4-flash |
+|---|---|---|---|
+| `--moe-routed-prefill-tokens` | the model's measured cutoff for the GPU count (`SERVE_DEFAULTS` in its package). Chunks up to this size load only their routed experts, the CPU computing part of the misses (`--moe-prefill-fetch`), instead of streaming every expert over PCIe (~2.4 s per chunk at x8 gen4). Re-tune on another link or CPU with `calibrate.sh` | one GPU `4096` (FP4, 4k new tokens on a cached 16k prefix 4.78 -> 3.26 s; an 8k chunk is faster streamed), two `3072` (each GPU streams half of every expert, so streaming wins sooner); about `1280` with `--moe-prefill-fetch 1` | two GPUs `1069` (1069 tokens 1.76 s routed vs 2.62 streamed; 2093 2.96 vs 2.82), one `2048` |
+| `--moe-decode-fetch` | the model's measured share, for NVFP4 / W4A16 experts (W4A16 needs AVX-512 BF16): decode fetches that share of its expert-cache misses over PCIe and the CPU computes the rest. `calibrate.sh` finds the best value for your machine; `1` = plain decode | one GPU `0.1` (FP4 28 -> 53 tok/s at 4k, 20 -> 46 at 261k); two GPUs plain (misses too rare to pay; with MTP pass `0.5`) | `0.1` (two GPUs 23.6 -> 32.2 tok/s at 4k) |
+| `--moe-vram-only` (RAM saver) | on when the expert banks + 8 GiB do not fit in the host RAM free at start (and under the cgroup cap); `--no-moe-vram-only` turns it off. Refuses to start when RAM is short by more than the GPUs' VRAM | off (63.6 GiB banks) | on with 96 GB (78.2 GiB banks) |
+| `--prefill-batch-max` | where the RAM saver is on because RAM is short: free RAM sits near `--host-ram-keep-free-gb` once the cache is warm, so the longest chunk's worst case (every expert its workspace pushes out of VRAM needs a host cell back) must fit in it less 2 GiB, in steps of 1024. An explicit `--prefill-batch-max` or `--max-prefill-length` wins | `16384` (unchanged) | `4096` at the default 4 GiB floor (a 20k prompt in 14.9 s; 16384-token chunks ran the box out of RAM) |
+
+Prefill chunks (`ft serve` defaults, so `serve.sh` passes nothing): a chunk needs 256 MiB + 230 KiB per token of VRAM for its activations. The standing reserve covers `--prefill-batch-min` (2048) tokens at any context length, and it alone bounds the context (one 16 GB GPU: about 208k tokens). A longer prompt takes what its chunk needs beyond that from the expert cache, coldest experts first, up to `--prefill-batch-max` (16384; less where the RAM saver is on because RAM is short, see above) tokens or whatever the KV cache leaves room for, and gives it back as empty slots before its first decode step. So a 5k-token agent turn retires about 290 expert slots instead of the 1040 a fixed 16384-token borrow took. Long chunks matter because a chunk past `--moe-routed-prefill-tokens` streams every expert over PCIe once: FP4 16k prompt 12.1 -> 6.7 s on one RTX 3080 with 16384- instead of 8192-token chunks, 7.8 -> 5.3 s on two (64k: 47.5 -> 28.1 s, 30.4 -> 21.0 s). An explicit `--max-prefill-length` caps both.
 
 Other useful flags: `--moe-prefill-fetch` (the share of a routed prefill chunk's cache misses fetched over PCIe, the rest computed on the CPU; default 0.35 wherever the CPU kernel runs, `1` = no CPU; here 0.2 is faster for 1k-token turns but slower from 2k up), `-t`/`--threads` (CPU threads for CPU expert work, split across the GPUs; default all physical cores), `--prefill-reserve-gb` / `--vram-keep-free-mb` (CUDA OOM after a long prompt), `--dense-mxfp8-groups lm_head` (recommended for FP4: +5% decode on one GPU, rounds the lm_head to MXFP8 with no measurable KLD change; off by default because it is lossy), `--dense-fp8` (faster decode, lossy), `--moe-collect-stats` (status line with the decode miss split and CPU time).
 

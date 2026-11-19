@@ -36,6 +36,13 @@ SWA_WINDOW_CHECKPOINT_TOKENS = 8192
 # Serving context when --max-seq-len-override is not given (the rope table covers 1M).
 DEFAULT_CONTEXT = 262144
 
+# `ft serve` offload defaults per GPU count (engine/auto_config.py), from scripts/calibrate.sh on RTX 3080s
+# at PCIe 4.0 x8; numbers in scripts/README.md.
+SERVE_DEFAULTS = {
+    1: {"moe_routed_prefill_tokens": 2048, "moe_decode_fetch": 0.1},
+    2: {"moe_routed_prefill_tokens": 1069, "moe_decode_fetch": 0.1},
+}
+
 
 def swa_ring_enabled() -> bool:
     return os.environ.get(SWA_RING_ENV, "1").strip() not in ("", "0")

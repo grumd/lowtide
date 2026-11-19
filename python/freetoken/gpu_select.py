@@ -218,7 +218,26 @@ def _same_gpu(a: str, b: str) -> bool:
 
 
 def _nvml_uuids() -> "list[str] | None":
-    """Full GPU UUIDs in physical (nvidia-smi) order, or None when NVML is unavailable.
+    devices = _nvml_devices()
+    return None if devices is None else [uuid for uuid, _ in devices]
+
+
+def gpu_total_memory(specs: Sequence[str], count: int) -> "int | None":
+    """Total VRAM bytes of the --gpu entries (the first ``count`` GPUs without any); None when NVML
+    is unavailable or an entry does not resolve."""
+    devices = _nvml_devices()
+    if devices is None:
+        return None
+    try:
+        uuids = resolve_gpu_uuids(specs) if specs else [u for u, _ in devices[:count]]
+    except ValueError:
+        return None
+    total = dict(devices)
+    return sum(total[u] for u in uuids) if uuids and all(u in total for u in uuids) else None
+
+
+def _nvml_devices() -> "list[tuple[str, int]] | None":
+    """(full GPU UUID, total memory bytes) in physical (nvidia-smi) order, or None when NVML is unavailable.
 
     Own ctypes loader instead of torch's _raw_device_uuid_nvml: that helper only knows the Linux library name, raises (not None) when the library is missing, and is private API.
     NVML exports are cdecl on every platform, so CDLL is right on Windows too (same as nvidia-ml-py).
@@ -249,7 +268,7 @@ def _nvml_uuids() -> "list[str] | None":
             count = ctypes.c_int()
             if lib.nvmlDeviceGetCount_v2(ctypes.byref(count)) != 0:
                 return None
-            uuids = []
+            devices = []
             for i in range(count.value):
                 handle = ctypes.c_void_p()
                 if lib.nvmlDeviceGetHandleByIndex_v2(i, ctypes.byref(handle)) != 0:
@@ -257,8 +276,10 @@ def _nvml_uuids() -> "list[str] | None":
                 buf = ctypes.create_string_buffer(96)
                 if lib.nvmlDeviceGetUUID(handle, buf, 96) != 0:
                     return None
-                uuids.append(buf.value.decode("ascii", "replace"))
-            return uuids
+                mem = (ctypes.c_ulonglong * 3)()  # nvmlMemory_t: total, free, used
+                total = mem[0] if lib.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(mem)) == 0 else 0
+                devices.append((buf.value.decode("ascii", "replace"), int(total)))
+            return devices
         finally:
             lib.nvmlShutdown()
     except (OSError, AttributeError):

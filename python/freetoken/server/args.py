@@ -1168,16 +1168,18 @@ def parse_args(
 
     parser.add_argument(
         "--moe-vram-only",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         dest="moe_vram_only",
-        default=ServerArgs.moe_vram_only,
+        default=None,
         help=(
             "Save host RAM: an expert that stays cached in VRAM gives up its copy in RAM, and "
             "gets one back (written over PCIe into a spare cell) when it is evicted, so RAM holds "
             "the experts that are not cached, the recently fetched ones and a few spare cells. "
             "The expert cache itself and its sizing are unchanged; host RAM in use follows the "
             "cache size and how long experts stay cached (a cache that turns over every request "
-            "saves nothing and loses nothing). Needs an FTW checkpoint and --moe-prefill-hit-d2d."
+            "saves nothing and loses nothing). Needs an FTW checkpoint, --moe-strategy offload and "
+            "--moe-prefill-hit-d2d. Default: on when the expert banks and the server do not fit "
+            "in the host RAM free at start."
         ),
     )
 
@@ -1233,9 +1235,11 @@ def parse_args(
             "--moe-prefill-fetch) instead of streaming every expert of every layer over PCIe. "
             "Cuts the fixed per-chunk stream on PCIe-bound boxes; past the cutoff the overlapped "
             "stream wins again. The best cutoff depends on the PCIe link, the CPU and the GPU "
-            "count: on RTX 3080s at PCIe 4.0 x8 with a Ryzen 7 9800X3D it is 4096 on one GPU and "
-            "3072 on two (about 1280 with --moe-prefill-fetch 1); time your prompt sizes to tune "
-            "it. Default 0 (only extends under tokens * top_k < num_experts)."
+            "count (about 1280 with --moe-prefill-fetch 1 on Qwen3.8-Flash-Next); time your prompt "
+            "sizes to tune it, or use scripts/calibrate.sh. Default with --moe-strategy offload: the "
+            "model's value measured on RTX 3080s at PCIe 4.0 x8 with a Ryzen 7 9800X3D "
+            "(Qwen3.8-Flash-Next 4096 on one GPU, 3072 on two; Hy4-flash 2048 / 1069); other models 0 "
+            "(only extends under tokens * top_k < num_experts)."
         ),
     )
     parser.add_argument(
@@ -1261,8 +1265,10 @@ def parse_args(
         help=(
             "With --moe-strategy offload and NVFP4 or W4A16 experts: the share (0-1) of each decode step's "
             "expert-cache misses fetched over PCIe into the cache; the CPU computes the rest from "
-            "the pinned banks while the GPU runs the hits. 1 (default) = every miss over PCIe, "
-            "0 = every miss on the CPU (the cache then only changes during prefill)."
+            "the pinned banks while the GPU runs the hits. 1 = every miss over PCIe, "
+            "0 = every miss on the CPU (the cache then only changes during prefill). Default with "
+            "--moe-strategy offload: the model's measured share (Qwen3.8-Flash-Next 0.1 on one GPU; "
+            "Hy4-flash 0.1), else 1."
         ),
     )
     parser.add_argument(
@@ -1308,7 +1314,7 @@ def parse_args(
     # (where elastic VRAM is on they need --no-elastic-kv: engine._check_vram_flags).
     static_dests = (*STATIC_VRAM_FIELDS, "gpu_memory_ratio")
     unset = object()
-    parser.set_defaults(**dict.fromkeys((*static_dests, "max_extend_tokens"), unset))
+    parser.set_defaults(**dict.fromkeys((*static_dests, "max_extend_tokens", "prefill_batch_max"), unset))
     kwargs = parser.parse_args(args).__dict__.copy()
     kwargs["static_vram_flags"] = tuple(
         next(a.option_strings[0] for a in parser._actions if a.dest == d)
@@ -1317,6 +1323,9 @@ def parse_args(
     for d in static_dests:
         if kwargs[d] is unset:
             kwargs[d] = getattr(ServerArgs, d)
+    chunk_explicit = not (kwargs["prefill_batch_max"] is unset and kwargs["max_extend_tokens"] is unset)
+    if kwargs["prefill_batch_max"] is unset:
+        kwargs["prefill_batch_max"] = ServerArgs.prefill_batch_max
 
     # --mtp: resolve the draft-head mode into the env gate the model parsers read.
     # The parsers run in the spawned TP workers, which inherit this process's env;
@@ -1460,6 +1469,11 @@ def parse_args(
         "float32": torch.float32,
     }
     kwargs["dtype"] = DTYPE_MAP[dtype_str] if isinstance(dtype_str, str) else dtype_str
+    from freetoken.engine.auto_config import resolve_serving_defaults
+
+    resolve_serving_defaults(kwargs, chunk_explicit=chunk_explicit, tp_size=kwargs["tensor_parallel_size"])
+    if kwargs["moe_vram_only"] is None:
+        kwargs["moe_vram_only"] = False
     kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
     del kwargs["tensor_parallel_size"]
 
