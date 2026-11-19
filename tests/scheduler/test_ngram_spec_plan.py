@@ -59,6 +59,13 @@ def test_window_stops_before_the_snapshot_boundary():
     assert drafts == [4, 5, 6]
 
 
+def test_window_ignores_snapshot_boundaries_without_recurrent_state():
+    m = _mgr(interval=16)
+    m.sched.cache_manager.is_hybrid = False  # Hy4: no GDN state to snapshot
+    _, drafts, _ = m.plan_one(_req(list(range(1, 11)) + [1, 2, 3]))
+    assert len(drafts) == 7
+
+
 def test_window_respects_the_output_budget():
     _, drafts, _ = _mgr().plan_one(_req(_IDS, remain=3))
     assert drafts == [4, 5]
@@ -230,11 +237,42 @@ def test_ngram_spec_needs_a_qwen4_exp_style_verify():
     assert "per-width" in ngram_spec_unsupported(gdn, linear_state_pool=object())
     attn_only = SimpleNamespace()
     assert "all-position logits" in ngram_spec_unsupported(attn_only, linear_state_pool=None)
+    assert ngram_spec_unsupported(full, linear_state_pool=None) is None  # hy4: no recurrent pool
     with_mtp = SimpleNamespace(**{**vars(full), "mtp": object()})
     assert "MTP" in ngram_spec_unsupported(with_mtp, linear_state_pool=object())
     assert verify_store_attr(SimpleNamespace(_graph_verify={})) == "_graph_verify"
     assert verify_store_attr(SimpleNamespace(_verify_graph={})) == "_verify_graph"
     assert verify_store_attr(SimpleNamespace()) is None
+
+def test_publish_commits_a_pool_free_model():
+    """A model without a recurrent pool (Hy4) still gets its deferred verify state committed,
+    with the kept row count per request (pending token + accepted drafts)."""
+    m = _mgr(k=3)
+    commits, rolled = [], []
+    m.engine = SimpleNamespace(
+        device=torch.device("cpu"), linear_state_pool=None,
+        model=SimpleNamespace(commit_mtp_verify=lambda pool, slots, lens: commits.append((pool, lens.tolist()))),
+    )
+    m._req_stats, m.stats_rounds, m.stats_drafted, m.stats_accepted, m._a_hist = {}, 0, 0, 0, [0] * 4
+    m._rounds_logged = 0
+    sched = m.sched
+    sched.cache_manager.rollback_last = lambda r, keep: rolled.append(keep)
+    sched.token_pool = torch.zeros(1, 64, dtype=torch.int32)
+    sched.eos_token_ids, sched.toolcall_anchor_id = {99}, None
+    sched.decode_manager = SimpleNamespace(remove_req=lambda r: None)
+    sched.send_result = lambda reply: None
+    sched._kv_usage_pages = lambda: (0, 0)
+    sched._mamba_slot_usage = lambda: None
+    sched._swa_token_usage = lambda: None
+    sched._gpu_mem_bytes = lambda: 0
+    buf = torch.arange(64, dtype=torch.int32)
+    r = _Req(uid=1, table_idx=0, linear_slot_idx=None, _ids_buf=buf, input_ids=buf[:14], cached_len=10,
+             device_len=14, sampling_params=SimpleNamespace(ignore_eos=False, stop_strs=None),
+             output_budget_exhausted=False, toolcall_anchor_len=None)
+    r.append_host = lambda t: setattr(r, "input_ids", buf[: r.input_ids.numel() + 1])
+    m._publish([r], [10], 3, [[11, 12, 50]], [3], [2], [13])
+    assert commits == [(None, [3])] and rolled == [13] and r.cached_len == 13
+
 
 def _brute_propose(hist, max_k, min_match=3, max_match=64, ways=4):
     """Oracle: the WAYS most recent earlier ends of the final trigram, longest backward match

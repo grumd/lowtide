@@ -199,5 +199,36 @@ class Hy4ForCausalLM(BaseLLMModel):
         output = self.model.forward(get_global_ctx().batch.input_ids)
         return self.lm_head.forward(output)
 
+    def forward_logits_all(self) -> torch.Tensor:
+        """Every forwarded row's fp32 logits [T, vocab] (speculative verify), no last-row selection."""
+        return self.lm_head.forward_all(self.model.forward(get_global_ctx().batch.input_ids))
+
+    def select_verify_width(self, t: int) -> None:
+        """After a captured verify of width ``t`` (no Python ran): its stash is the one to commit."""
+        get_global_ctx().attn_backend.select_verify(t)
+
+    def verify_graph_host_fill(self, batch) -> None:
+        """Before a captured verify replays: stage its Engram rows into the graph buffers (the
+        graph WAITs on the fill's flag; the eager path does this in forward_host_ctx)."""
+        store = self.model._engram_store
+        if store is None:
+            return
+        from freetoken.models.qwen4_exp.ple_disk import _context
+
+        pad = store.table.eos_token_id
+        runs = [
+            torch.cat((
+                torch.tensor(_context(r.input_ids, r.cached_len, pad), dtype=torch.int64),
+                r.input_ids[r.cached_len : r.device_len].to(torch.int64),
+            ))
+            for r in batch.padded_reqs
+        ]
+        store.table.fill(runs, graph=True)
+
+    def commit_mtp_verify(self, pool, slots, lens) -> None:
+        """After a speculative verify: the only non-KV state a verify defers is the indexer's
+        tail ring (``lens`` [n] device int, rows kept per request; no recurrent pool)."""
+        get_global_ctx().attn_backend.commit_verify(lens)
+
 
 __all__ = ["Hy4ForCausalLM", "Hy4Model", "Hy4DecoderLayer", "Hy4LMHead"]

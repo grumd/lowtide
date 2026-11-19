@@ -416,7 +416,8 @@ class NgramSpecManager:
             drafts = self._drafter(r).propose(k)[0] if self.mode == "fixed" else []
             return (r, (self._truncate(drafts) + [0] * k)[:k], 0)
         # never commit past the next decode snapshot boundary (its GDN snapshot is taken on entry)
-        interval = sched.cache_manager.decode_snapshot_interval
+        cm = sched.cache_manager
+        interval = cm.decode_snapshot_interval if getattr(cm, "is_hybrid", True) else 0
         if interval:
             k = min(k, (r.cached_len // interval + 1) * interval - r.cached_len - 1)
         if k <= 0:
@@ -655,7 +656,8 @@ class NgramSpecManager:
                 sched.token_pool[r.table_idx, rext_end] = bonus_gpu[i].to(sched.token_pool.dtype)
         pool = eng.linear_state_pool
         graphs = getattr(eng, "ngram_verify_graphs", None)
-        if pool is not None:
+        # a model without recurrent layers may still defer verify state (Hy4's indexer tail ring)
+        if pool is not None or callable(getattr(eng.model, "commit_mtp_verify", None)):
             slots = [r.linear_slot_idx if r.linear_slot_idx is not None else r.table_idx for r, *_ in plans]
             lens = [p[1] - C[i] for i, p in enumerate(plans)]
             if graphs is None or not graphs.commit(slots, lens, k + 1):

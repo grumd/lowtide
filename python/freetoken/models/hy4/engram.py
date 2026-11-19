@@ -19,6 +19,7 @@ norms, 4 key/query norms, 4 per-stream scales), and the four key projections plu
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
@@ -229,7 +230,27 @@ class Hy4EngramStore:
         )
         self._offsets = offsets
         self._probe = torch.empty((max(max_graph_rows, max_extend_tokens), 0), device=self.table._device)
-        self.forward_host_ctx = self.table.forward_host_ctx
+
+    @contextmanager
+    def forward_host_ctx(self, batch, use_graph: bool):
+        if use_graph or not getattr(batch, "mtp_verify", False):
+            with self.table.forward_host_ctx(batch, use_graph):
+                yield
+            return
+        # An eager verify stages its few rows before the launch: with the async fill its stream
+        # WAITs on the I/O thread, and thousands of small launches queued behind that WAIT can
+        # block the launching thread inside CUDA while it holds the GIL the I/O thread needs.
+        from freetoken.models.qwen4_exp.ple_disk import _context
+
+        pad = self.table.eos_token_id
+        self.table.fill([
+            torch.cat((
+                torch.tensor(_context(r.input_ids, r.cached_len, pad), dtype=torch.int64),
+                r.input_ids[r.cached_len : r.device_len].to(torch.int64),
+            ))
+            for r in batch.padded_reqs
+        ], graph=False)
+        yield
 
     def rows(self, tokens: int) -> torch.Tensor:
         """The staged rows [T, layers, heads, head_dim]; the graph/async WAIT lives here."""

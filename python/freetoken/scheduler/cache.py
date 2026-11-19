@@ -302,26 +302,33 @@ class CacheManager:
                 continue                       # overlap guard: extend forward may still be running
             floor = req.cache_handle.cached_len   # reused prefix -> its swa is tree-owned, not ours
             threshold = (req.device_len - 1) - window - self.page_size
-            if req.toolcall_anchor_len is not None:
-                # Keep the window ending at the anchor resumable: a client-side rewrite of the
-                # echoed tool call forks after the anchor, and a resume there needs
-                # [anchor - window, anchor) live. The finish-insert then adopts (rather than
-                # tombstones) these never-evicted slots; they stay unlocked, so real pool
-                # pressure can still reclaim them (same soft retention as the prompt-end pin).
-                cap = req.toolcall_anchor_len - window - _SWA_RETAIN_GAP
-                if threshold - cap > window + _SWA_RETAIN_GAP:
-                    # The decode ran on far past the anchor (a tool call is normally within
-                    # tens of tokens of the end). Holding the cap would grow this request's
-                    # live swa without bound ("SWA pool exhausted" is unhandled) -- drop the
-                    # anchor and let normal eviction resume. This bound is what the
-                    # anchor-retention term in _swa_per_req_swa_floor sizes the pool for.
-                    req.toolcall_anchor_len = None
-                else:
-                    threshold = min(threshold, cap)
+            threshold = self._anchor_capped(req, threshold)
             new_evicted = align_down(threshold, self.page_size)
             start = max(req.swa_evicted_seqlen, floor)
             if new_evicted > start:
                 req.swa_evicted_seqlen = self._free_swa_own(req.table_idx, start, new_evicted)
+
+    def _anchor_capped(self, req: Req, threshold: int) -> int:
+        """Cap a request's swa free frontier at its tool-call anchor window (decode and
+        speculative-verify extends alike)."""
+        window = self.sliding_window_size
+        if req.toolcall_anchor_len is not None:
+            # Keep the window ending at the anchor resumable: a client-side rewrite of the
+            # echoed tool call forks after the anchor, and a resume there needs
+            # [anchor - window, anchor) live. The finish-insert then adopts (rather than
+            # tombstones) these never-evicted slots; they stay unlocked, so real pool
+            # pressure can still reclaim them (same soft retention as the prompt-end pin).
+            cap = req.toolcall_anchor_len - window - _SWA_RETAIN_GAP
+            if threshold - cap > window + _SWA_RETAIN_GAP:
+                # The decode ran on far past the anchor (a tool call is normally within
+                # tens of tokens of the end). Holding the cap would grow this request's
+                # live swa without bound ("SWA pool exhausted" is unhandled) -- drop the
+                # anchor and let normal eviction resume. This bound is what the
+                # anchor-retention term in _swa_per_req_swa_floor sizes the pool for.
+                req.toolcall_anchor_len = None
+            else:
+                threshold = min(threshold, cap)
+        return threshold
 
     def free_swa_out_of_window_extend(self, reqs: List[Req]) -> None:
         """Prefill sibling of ``maybe_free_swa_out_of_window``: before allocating a chunk, return
@@ -340,7 +347,8 @@ class CacheManager:
         window = self.sliding_window_size
         for req in reqs:
             floor = req.cache_handle.cached_len   # reused prefix -> its swa is tree-owned, not ours
-            new_evicted = align_down(req.cached_len - window - self.page_size, self.page_size)
+            threshold = self._anchor_capped(req, req.cached_len - window - self.page_size)
+            new_evicted = align_down(threshold, self.page_size)
             start = max(req.swa_evicted_seqlen, floor)
             if new_evicted > start:
                 req.swa_evicted_seqlen = self._free_swa_own(req.table_idx, start, new_evicted)

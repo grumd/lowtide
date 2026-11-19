@@ -365,7 +365,7 @@ def glm_dsa_sparse_attn(
     softmax_scale: float,
     counts: torch.Tensor | None = None,  # [b, m] int32 live columns per query (device-read)
     d_v: int = 512,
-    force_splits: int | None = None,     # tests only: 0 = single-program, N = split-k N
+    force_splits: int | None = None,     # 0 = single-program, N = split-k N (None: by shape)
     sinks: torch.Tensor | None = None,   # [h] fp32 per-head sink logits (Hy4)
 ) -> torch.Tensor:
     """Sparse MLA attention over gathered latent rows; returns ``[b, m, h, d_v]``.

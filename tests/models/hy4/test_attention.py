@@ -1376,3 +1376,145 @@ def test_window_tier_two_requests_bitwise():
     for i in layers:
         for k in (0, 1):
             assert torch.equal(outs[False][i][k], outs[True][i][k]), (i, k)
+
+
+# --- 11. speculative verify: K-row windows with rejection and rollback ------------------------------
+
+_VERIFY_T = 6  # pending token + 5 drafts
+_VERIFY_ACCEPT = (5, 0, 2, 5, 3, 1, 4, 0, 5, 2)  # drafts accepted per round, cycled
+
+
+def _verify_plan(size: str):
+    """(prefill chunk edges, first verify position, last position) per size: tiny crosses its
+    24-key dense threshold and 12-row window; realdims crosses 2048 keys and 64-row pages."""
+    if size == "tiny":
+        return [0, 19], 19, 130
+    return [0, 512, 1024, 1536, 2030], 2030, 2120
+
+
+def _rollback(fx, table_idx: int, keep_to: int, end: int) -> None:
+    """CacheManager.rollback_last on the fixture: pages wholly past ``keep_to`` go back."""
+    ps = fx.page_size
+    for page in range(-(-keep_to // ps), -(-end // ps)):
+        slots = fx.page_table[table_idx, page * ps : (page + 1) * ps]
+        if fx.ring:
+            fx.pool.free_swa(slots)
+        fx._free.append(int(slots[0]) // ps)
+
+
+def _verify_run(gd, size: str, garbage_seed: int | None, mode: str = "commit"):
+    """Prefill, then rounds of ``_VERIFY_T``-row verify windows: the first ``a + 1`` rows carry
+    the golden inputs, the rest garbage (``garbage_seed``), then rollback and commit of
+    ``a + 1`` rows. ``garbage_seed=None``: the same positions as plain decode steps instead.
+    ``mode`` "stale": no commit; "unflagged": the window runs as a plain extend (ring refreshed
+    from every row, the behavior before the verify flag); "static": the addressing a captured
+    verify uses (``stage_verify_round`` into the static buffers).
+    Returns per layer the outputs of every kept row in position order, and the final state."""
+    from types import SimpleNamespace
+
+    from .common import ring_config
+
+    n = len(gd.attns)
+    xs = {i: gd.get("a", f"L{i}.attn.in") for i in range(n)}
+    edges, start, stop = _verify_plan(size)
+    ps = 4 if size == "tiny" else 64
+    chunk = max(b - a for a, b in zip(edges[:-1], edges[1:]))
+    window = -(-(chunk + gd.args.sliding_window + 3 * ps) // ps) * ps
+    fx = AttnFixture(ring_config(gd.config), -(-stop // ps) + 8, page_size=ps, window_tokens=window)
+    gen = None if garbage_seed is None else torch.Generator(device=DEV).manual_seed(garbage_seed)
+    out = {i: [] for i in range(n)}
+
+    def forward(batch, rows):
+        for i, attn in enumerate(gd.attns):
+            x = xs[i][batch.positions[0].item() : batch.positions[0].item() + rows].to(DEV, torch.bfloat16)
+            if x.shape[0] < batch.positions.numel():  # garbage rows past the kept ones
+                g = torch.randn(batch.positions.numel() - x.shape[0], x.shape[1], device=DEV, generator=gen)
+                x = torch.cat([x, (g * x.float().std()).to(x.dtype)])
+            out[i].append(fx.run(batch, lambda: attn.forward(x))[:rows])
+
+    for a, b in zip(edges[:-1], edges[1:]):
+        forward(fx.batch(0, a, b, "prefill"), b - a)
+    c, r, rounds = start, 0, 0
+    while c < stop:
+        if garbage_seed is None:
+            forward(fx.batch(0, c, c + 1, "decode"), 1)
+            c += 1
+            continue
+        keep = _VERIFY_ACCEPT[r % len(_VERIFY_ACCEPT)] + 1
+        batch = fx.batch(0, c, c + _VERIFY_T, "prefill")
+        batch.mtp_verify = mode != "unflagged"
+        if mode == "static":
+            be = fx.backend
+            if be._graph_verify is None:
+                be.init_capture_verify(1, _VERIFY_T)
+            be.set_verify_n(1)
+            be.stage_verify_round([0], [c + _VERIFY_T], pad_table_idx=0)
+            batch.attn_metadata = be.make_verify_metadata()
+        forward(batch, keep)
+        _rollback(fx, 0, c + keep, c + _VERIFY_T)
+        if mode in ("commit", "static"):
+            fx.backend.commit_verify(torch.tensor([keep], dtype=torch.int32, device=DEV))
+        c, r = c + keep, r + 1
+    state = {"latent": {}, "slab": {}, "ring": {}}
+    rows = fx.page_table[0, :c].long()
+    ratio = gd.args.index_ratio
+    for i in range(n):
+        if fx.ring and not gd.args.is_indexed(i):
+            state["latent"][i] = fx.pool._win_buffer[fx.pool._swa_layer[i]][fx.pool.window_slots(rows[-gd.args.sliding_window:]).long()].cpu()
+        if gd.args.is_indexed(i):
+            slot = fx.backend._idx_slot[i]
+            state["latent"][i] = fx.pool.latent_rows(i)[rows].cpu()
+            state["slab"][i] = fx.pool.index_k_cache(slot)[rows[ratio - 1 : (c // ratio) * ratio : ratio] // ratio].cpu()
+            state["ring"][i] = fx.pool.tail_k(slot)[0].cpu()
+    import freetoken.core as core_mod
+
+    core_mod._GLOBAL_CTX = None
+    return {i: torch.cat(o) for i, o in out.items()}, state, c
+
+
+@pytest.mark.parametrize("size", SIZES)
+def test_verify_rollback_exact(size):
+    """Verify windows (6 rows, rejection after 0-5 drafts, crossing pool-of-4 groups, the dense
+    threshold, the sliding window and freed window pages): every kept row and the KV / pooled
+    key / tail ring state are bit-identical whatever the rejected rows held, eager or with the
+    static (graph) addressing. Without the ring commit they are not (the test sees the defect).
+    Against plain decode steps over the same positions the kept rows differ by rounding only,
+    and are no further from the f64 reference."""
+    gd = _golden(size)
+    out_a, st_a, end = _verify_run(gd, size, garbage_seed=1)
+    out_b, st_b, _ = _verify_run(gd, size, garbage_seed=2, mode="static")
+    for i in out_a:
+        assert torch.equal(out_a[i], out_b[i]), (size, i, _bits_differ(out_a[i], out_b[i]))
+    for kind in st_a:
+        for i in st_a[kind]:
+            assert torch.equal(st_a[kind][i], st_b[kind][i]), (size, kind, i)
+    # the controls fail: rejected keys leak through an unflagged window, a stale ring is wrong
+    out_u1, _, _ = _verify_run(gd, size, garbage_seed=1, mode="unflagged")
+    out_u2, _, _ = _verify_run(gd, size, garbage_seed=2, mode="unflagged")
+    assert any(not torch.equal(out_u1[i], out_u2[i]) for i in out_u1)
+    out_s, _, _ = _verify_run(gd, size, garbage_seed=1, mode="stale")
+    assert any(not torch.equal(out_s[i], out_a[i]) for i in out_a)
+    ref, _, _ = _verify_run(gd, size, garbage_seed=None)
+    start = _verify_plan(size)[1]
+    for i in out_a:
+        assert out_a[i].shape == ref[i].shape
+        mx, rel = _err(out_a[i][start:], ref[i][start:])
+        print(f"{size} L{i} verify vs plain decode (rows {start}-{end - 1}): max {mx:.2e} rel {rel:.2e}")
+        assert rel <= 2.0**-7, (size, i, rel)
+    # f64 yardstick: sliding layers on every verify row, indexed layers where all closed groups
+    # are recalled (query slot < 4 * group_topk); verify must be no further from exact than decode
+    args = gd.args
+    for i in out_a:
+        last = end if not args.is_indexed(i) else min(end, args.index_ratio * args.index_group_topk)
+        if last <= start:
+            continue
+        q = torch.arange(start, last)
+        pos = torch.arange(end)
+        vis = pos[None, :] <= q[:, None]
+        if not args.is_indexed(i):
+            vis &= pos[None, :] > q[:, None] - args.sliding_window
+        _, exact = _f64_attention(gd.attns[i], gd.get("a", f"L{i}.attn.in")[:end], q, vis, args.norm_eps)
+        _, e_verify = _err(out_a[i][start:last], exact)
+        _, e_decode = _err(ref[i][start:last], exact)
+        print(f"{size} L{i} vs f64 (rows {start}-{last - 1}): verify rel {e_verify:.2e}, decode rel {e_decode:.2e}")
+        assert e_verify <= 1.25 * e_decode, (size, i, e_verify, e_decode)

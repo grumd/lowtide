@@ -25,6 +25,7 @@ toward the lower group index; the reference leaves them to ``torch.topk``.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Tuple
@@ -75,6 +76,12 @@ class Hy4AttnBackend(Glm5NextDSABackend):
         self.ring = bool(getattr(self.kvcache, "swa_paged", False))
         sliding = [i for i in self.hy4.sliding_layer_ids if i < config.num_layers]
         self._first_sliding = min(sliding) if sliding else -1
+        # speculative verify: the window's raw token keys per indexer slot and their ring rows,
+        # static so a captured verify fills them too; commit_verify reads the first n * t rows
+        self._vk: dict[int, torch.Tensor] = {}
+        self._vring: torch.Tensor | None = None
+        self._verify_t = 0  # rows per request of the stashed window, 0 = nothing to commit
+        self._graph_verify: dict | None = None
 
     def _model_args(self, config: "ModelConfig"):
         args = config.hy4_args
@@ -109,6 +116,8 @@ class Hy4AttnBackend(Glm5NextDSABackend):
         if md.is_decode and md.rows is None:
             md.rows = self._decode_rows(batch).to(torch.int32)
             md.kvlen = md.kv_len_cpu.to(self.device, non_blocking=True)
+        elif not md.is_decode and getattr(batch, "mtp_verify", False) and md.rows is None:
+            self._stage_eager_verify(md, batch)
         if self.ring and not self.hy4.is_indexed(layer_id):
             # one map lookup per forward, at its first sliding layer (a decode graph's
             # capture forward recomputes it, so no warmup tensor is baked in)
@@ -125,6 +134,8 @@ class Hy4AttnBackend(Glm5NextDSABackend):
         q_cat = torch.cat([q_nope, q_pe], dim=-1)
         if md.is_decode:
             return self._decode_hy4(md, layer_id, q_cat, indexer_inputs if indexed else None, sinks)
+        if getattr(md, "verify_t", 0):
+            return self._verify_hy4(md, layer_id, q_cat, indexer_inputs if indexed else None, sinks)
         return self._prefill_hy4(md, layer_id, q_cat, batch, indexer_inputs if indexed else None, sinks)
 
     def _attend(self, q_cat, layer_id, sel, cnt, sinks=None) -> torch.Tensor:
@@ -165,7 +176,158 @@ class Hy4AttnBackend(Glm5NextDSABackend):
         members = src.index_select(0, torch.where(from_raw, raw_row, t + ring_row).view(-1)).view(t, kp, d)
         keys = inputs.pool(members, pos - (kp - 1))
         qsa_store_rows(self.kvcache.index_k_cache(slot).view(-1, 1, d), plan.cmp_rows, keys)
-        qsa_store_rows(ring, plan.ring_rows, k)
+        if not getattr(md, "verify_t", 0):
+            qsa_store_rows(ring, plan.ring_rows, k)
+            return
+        # A verify window's last rows may be rejected: the ring keeps its pre-verify keys and
+        # commit_verify writes the accepted rows' keys. Shadow-row keys of groups closed by
+        # rejected rows are never scored (a query sees only groups below its own) before
+        # those rows are forwarded again.
+        if slot == 0:
+            self._vring[:t].copy_(plan.ring_slots.to(torch.int64).index_select(0, req) * kp + pos % kp)
+        self._vk[slot][:t].copy_(k)
+        self._verify_t = md.verify_t
+
+    def _verify_buffers(self, rows: int) -> None:
+        if not self.dsa_enabled or (self._vring is not None and self._vring.numel() >= rows):
+            return
+        assert not torch.cuda.is_current_stream_capturing(), "verify buffers must exist before capture"
+        d = self.kvcache.tail_k(0).shape[-1]
+        self._vring = torch.empty(rows, dtype=torch.int64, device=self.device)
+        self._vk = {
+            slot: torch.empty(rows, d, dtype=torch.bfloat16, device=self.device) for slot in self._idx_slot.values()
+        }
+
+    def commit_verify(self, lens: torch.Tensor) -> None:
+        """After a speculative verify: each request's tail ring takes the keys of its last
+        ``ratio`` accepted rows (``lens`` [n] device int, rows kept per request, in order)."""
+        from freetoken.kernel.triton.qsa import qsa_store_rows
+
+        t, self._verify_t = self._verify_t, 0
+        if not t:
+            return
+        n = lens.numel()
+        row = torch.arange(n * t, device=self.device)
+        kept = lens.to(device=self.device, dtype=torch.int64).index_select(0, row // t)
+        j = row % t
+        rows = torch.where((j < kept) & (j >= kept - self.kpool), self._vring[: n * t], -1).to(torch.int32)
+        for slot, k in self._vk.items():
+            qsa_store_rows(self.kvcache.tail_k(slot), rows, k[: n * t])
+
+    def select_verify(self, t: int) -> None:
+        """After a captured verify of ``t`` rows per request replayed (no Python ran)."""
+        self._verify_t = t
+
+    # ----- speculative verify: n requests x t rows, every row a decode-style query ---------
+    def _plan_kpool_writes(self, md, batch: "Batch", slot: int):
+        t = getattr(md, "verify_t", 0)
+        if not t:
+            return super()._plan_kpool_writes(md, batch, slot)
+        if slot != 0 and md.kpool_plan is not None:
+            return md.kpool_plan
+        from freetoken.attention.dsa import KpoolPlan
+
+        kp = self.kpool
+        out_loc = batch.out_loc.to(torch.int64)
+        positions = batch.positions.to(torch.int64)
+        total = out_loc.numel()
+        row = torch.arange(total, device=self.device, dtype=torch.int64)
+        token_to_req = (row // t).to(torch.int32)
+        cu_seqlens = (torch.arange(total // t + 1, device=self.device, dtype=torch.int64) * t).to(torch.int32)
+        slots = md.ring_slots.to(torch.int64).index_select(0, row // t)
+        cmp_rows = torch.where(
+            positions % kp == kp - 1, out_loc // kp, self.kvcache.cmp_scratch_base + slots
+        ).to(torch.int32)
+        ring_rows = torch.full_like(cmp_rows, -1)  # never during a verify: commit_verify
+        md.kpool_plan = KpoolPlan(cmp_rows, ring_rows, md.ring_slots, token_to_req, cu_seqlens)
+        return md.kpool_plan
+
+    def _stage_eager_verify(self, md, batch: "Batch") -> None:
+        """An eager verify: the addressing ``stage_verify_round`` stages for a captured one."""
+        qo = md.qo_indptr_cpu
+        t = int(qo[1] - qo[0])
+        assert bool(((qo[1:] - qo[:-1]) == t).all()), "a verify window has the same width for every request"
+        reqs = batch.padded_reqs if hasattr(batch, "padded_reqs") else batch.reqs
+        idx = torch.tensor([r.table_idx for r in reqs], dtype=torch.int64).to(self.device)
+        md.rows = get_global_ctx().page_table.index_select(0, idx)
+        md.kvlen = md.kv_len_cpu.to(self.device, torch.int32)
+        md.ring_slots = idx
+        md.verify_t = t
+        self._verify_buffers(len(reqs) * t)
+
+    def init_capture_verify(self, n_max: int, t: int) -> None:
+        width = get_global_ctx().page_table.shape[1]
+        self._verify_buffers(n_max * t)
+        self._graph_verify = {
+            "n": n_max, "t": t,
+            "rows": torch.full((n_max, width), -1, dtype=torch.int32, device=self.device),
+            "kvlen": torch.full((n_max,), t, dtype=torch.int32, device=self.device),
+            "slots": torch.zeros(n_max, dtype=torch.int64, device=self.device),
+        }
+
+    def set_verify_n(self, n: int) -> None:
+        self._graph_verify["n"] = n
+
+    def make_verify_metadata(self, n: int | None = None, t: int | None = None) -> DSAMetadata:
+        st = self._graph_verify
+        n, t = st["n"], st["t"]
+        qo = torch.arange(n + 1, dtype=torch.int32) * t
+        md = DSAMetadata(
+            is_decode=False, last_indices=(qo[1:] - 1).to(self.device), qo_indptr_cpu=qo,
+            kv_len_cpu=torch.full((n,), t, dtype=torch.int32),
+            rows=st["rows"][:n], kvlen=st["kvlen"][:n], ring_slots=st["slots"][:n],
+        )
+        md.verify_t = t
+        return md
+
+    def stage_verify_round(self, table_idx, kvlen, pad_table_idx: int) -> None:
+        st = self._graph_verify
+        n, t = st["n"], st["t"]
+        idx = [int(x) for x in table_idx] + [int(pad_table_idx)] * (n - len(table_idx))
+        kv = [int(x) for x in kvlen] + [t] * (n - len(table_idx))
+        dev_idx = torch.tensor(idx, dtype=torch.int64).to(self.device)
+        st["rows"][:n].copy_(get_global_ctx().page_table.index_select(0, dev_idx))
+        st["kvlen"][:n].copy_(torch.tensor(kv, dtype=torch.int32).to(self.device))
+        st["slots"][:n].copy_(dev_idx)
+
+    def verify_scratch(self):
+        return nullcontext()
+
+    def _verify_hy4(self, md, layer_id, q_cat, inputs, sinks) -> torch.Tensor:
+        """Every row of a ``t``-row window is a decode query at its own position over the
+        request's rows: the decode path's selection and attention, with static shapes."""
+        total, h, d = q_cat.shape
+        t = md.verify_t
+        n = total // t
+        rows = md.rows.unsqueeze(1)
+        q_pos = (md.kvlen.view(n, 1) - t + torch.arange(t, device=self.device, dtype=torch.int32)).to(torch.int64)
+        if not self.hy4.is_indexed(layer_id):
+            sel, cnt = self._sliding_sel(md, "verify", rows, q_pos)
+        elif inputs is None:  # indexed layer without an index pool: dense
+            sel, cnt = rows, (q_pos + 1).to(torch.int32)
+        else:
+            kp = self.kpool
+            groups = getattr(md, "verify_groups", None)
+            # rebuilt by every forward's first indexed layer: a capture's warmup and capture
+            # forwards share one metadata object
+            if groups is None or self._idx_slot[layer_id] == 0:
+                g = (md.rows[:, kp - 1 :: kp] // kp).to(torch.int32)
+                groups = md.verify_groups = g.unsqueeze(1).expand(n, t, g.shape[-1]).reshape(total, -1)
+            own = (q_pos // kp).to(torch.int32).view(-1)
+            s = self.dsa_decode_scores(inputs.q, inputs.w, self._idx_slot[layer_id], groups, own)
+            picks = self._pick_groups(s.view(n, t, -1), q_pos)
+            sel, cnt = self._expand_groups(picks, rows, q_pos)
+        # one query per program row with a single decode step's split: each row reduces in
+        # the same order as that step would
+        from freetoken.kernel.triton.glm_dsa_sparse import _split_count, glm_dsa_sparse_attn
+
+        sel = sel.expand(n, t, sel.shape[-1]).reshape(total, 1, -1)
+        splits = _split_count(1, 1, h, sel.shape[-1], q_cat.device)
+        o = glm_dsa_sparse_attn(
+            q_cat.view(total, 1, h, d), self.kvcache.latent_rows(layer_id), sel, self.sm_scale,
+            counts=cnt.reshape(total, 1), d_v=self.kv_lora_rank, sinks=sinks, force_splits=splits,
+        )
+        return o.view(total, h, self.kv_lora_rank)
 
     # ----- selection ---------------------------------------------------------------------
     def _pick_groups(self, scores: torch.Tensor, q_pos: torch.Tensor) -> torch.Tensor:

@@ -227,3 +227,49 @@ def test_interval_validation(bad):
     assert hy4_checkpoint_interval(cfg) == 8192
     cfg.cache_type = "naive"
     assert hy4_checkpoint_interval(cfg) == 0
+
+
+@pytest.mark.parametrize("anchored", [True, False])
+def test_verify_extend_keeps_the_tool_call_anchor_window(anchored):
+    """Speculative verify rounds are extends: their window free must keep the window ending at
+    a tool-call anchor live, as the decode driver does (control: no anchor frees it)."""
+    rig = Rig(interval=0)
+    rig.uid += 1
+    rig.pm.pending_list = [PendingReq(uid=rig.uid, input_ids=torch.tensor(_a(40), dtype=torch.int32),
+                                      sampling_params=SamplingParams(max_tokens=64))]
+    req = last = None
+    while rig.pm.runnable or last is not None:
+        batch = rig.pm.schedule_next_batch(rig.budget)
+        if batch is not None:
+            rig.cm.free_swa_out_of_window_extend(batch.reqs)
+            rig.cm.allocate_paged(batch.reqs)
+            for r in batch.reqs:
+                rig._forward(r)
+                r.complete_one()
+        if last is not None:
+            for r in last.reqs:
+                if not isinstance(r, ChunkedReq):
+                    rig.cm.cache_req(r, finished=False)
+                    req = r
+        last = batch
+    t, anchor = 4, None
+    req.append_host(torch.tensor([59_999], dtype=torch.int32))  # the prefill's sampled token
+    for i in range(8):
+        # a fully accepted width-t round: last sampled + (t - 1) drafts, then the bonus token
+        req.append_host(torch.arange(t - 1, dtype=torch.int32) + 60_000 + i * t)
+        req.device_len = req.cached_len + t
+        rig.cm.free_swa_out_of_window_extend([req])
+        rig.cm.allocate_paged([req])
+        rig._forward(req)
+        req.cached_len = req.device_len
+        req.append_host(torch.tensor([61_000 + i], dtype=torch.int32))
+        req.device_len += 1
+        if i == 3:
+            anchor = req.input_ids.numel()
+            req.toolcall_anchor_len = anchor if anchored else None
+    rows = rig._rows(req, anchor - WINDOW, anchor)
+    if anchored:
+        assert req.toolcall_anchor_len == anchor, "the anchor is dropped only far past it"
+        assert bool((rows >= 0).all())
+    else:
+        assert bool((rows < 0).any())
