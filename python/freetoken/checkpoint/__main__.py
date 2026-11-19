@@ -51,8 +51,11 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
                    help="standalone MTP draft-head artifact for --mtp file: a directory (config.json + "
                         "*.safetensors) or a single .safetensors with its config.json next to it")
     p.add_argument("--include-engram", action="store_true",
-                   help="also export the Engram n-gram tables into the FTW (~189 GiB extra disk); "
-                        "otherwise they are read in place from the source shards at serve time")
+                   help="also export the Engram n-gram tables, so the FTW serves without its source "
+                        "checkpoint: DeepSeek-V4.1 into the FTW (~189 GiB extra disk); Hy4-flash into "
+                        "engram/ in the FTW dir, hardlinked from the source shards on the same filesystem "
+                        "(no extra disk) and copied otherwise (~118 GiB). Without it the tables are read "
+                        "in place from the source shards at serve time")
     p.add_argument("--include-dspark", action="store_true",
                    help="also export the DSpark MTP draft head (mtp.* weights + draft expert banks) "
                         "into the FTW; otherwise the draft head is skipped at conversion")

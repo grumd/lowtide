@@ -258,6 +258,16 @@ def ftw_side_tensors(model_path: str):
     return _model_override(spec, "ftw_side_owns"), fn(model_path)
 
 
+def ftw_engram_files(model_path: str, out_dir: str) -> list[str] | None:
+    """``--include-engram`` for a family that keeps its Engram tables beside the FTW entries (Hy4:
+    ``engram/``, see its ``ftw_engram_files``): writes them and returns their paths relative to
+    ``out_dir``. ``None`` when the family has no such hook (DeepSeek-V4.1 exports its tables into
+    the dense stream instead)."""
+    _config, spec = _spec_for_model_path(model_path)
+    fn = _model_override(spec, "ftw_engram_files")
+    return None if fn is None else fn(model_path, out_dir)
+
+
 def load_weight(
     model_path: str,
     device: torch.device,

@@ -3,6 +3,7 @@ from .model import Hy4ForCausalLM
 from .weight import (
     adjust_hf_config,
     engram_table_sources,
+    ftw_engram_files,
     ftw_side_owns,
     ftw_side_tensors,
     iter_expert_pieces,
@@ -23,4 +24,5 @@ __all__ = [
     "iter_ftw_extra",
     "ftw_side_tensors",
     "ftw_side_owns",
+    "ftw_engram_files",
 ]

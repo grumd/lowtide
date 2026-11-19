@@ -375,7 +375,8 @@ def convert_checkpoint(
     serve time) and the DSpark MTP draft head (otherwise skipped). Both are OFF by
     default so the FTW stays the current dense+banks layout; the index records which
     were included under ``"includes"`` so the loader can tell an FTW apart. Including the
-    engram costs ~189 GiB of extra disk.
+    engram costs ~189 GiB of extra disk. A family with an ``ftw_engram_files`` hook (Hy4)
+    keeps its tables beside the entries instead (``engram/``, hardlinked when it can be).
 
     The FTW format is TP-agnostic and conversion runs single-process, so the resulting
     checkpoint records no TP layout and loads independently of the runtime TP setting.
@@ -601,6 +602,11 @@ def convert_checkpoint(
     _progress("finalize")  # writing shard index + copying config/tokenizer
     copied = _copy_metadata(model_path, out_dir)
     _declare_quantization(model_path, out_dir)
+    engram_files = None
+    if include_engram:
+        from freetoken.models.weight import ftw_engram_files
+
+        engram_files = ftw_engram_files(model_path, out_dir)
     # Model-specific side tables (qwen4_exp: the PLE n-gram table): .safetensors files
     # the model loads outside the dense stream — without them the FTW dir cannot serve.
     # ``ple_mode`` selects the stored dtype: ``bf16``/``fp8`` re-encode to that dtype
@@ -678,6 +684,9 @@ def convert_checkpoint(
             **n_side,
         },
         "copied_metadata": copied,
+        # Engram tables kept beside the entries (Hy4 --include-engram: engram/, read in place at
+        # serve time instead of from source_model_path); None when the FTW has no such files.
+        "engram_files": engram_files,
         # Which optional side payloads this FTW carries. The loader reads these to decide
         # whether the Engram tables / DSpark draft come from the FTW or are skipped.
         "includes": {

@@ -20,7 +20,7 @@ import torch
 import freetoken
 from freetoken.models.hy4.engram import EngramRows, Hy4EngramStore, engram_mask, hash_multipliers
 
-from .common import golden_dir, golden_model, model_path, move_op, needs_checkpoint, needs_golden
+from .common import golden_config, golden_dir, golden_model, model_path, move_op, needs_checkpoint, needs_golden
 
 pytestmark = needs_golden
 DEV = "cuda"
@@ -646,3 +646,125 @@ def test_real_engram_vs_reference():
         assert ft_rel <= ref_rel
         del x, out, rec, exact, ours
         torch.cuda.empty_cache()
+
+
+# --- 7. an FTW that carries its own tables (ft checkpoint --include-engram) ---------------------
+
+
+def _table_bytes(sources) -> dict[str, bytes]:
+    out = {}
+    for s in sources:
+        with open(s.path, "rb") as fh:
+            fh.seek(s.offset)
+            out[s.key] = fh.read(s.rows * s.row_bytes)
+    return out
+
+
+def _fields(sources) -> list[tuple]:
+    return [(s.layer, s.hash_layer_id, s.key, s.rows, s.dim, s.dtype, s.head_vocab_sizes) for s in sources]
+
+
+def _clean_convert_env(monkeypatch) -> None:
+    from freetoken.checkpoint.convert import HY4_EXPERT_QUANT_ENV
+
+    # the converter sets these in os.environ; recording them first lets monkeypatch undo it
+    for key in ("FREETOKEN_ENABLE_MTP", "FREETOKEN_LOAD_VISION", "FREETOKEN_EXPORT_ENGRAM", HY4_EXPERT_QUANT_ENV):
+        monkeypatch.setenv(key, "")
+        monkeypatch.delenv(key)
+
+
+@pytest.mark.parametrize("include", [True, False], ids=["include_engram", "default"])
+def test_converted_ftw_reads_tables_from_its_own_dir(tmp_path, monkeypatch, include):
+    """Through the real converter: with --include-engram the FTW serves its tables after the source
+    is gone (same tables, same bytes); without it, it still points at the source, and fails loudly
+    once the source is gone."""
+    import json
+    import shutil
+
+    from freetoken.checkpoint.convert import convert_checkpoint
+    from freetoken.models.hy4.weight import engram_table_sources
+
+    _clean_convert_env(monkeypatch)
+    src, out = tmp_path / "src", tmp_path / "ftw"
+    shutil.copytree(golden_dir() / "tiny_ckpt", src)
+    want = engram_table_sources(str(src))
+    want_bytes = _table_bytes(want)
+    index = convert_checkpoint(str(src), str(out), include_engram=include)
+    meta = json.loads((out / "freetoken_weight.json").read_text())
+    assert meta["source_model_path"] == str(src) and meta["engram_files"] == index["engram_files"]
+    if not include:
+        assert index["engram_files"] is None and not (out / "engram").exists()
+        assert [s.path for s in engram_table_sources(str(out))] == [s.path for s in want]
+        shutil.rmtree(src)
+        with pytest.raises(FileNotFoundError, match="--include-engram"):
+            engram_table_sources(str(out))
+        return
+    # the tiny tables share model.safetensors with every other tensor: each gets its own file
+    assert index["engram_files"] == ["engram/engram-layer-001.safetensors", "engram/engram-layer-004.safetensors",
+                                     "engram/model.safetensors.index.json"]
+    shutil.rmtree(src)
+    got = engram_table_sources(str(out))
+    assert _fields(got) == _fields(want)
+    assert all(s.path.startswith(str(out / "engram") + "/") for s in got)
+    assert _table_bytes(got) == want_bytes
+    # nothing else on the serve path needs the source either: the index may drop it
+    meta["source_model_path"] = None
+    (out / "freetoken_weight.json").write_text(json.dumps(meta))
+    assert _table_bytes(engram_table_sources(str(out))) == want_bytes
+
+
+def _tables_in_own_shard(root):
+    """tiny_ckpt with both tables moved to a shard that holds nothing else."""
+    import json
+    import shutil
+
+    import safetensors
+    from safetensors.torch import save_file
+
+    src = root / "src"
+    shutil.copytree(golden_dir() / "tiny_ckpt", src)
+    index = json.loads((src / "model.safetensors.index.json").read_text())
+    keys = [k for k in index["weight_map"] if k.endswith("multi_head_embedding.embedding.weight")]
+    with safetensors.safe_open(str(src / "model.safetensors"), framework="pt") as f:
+        save_file({k: f.get_tensor(k) for k in keys}, str(src / "model-tables.safetensors"))
+    index["weight_map"].update({k: "model-tables.safetensors" for k in keys})
+    (src / "model.safetensors.index.json").write_text(json.dumps(index))
+    return src
+
+
+@pytest.mark.parametrize("link", ["hardlink", "exdev"])
+def test_table_only_shard_is_linked_else_copied(tmp_path, monkeypatch, link):
+    import errno
+    import os
+
+    from freetoken.models.hy4 import weight as w
+
+    src = _tables_in_own_shard(tmp_path)
+    if link == "exdev":
+        def no_link(a, b):
+            raise OSError(errno.EXDEV, "cross-device link")
+
+        monkeypatch.setattr(w.os, "link", no_link)
+    want = w.engram_table_sources(str(src))
+    out = tmp_path / "ftw"
+    files = w.ftw_engram_files(str(src), str(out))
+    assert files == ["engram/model-tables.safetensors", "engram/model.safetensors.index.json"]
+    same = os.stat(out / files[0]).st_ino == os.stat(src / "model-tables.safetensors").st_ino
+    assert same == (link == "hardlink")
+    got = w.engram_sources(w.CheckpointSource(str(out / "engram")), golden_config(golden_dir() / "tiny_ckpt"))
+    assert _fields(got) == _fields(want) and _table_bytes(got) == _table_bytes(want)
+    # a rerun replaces the files instead of writing through the link into the source
+    before = (src / "model-tables.safetensors").read_bytes()
+    assert w.ftw_engram_files(str(src), str(out)) == files
+    assert (src / "model-tables.safetensors").read_bytes() == before
+
+
+def test_realdims_table_extracts_bitwise(tmp_path):
+    from freetoken.models.hy4 import weight as w
+
+    ckpt = golden_dir() / "realdims" / "ckpt"
+    want = w.engram_table_sources(str(ckpt))
+    files = w.ftw_engram_files(str(ckpt), str(tmp_path))
+    assert files == ["engram/engram-layer-001.safetensors", "engram/model.safetensors.index.json"]
+    got = w.engram_sources(w.CheckpointSource(str(tmp_path / "engram")), golden_config(ckpt))
+    assert _fields(got) == _fields(want) and _table_bytes(got) == _table_bytes(want)

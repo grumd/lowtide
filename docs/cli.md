@@ -281,7 +281,8 @@ Converts an HF safetensors checkpoint to FTW, FreeToken's self-contained
 fast-load format; point `ft serve --model` at the output dir. The FTW carries
 everything the source had (including the draft head; Hy4-flash's DFly2 drafter is stored
 under FTW kind `dfly` and loaded with `ft serve --mtp on`), so the server replays it
-without re-reading the HF shards. See the FTW caveats in
+without re-reading the HF shards. The Engram n-gram tables are the exception: they stay in the
+source checkpoint unless `--include-engram` is given. See the FTW caveats in
 [models.md](models.md#notes).
 
 | Flag | Default | Meaning |
@@ -291,7 +292,7 @@ without re-reading the HF shards. See the FTW caveats in
 | `--moe-backend` | offload | `offload` packs the experts into offload banks; e.g. `triton` keeps them dense for resident serving |
 | `--quant-backend` | auto | Kernel per quantized layer type (as for `ft serve`); the expert banks are packed for the chosen kernel and the server picks it back up |
 | `--shard-gib` | 8 | Max FTW shard size in GiB |
-| `--include-engram` | off | Also export the Engram n-gram tables into the FTW (~189 GiB extra disk); otherwise they are read in place at serve time |
+| `--include-engram` | off | Also export the Engram n-gram tables, so the FTW serves without its source checkpoint. DeepSeek-V4.1: into the FTW (~189 GiB extra disk). Hy4-flash: into `engram/` in the FTW dir (original tensor names and bytes, own `model.safetensors.index.json`, read in place like the source's); a source shard that holds only tables is hardlinked when both dirs are on one filesystem (no extra disk) and copied otherwise (~118 GiB), a table sharing its shard gets a file of its own. Never edit a hardlinked file in place: it is the source's file too. Without the flag the tables are read in place from the source shards at serve time (the index records `source_model_path`) |
 | `--include-dspark` | off | Also export the DSpark MTP draft head (mtp.* weights + draft expert banks); otherwise the draft head is skipped |
 | `--ple` | bf16 | Stored dtype of the PLE n-gram table side tables (qwen4_exp): `bf16`, `fp8`, `auto` (keep the source dtype), or `none` to copy nothing and read the table from the source checkpoint at serve time (the source must stay in place) |
 | `--gpu` | first visible GPU | GPU for the repack: a UUID from `nvidia-smi -L` or an index |
