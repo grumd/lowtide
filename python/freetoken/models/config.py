@@ -366,7 +366,11 @@ class ModelConfig:
     slot_states: Tuple[SlotStateSpec, ...] = ()
     # (base bytes, bytes per chunk token) of prefill activations over the idle footprint, per
     # rank, as the model measured it; None -> the engine's defaults (engine/cache_budget.py).
-    prefill_workspace: Tuple[int, int] | None = None
+    # A third term is per-token bytes split across TP ranks; EngineConfig.model_config folds it
+    # into the per-token term for its tp size.
+    prefill_workspace: Tuple[int, ...] | None = None
+    # Serving context when no --max-seq-len-override is given; None -> the rope table length.
+    default_max_seq_len: int | None = None
 
     @property
     def is_moe(self) -> bool:

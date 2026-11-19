@@ -177,6 +177,11 @@ def ring_config(config):
     return dataclasses.replace(config, hy4_args=dataclasses.replace(config.hy4_args, swa_ring=True))
 
 
+def full_history_config(config):
+    """``config`` with every layer on the full-history pool (option A, FREETOKEN_HY4_SWA_RING=0)."""
+    return dataclasses.replace(config, hy4_args=dataclasses.replace(config.hy4_args, swa_ring=False))
+
+
 class AttnFixture:
     """The factory-built KV pool, the registry's dsa backend (Hy4AttnBackend), a page table
     whose pages are handed out in a scrambled order (slot != position) and the global ctx."""
@@ -190,6 +195,8 @@ class AttnFixture:
 
         self.device = torch.device("cuda")
         self.page_size = page_size
+        if window_tokens is None:  # no window tier sized: the full-history pool
+            config = full_history_config(config)
         self.pool = create_kvcache_pool(
             model_config=config, num_pages=num_pages + 1, page_size=page_size,
             dtype=torch.bfloat16, device=self.device, num_req_slots=max_running_req + 1,

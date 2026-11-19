@@ -1182,6 +1182,34 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--host-ram-keep-free-gb",
+        type=float,
+        default=ServerArgs.host_ram_keep_free_gb,
+        dest="host_ram_keep_free_gb",
+        help=(
+            "With --moe-vram-only: host RAM to leave free, on the box and under the server's cgroup "
+            "memory limit. The RAM saver stops pinning spare cells there (an evicted expert then swaps "
+            "with the one replacing it, costing a write-back), and when free RAM falls below it, idle "
+            "points release the host copies of experts cached in VRAM. Experts that must leave VRAM "
+            "(a long prompt's workspace, KV growth) are still stored below it. Default 4."
+        ),
+    )
+
+    parser.add_argument(
+        "--swa-window-checkpoint-tokens",
+        type=int,
+        default=ServerArgs.swa_window_checkpoint_tokens,
+        dest="swa_window_checkpoint_tokens",
+        help=(
+            "Hy4 window tier on the radix cache: keep the sliding layers' 512-token window every N "
+            "tokens of a sequence, so a prompt that branches mid-message re-prefills at most N tokens. "
+            "Default 8192; 0 keeps only the prompt-end and reply-end windows. Each checkpoint costs "
+            "17.7 MB per GPU and max-context/N are reserved. Must be a multiple of the KV page size "
+            "(64) and >= the window."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-prefill-hit-d2d",
         action="store_true",
         dest="moe_prefill_hit_d2d",
@@ -1327,6 +1355,8 @@ def parse_args(
 
     if kwargs["vram_keep_free_mb"] < 0 or kwargs["elastic_kv_step_tokens"] <= 0:
         parser.error("--vram-keep-free-mb must be >= 0 and --elastic-kv-step-tokens > 0")
+    if kwargs["host_ram_keep_free_gb"] < 0:
+        parser.error("--host-ram-keep-free-gb must be >= 0")
     if kwargs["elastic_lend_after"] < 0:
         parser.error("--elastic-lend-after must be >= 0 (0 never lends)")
     if not 0 < kwargs["prefill_batch_min"] <= kwargs["prefill_batch_max"]:

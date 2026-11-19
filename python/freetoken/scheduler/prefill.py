@@ -163,7 +163,7 @@ class PrefillAdder:
             window, ps = cm.sliding_window_size, cm.page_size
             floor = cache_handle.cached_len
             new_evicted = align_down(cached_len - window - ps, ps)
-            self_reclaim = max(0, new_evicted - max(swa_evicted_seqlen, floor))
+            self_reclaim = cm.swa_extend_reclaim(table_idx, max(swa_evicted_seqlen, floor), new_evicted)
             swa_budget = cm.swa_available_size + self_reclaim - self.reserved_swa
             # swa is charged per WHOLE page: cap the chunk so its PAGE-SPAN cost fits the budget
             # (the extend [cached_len, cached_len+chunk) pulls div_ceil(end,ps)-div_ceil(start,ps)

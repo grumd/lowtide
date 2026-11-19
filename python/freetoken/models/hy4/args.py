@@ -91,7 +91,7 @@ class Hy4Args:
     dense_fp8: bool = True
     # ---- KV pool ----
     # sliding layers keep only their window in a page-bound window tier (kvcache/hy4_pool.py)
-    swa_ring: bool = False
+    swa_ring: bool = True
 
     @property
     def num_layers(self) -> int:

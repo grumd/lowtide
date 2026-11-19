@@ -968,7 +968,36 @@ class Engine:
             f"--moe-vram-only: {seeded} of {total} experts start in VRAM only; {in_ram} host cells stay in RAM "
             f"(spare ones included), {(total - in_ram) * cell * self.config.tp_info.size / 2**30:.1f} GiB released; "
             f"an expert's host cell is {cell / 2**20:.2f} MiB, and {kept / 1024:.0f} KiB of small rows stay pinned; "
-            f"{late_count} layers were read one at a time on their way into VRAM"
+            f"{late_count} layers were read one at a time on their way into VRAM; spare cells leave "
+            f"{cache.host_ram_keep_free / 2**30:.1f} GiB of host RAM free (--host-ram-keep-free-gb), and idle "
+            f"points release host copies of cached experts below that"
+        )
+        self._warn_vram_only_workspace(cache, cell)
+
+    def _warn_vram_only_workspace(self, cache, cell: int) -> None:
+        """--moe-vram-only under elastic VRAM: the longest prefill chunk's workspace retires expert
+        slots, and the VRAM-only experts there need host cells; say so at load if the RAM free now,
+        less the keep-free floor, would not take them (the server stops with HostRamShort when the
+        RAM is not there; what is free at load shrinks as the cache warms up)."""
+        from freetoken.moe.host_banks import host_ram_headroom
+
+        el, room = self.elastic, host_ram_headroom()
+        if el is None or room is None or not el.prefill_bytes_per_token:
+            return
+        slot = sum(cache.bank_row_bytes().values())
+        per_token = el.prefill_bytes_per_token / slot * cell * self.config.tp_info.size
+        need = (el.prefill_max_tokens - el.prefill_min_tokens) * per_token
+        spare = max(0, room - cache.host_ram_keep_free)
+        if need <= spare:
+            return
+        fits = el.prefill_min_tokens + int(spare / per_token) // 1024 * 1024
+        logger.warning_rank0(
+            f"--moe-vram-only: a {el.prefill_max_tokens}-token prefill chunk can push experts out of VRAM "
+            f"that need up to {need / 2**30:.1f} GiB of host RAM, and {room / 2**30:.1f} GiB is free now "
+            f"({cache.host_ram_keep_free / 2**30:.1f} GiB of it kept free); "
+            f"if it is not there when such a prompt comes, the server stops. --prefill-batch-max "
+            f"{max(el.prefill_min_tokens, fits)} keeps that within the RAM free now above --host-ram-keep-free-gb "
+            f"(smaller chunks, slower long prompts)."
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
@@ -1110,7 +1139,8 @@ class Engine:
         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         if host_cells:
-            cache.use_host_cells(banks.host_pools, banks.late_layers)
+            cache.use_host_cells(banks.host_pools, banks.late_layers,
+                                 keep_free=int(config.host_ram_keep_free_gb * 2**30), ranks=config.tp_info.size)
             self._late_expert_layers = banks.late_layers
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)

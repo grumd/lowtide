@@ -1,9 +1,9 @@
 """Engine-facing config for Hy4-flash (``hy_v4_flash``).
 
 One attention group: all layers' MLA latent rows (576 = 512 ckv + 64 k_rope) plus a kpool
-index slab for the indexed layers (``kvcache/hy4_pool.py``). By default the sliding layers read
-the last ``sliding_window`` rows of the same full history; with the window tier
-(``FREETOKEN_HY4_SWA_RING=1``) they keep only their window in a page-bound window pool. Per-layer head counts,
+index slab for the indexed layers (``kvcache/hy4_pool.py``). By default the sliding layers keep
+only their window in a page-bound window tier; ``FREETOKEN_HY4_SWA_RING=0`` puts them back on the
+full history (all 42 layers in one pool). Per-layer head counts,
 rope thetas and the window live in ``hy4_args``; ``num_qo_heads`` and the group's rotary
 config describe the indexed layers only.
 
@@ -28,19 +28,24 @@ from freetoken.models.config import (
 from .args import load_args
 
 MAX_LAYERS_ENV = "FREETOKEN_HY4_MAX_LAYERS"
-# Dev switch until the prefix-hit policy is decided: the window tier restricts radix hits
-# to positions whose last ``sliding_window`` sliding rows are still resident.
+# Opt-out (=0) to the full-history pool: radix hits at any page, at ~3.4x the KV per token.
 SWA_RING_ENV = "FREETOKEN_HY4_SWA_RING"
+# Window tier: the sliding layers' window is kept every this many tokens of a sequence, so a
+# prompt that branches mid-message re-prefills at most this much (EngineConfig override).
+SWA_WINDOW_CHECKPOINT_TOKENS = 8192
+# Serving context when --max-seq-len-override is not given (the rope table covers 1M).
+DEFAULT_CONTEXT = 262144
 
 
 def swa_ring_enabled() -> bool:
-    return os.environ.get(SWA_RING_ENV, "0").strip() not in ("", "0")
+    return os.environ.get(SWA_RING_ENV, "1").strip() not in ("", "0")
 
 
-# Prefill activations over the idle footprint per rank (TP=2, GPU-only, 16k-token prompt): torch
-# peak reserved over idle allocated 0.74 / 1.57 / 3.03 GiB at 2048 / 4096 / 8192-token chunks
-# (~390 KiB per token, no measurable base; peak allocated ~308 KiB per token).
-PREFILL_WORKSPACE = (256 << 20, 384 << 10)
+# Prefill activations over the idle footprint per rank (GPU-only, 16k-token prompt), torch peak
+# reserved over idle allocated at 2048 / 4096 / 8192-token chunks: TP=2 0.74 / 1.57 / 3.03 GiB,
+# TP=1 1.16 / 2.43 / 4.34 GiB. (base, per token, per token split across TP ranks): 384 KiB/token
+# at TP=2 as before, 576 KiB at TP=1, where the attention heads are not halved.
+PREFILL_WORKSPACE = (256 << 20, 192 << 10, 384 << 10)
 
 
 def max_layers(num_layers: int) -> int:
@@ -50,9 +55,7 @@ def max_layers(num_layers: int) -> int:
 
 
 def parse_config(hf_config: Any) -> ModelConfig:
-    args = load_args(hf_config)
-    if swa_ring_enabled():
-        args = replace(args, swa_ring=True)
+    args = replace(load_args(hf_config), swa_ring=swa_ring_enabled())
     text = getattr(hf_config, "text_config", hf_config)
     num_layers = max_layers(args.num_layers)
 
@@ -120,7 +123,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
         image_token_id=args.image_token_id,
         hy4_args=args,
         prefill_workspace=PREFILL_WORKSPACE,
+        default_max_seq_len=min(DEFAULT_CONTEXT, args.max_position),
     )
 
 
-__all__ = ["parse_config", "max_layers", "MAX_LAYERS_ENV", "SWA_RING_ENV", "swa_ring_enabled"]
+__all__ = [
+    "parse_config", "max_layers", "MAX_LAYERS_ENV", "SWA_RING_ENV", "swa_ring_enabled",
+    "SWA_WINDOW_CHECKPOINT_TOKENS", "DEFAULT_CONTEXT",
+]

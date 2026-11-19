@@ -93,6 +93,13 @@ class CacheManager:
         # attributes leave the defaults untouched (Gemma4).
         if swa_pool is not None:
             self.prefill_chunk_budget = getattr(swa_pool, "prefill_chunk_budget", None)
+        # Window checkpoints (radix only, pools that declare them: Hy4's window tier): the
+        # window ending at every multiple of ckpt_interval stays live in the tree. A running
+        # request's own retained windows (by table row) count against ckpt_capacity tokens.
+        self.ckpt_interval = int(getattr(swa_pool, "checkpoint_interval", 0) or 0) if self.is_swa else 0
+        self.ckpt_window = int(getattr(swa_pool, "checkpoint_window", 0) or 0)
+        self.ckpt_capacity = int(getattr(swa_pool, "checkpoint_capacity", 0) or 0)
+        self._ckpt_owned: dict[int, List[int]] = {}
         self.prefix_cache = self._make_prefix_cache(device, page_size, type)
         self.device = device
         self.num_pages = num_pages
@@ -314,8 +321,7 @@ class CacheManager:
             new_evicted = align_down(threshold, self.page_size)
             start = max(req.swa_evicted_seqlen, floor)
             if new_evicted > start:
-                self._free_swa(self.page_table[req.table_idx, start:new_evicted])
-                req.swa_evicted_seqlen = new_evicted
+                req.swa_evicted_seqlen = self._free_swa_own(req.table_idx, start, new_evicted)
 
     def free_swa_out_of_window_extend(self, reqs: List[Req]) -> None:
         """Prefill sibling of ``maybe_free_swa_out_of_window``: before allocating a chunk, return
@@ -337,8 +343,49 @@ class CacheManager:
             new_evicted = align_down(req.cached_len - window - self.page_size, self.page_size)
             start = max(req.swa_evicted_seqlen, floor)
             if new_evicted > start:
-                self._free_swa(self.page_table[req.table_idx, start:new_evicted])
-                req.swa_evicted_seqlen = new_evicted
+                req.swa_evicted_seqlen = self._free_swa_own(req.table_idx, start, new_evicted)
+
+    def _swa_free_plan(self, table_idx: int, start: int, end: int):
+        """Split a request's own out-of-window span ``[start, end)`` into the ranges to free and
+        the checkpoint boundaries to keep. Returns ``(frontier, ranges, kept)``: the frontier
+        never stops inside a checkpoint window (each one is decided whole), and a checkpoint is
+        kept only while the request-owned ones fit ``ckpt_capacity`` (else it is freed)."""
+        iv, w = self.ckpt_interval, self.ckpt_window
+        if iv <= 0:
+            return end, [(start, end)], []
+        b = div_ceil(end, iv) * iv
+        if b - w < end < b:
+            end = max(start, b - w)
+        owned = sum(len(v) for v in self._ckpt_owned.values())
+        ranges, kept, pos = [], [], start
+        for b in range(div_ceil(start + 1, iv) * iv, end + 1, iv):
+            if (owned + len(kept) + 1) * w > self.ckpt_capacity:
+                break
+            lo = max(b - w, pos)
+            if lo > pos:
+                ranges.append((pos, lo))
+            kept.append(b)
+            pos = b
+        if end > pos:
+            ranges.append((pos, end))
+        return end, ranges, kept
+
+    def _free_swa_own(self, table_idx: int, start: int, end: int) -> int:
+        """Free the request's own window rows ``[start, end)`` except its checkpoint windows;
+        returns the new free frontier."""
+        end, ranges, kept = self._swa_free_plan(table_idx, start, end)
+        for lo, hi in ranges:
+            self._free_swa(self.page_table[table_idx, lo:hi])
+        if kept:
+            self._ckpt_owned.setdefault(table_idx, []).extend(kept)
+        return end
+
+    def swa_extend_reclaim(self, table_idx: int, start: int, end: int) -> int:
+        """Window slots ``free_swa_out_of_window_extend`` will return for ``[start, end)``."""
+        if end <= start:
+            return 0
+        _, ranges, _ = self._swa_free_plan(table_idx, start, end)
+        return sum(hi - lo for lo, hi in ranges)
 
     def lock(self, handle: BaseCacheHandle) -> None:
         if self.is_swa:
@@ -559,6 +606,21 @@ class CacheManager:
 
         insert_len = align_down(req.cached_len, self.page_size)
         freed = page_indices[:0]
+        kept = sorted(b for b in self._ckpt_owned.pop(req.table_idx, ()) if b <= insert_len)
+        if kept:
+            # One insert per kept checkpoint: each lays out [.., b - window) as tombstone and the
+            # checkpoint window as a live node, so the tree mirrors which rows are still bound.
+            prev, parts = old_handle.cached_len, []
+            for b in kept:
+                _, f = self.prefix_cache.insert(
+                    cache_key(req, b), page_indices[:b],
+                    swa_evicted_seqlen=b - self.ckpt_window, update_kv_after_len=prev)
+                parts.append(f)
+                prev = b
+            freed = torch.cat(parts)
+            old_handle_len = prev
+        else:
+            old_handle_len = old_handle.cached_len
         if insert_len > 0:
             # insert reconciles tombstones (revives the in-window ones by ADOPTING the request's
             # live-swa slots into node.value) and returns every full slot to reclaim: the displaced
@@ -568,10 +630,11 @@ class CacheManager:
             # commits -- the extend driver frees out-of-window swa during chunked prefill too, so an
             # unfinished chunk's frontier is already > 0 and must be honored (else insert adopts
             # sentinel slots -> the request's later SWA gathers read slot 0 -> corruption).
-            _, freed = self.prefix_cache.insert(
+            _, last = self.prefix_cache.insert(
                 cache_key(req, insert_len), page_indices[:insert_len],
                 swa_evicted_seqlen=req.swa_evicted_seqlen,
-                update_kv_after_len=old_handle.cached_len)
+                update_kv_after_len=old_handle_len)
+            freed = torch.cat([freed, last])
         self.unlock(old_handle)
         self._free_swa(freed)   # idempotent: revived/out-of-window slots are already sentinel -> no-op
         self._free(freed)
@@ -596,8 +659,9 @@ class CacheManager:
                     self.page_size,
                 )
                 if keep_from > 0:
-                    self._free_swa(
-                        self.prefix_cache.trim_head_swa(cache_key(req, prompt_len), keep_from))
+                    self._free_swa(self.prefix_cache.trim_head_swa(
+                        cache_key(req, prompt_len), keep_from,
+                        checkpoint_interval=self.ckpt_interval, checkpoint_window=self.ckpt_window))
                 self.prefix_cache.match_prefix(cache_key(req, prompt_len))
         else:
             # inc_lock is node-granular, and the suffix insert just made this chunk's whole
@@ -658,6 +722,7 @@ class CacheManager:
         elif self.is_swa:
             pc = self.prefix_cache
             pc.check_integrity()  # full>=swa refs, tombstone => no swa lock
+            assert not any(self._ckpt_owned.values()), f"checkpoints held by no request: {self._ckpt_owned}"
             cache_pages = (pc.full_evictable + pc.full_protected) // self.page_size
             # swa-slot conservation upper bound: free swa slots + tree-held live swa tokens can
             # never exceed the (non-sentinel) swa-pool capacity; the rest is held by running reqs.

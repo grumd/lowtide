@@ -330,6 +330,106 @@ def test_spare_cells_wait_when_host_ram_is_short(monkeypatch):
     _assert_whole(cache, truth)
 
 
+CELL = sum(math.prod(shape) * 2 for shape in BANKS.values())  # bytes of one expert's cells
+FLOOR = 64 * CELL  # a keep-free floor, in the units the fake headroom below counts
+
+
+def _room(monkeypatch, cells_over_floor: float):
+    """Host RAM free: the floor plus (or minus) this many cells."""
+    from freetoken.moe import host_banks
+
+    monkeypatch.setattr(host_banks, "host_ram_headroom", lambda: int(FLOOR + cells_over_floor * CELL))
+
+
+@CUDA
+def test_spare_cells_stop_at_the_host_ram_floor(monkeypatch):
+    """RAM above the floor but not enough for the spare cells a cycle asks for: none are pinned,
+    evictions swap instead, and nothing is lost."""
+    cache, truth, _ = _build()
+    cache.host_ram_keep_free = FLOOR
+    cache._spare_target = 0
+    _settle(cache)
+    _decode(cache, 200, seed=110)
+    assert _counts(cache)[1] > 2 * E
+    _room(monkeypatch, 0.5)
+    _settle(cache)
+    assert _spares(cache) == 0 and cache._pins_refused > 0
+    assert all(pool.commits == 0 for pool in cache.host_pools.values())
+    _assert_whole(cache, truth)
+    _decode(cache, 100, seed=111)
+    _assert_whole(cache, truth)
+    _room(monkeypatch, 4 * E)  # room again: the next idle point pins them
+    _settle(cache)
+    assert _spares(cache) > 0
+    _assert_whole(cache, truth)
+
+
+@CUDA
+def test_tp_ranks_count_the_ram_of_all_ranks(monkeypatch):
+    cache, _, _ = _build()
+    _room(monkeypatch, 3)  # floor plus three cells
+    assert cache._ram_allows(3, FLOOR) and not cache._ram_allows(4, FLOOR)
+    cache.host_ram_ranks = 2
+    assert cache._ram_allows(1, FLOOR) and not cache._ram_allows(2, FLOOR)
+
+
+@CUDA
+def test_idle_points_under_the_floor_shed_host_copies(monkeypatch):
+    """Something else took the RAM: the next idle point releases the spare cells and then the
+    host copies of the experts cached in the range, hottest first, and every expert stays whole."""
+    cache, truth, _ = _build(seed=False)
+    cache._set_vram_only_end(CAP)
+    cache.host_ram_keep_free = FLOOR
+    _decode(cache, 60, seed=120)  # cached with host copies, none settled yet
+    _settle(cache)
+    released, held = _released(cache), cache.vram_only
+    assert held == 0
+    _room(monkeypatch, -10)
+    cache.settle_host_cells()
+    assert _released(cache) >= released + 10 and cache.vram_only >= 10 - _spares(cache)
+    assert cache._cells_shed >= 10 and _spares(cache) == 0
+    slot = torch.arange(CAP, device=cache.device)
+    hot = cache.usage[cache.vram_only_owner >= 0]
+    rest = cache.usage[(cache.vram_only_owner < 0) & (cache.id_of_slot >= 0) & (slot >= 2 * E)]
+    assert rest.numel() == 0 or hot.min() >= rest.max(), "the hottest experts give their copies up first"
+    _assert_whole(cache, truth)
+    _decode(cache, 100, seed=121)  # evicting them writes them back
+    _assert_whole(cache, truth)
+    _room(monkeypatch, 4 * E)
+    _settle(cache)
+    _assert_whole(cache, truth)
+
+
+@CUDA
+def test_a_shrink_under_the_floor_stores_into_spare_cells_before_it_pins(monkeypatch):
+    cache, truth, elastic = _build(active=CAP)
+    cache.host_ram_keep_free = FLOOR
+    _decode(cache, 100, seed=130)
+    _settle(cache)
+    spares, pool = _spares(cache), next(iter(cache.host_pools.values()))
+    assert spares >= E
+    commits, full = pool.commits, cache.vram_only
+    _room(monkeypatch, -1)  # under the floor, yet the stores of a shrink still go ahead
+    low = 2 * E + 8
+    cache.shrink_active(low)
+    _remap(elastic, low)
+    stored = full - cache.vram_only
+    assert stored > spares
+    assert pool.commits - commits == stored - spares, "every spare cell took a store before a cell was pinned"
+    _assert_whole(cache, truth)
+    _decode(cache, 50, seed=131)
+    _assert_whole(cache, truth)
+    # the workspace went back; under the floor the range takes the whole cache at the next idle point
+    _remap(elastic, CAP)
+    cache.grow_active(CAP)
+    _decode(cache, 50, seed=132)
+    cache.settle_host_cells()
+    assert cache.vram_only_end == CAP and cache._cells_shed > 0
+    _assert_whole(cache, truth)
+    _decode(cache, 50, seed=133)
+    _assert_whole(cache, truth)
+
+
 @CUDA
 def test_an_unseeded_cache_gives_up_the_cells_of_what_settles():
     cache, truth, _ = _build(seed=False)

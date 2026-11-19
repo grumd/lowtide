@@ -15,6 +15,13 @@ page per full page (``alloc_swa``) and frees pages whose tokens slid out of ever
 window or were tombstoned by the SWA radix cache (``free_swa``). The trailing map entry is a
 permanent ``-1`` so a gather at row ``-1`` stays ``-1``; the window slab keeps one scratch row
 past its pages for stores to unbound slots (warmup prefill writes the dummy row's slots).
+
+Window checkpoints (radix cache only): the window ending at every multiple of
+``checkpoint_interval`` tokens of a sequence stays bound (its pages are simply not freed when
+they slide out), so the radix tree keeps it as a live node between tombstones and a prompt
+that branches mid-message resumes at the last checkpoint before the branch. The tier reserves
+room for one ``max_seq_len`` sequence's checkpoints on top of the concurrency floor; tree-held
+checkpoints are ordinary unlocked swa nodes that ``evict_swa`` reclaims under pressure.
 """
 
 from __future__ import annotations
@@ -50,15 +57,51 @@ def hy4_window_floor_tokens(config) -> int:
     return config.max_running_req * _per_req_window_tokens(config)
 
 
+def hy4_checkpoint_interval(config) -> int:
+    """Tokens between retained window checkpoints (0 = none); only the radix cache has a tree
+    to keep them in."""
+    from freetoken.models.hy4.config import SWA_WINDOW_CHECKPOINT_TOKENS
+
+    n = getattr(config, "swa_window_checkpoint_tokens", None)
+    n = SWA_WINDOW_CHECKPOINT_TOKENS if n is None else int(n)
+    window = _window_args(config).sliding_window
+    if n < 0 or (n and (n % config.page_size or n < window)):
+        raise ValueError(
+            f"swa_window_checkpoint_tokens must be 0 or a multiple of the KV page size "
+            f"({config.page_size}) that is >= the sliding window ({window}), got {n}"
+        )
+    return n if config.cache_type == "swa_radix" else 0
+
+
+def hy4_checkpoint_window(config) -> int:
+    """Rows one checkpoint keeps: the window before the boundary, page aligned."""
+    return align_ceil(_window_args(config).sliding_window, config.page_size)
+
+
+def hy4_checkpoint_tokens(config, num_full_tokens: int | None = None) -> int:
+    """Window slots reserved for checkpoints: every checkpoint of one max-length sequence (a
+    static pool's sequences are also bounded by its full tier)."""
+    interval = hy4_checkpoint_interval(config)
+    if interval == 0:
+        return 0
+    seq = int(config.max_seq_len)
+    if num_full_tokens is not None:
+        seq = min(seq, int(num_full_tokens))
+    return seq // interval * hy4_checkpoint_window(config)
+
+
 def hy4_window_tokens(config, num_full_pages: int, num_swa_pages: int | None = None) -> int:
     """Allocatable window slots (dummy page excluded): the concurrency floor, or for the radix
-    cache the larger of it and the pinned size / ``swa_full_tokens_ratio`` x full tokens."""
+    cache the larger of the floor plus the checkpoint reserve and the pinned size /
+    ``swa_full_tokens_ratio`` x full tokens."""
     floor = hy4_window_floor_tokens(config)
     if config.cache_type != "swa_radix":
         return floor
     from freetoken.engine.engine import _elastic_vram
 
-    if _elastic_vram(config) and num_swa_pages is None and config.swa_num_pages_override is None:
+    elastic = _elastic_vram(config)
+    floor += hy4_checkpoint_tokens(config, None if elastic else num_full_pages * config.page_size)
+    if elastic and num_swa_pages is None and config.swa_num_pages_override is None:
         return floor  # the full tier moves with the page count; the window tier cannot
     pin = num_swa_pages if num_swa_pages is not None else config.swa_num_pages_override
     if pin is not None:
@@ -146,12 +189,25 @@ class Hy4WindowKVCache(Hy4KVCache):
 
     def rebuild_from_config(self, config, num_pages: int, *, num_swa_pages: int | None = None) -> None:
         self.rebuild(num_pages + 1, hy4_window_tokens(config, num_pages + 1, num_swa_pages))
+        self.configure_checkpoints(config)
+
+    # read by the CacheManager (scheduler/cache.py): retained-window spacing, rows and budget
+    checkpoint_interval = 0
+    checkpoint_window = 0
+    checkpoint_capacity = 0
+
+    def configure_checkpoints(self, config) -> None:
+        """The checkpoint budget is whatever the tier holds above the concurrency floor."""
+        self.checkpoint_interval = hy4_checkpoint_interval(config)
+        self.checkpoint_window = hy4_checkpoint_window(config)
+        spare = self._num_window_tokens - hy4_window_floor_tokens(config)
+        self.checkpoint_capacity = max(0, spare) if self.checkpoint_interval else 0
 
     @classmethod
     def kv_cost(cls, config, *, num_swa_pages: int | None = None) -> tuple[int, int, int, int]:
         """Full tier (indexed layers + index slab + the int32 map) per page; the window tier is
-        the concurrency floor (fixed) plus, for the radix cache, ratio x full tokens per page
-        unless a window size is pinned."""
+        the concurrency floor (fixed) plus, for the radix cache, the checkpoint reserve (fixed)
+        and ratio x full tokens per page unless a window size is pinned."""
         args = _window_args(config)
         ps = config.page_size
         row = args.latent_dim * config.dtype.itemsize
@@ -165,8 +221,10 @@ class Hy4WindowKVCache(Hy4KVCache):
         from freetoken.engine.engine import _elastic_vram
 
         if config.cache_type == "swa_radix":
+            floor = hy4_window_floor_tokens(config) + hy4_checkpoint_tokens(config)
+            fixed = win * (floor + ps)
             if pin is not None:
-                fixed = win * (align_ceil(max(hy4_window_floor_tokens(config), int(pin)), ps) + ps)
+                fixed = win * (align_ceil(max(floor, int(pin)), ps) + ps)
             elif not _elastic_vram(config):
                 per_page += int(win * ps * config.swa_full_tokens_ratio)
         return per_page, fixed, ps, 0
@@ -270,4 +328,7 @@ class Hy4WindowKVCache(Hy4KVCache):
         return self.window_slots(kv_indices)
 
 
-__all__ = ["Hy4KVCache", "Hy4WindowKVCache", "hy4_window_tokens", "hy4_window_floor_tokens"]
+__all__ = [
+    "Hy4KVCache", "Hy4WindowKVCache", "hy4_window_tokens", "hy4_window_floor_tokens",
+    "hy4_checkpoint_interval", "hy4_checkpoint_tokens",
+]

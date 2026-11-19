@@ -108,3 +108,36 @@ def test_report_from_a_full_result(tmp_path):
     report = cal.render_report(res, 5)
     assert "Recommendation: scripts/serve.sh --moe-decode-fetch 0.15 --threads 7" in report
     assert "PCIe gen4 x8" in report and "0.15            55.0            51.9  <- pick" in report
+
+
+def test_routed_cutoff_is_the_last_size_routing_wins_from_the_start():
+    streamed = {512: 6.9, 1024: 7.4, 2048: 8.5, 3072: 9.6, 4096: 10.8}
+    assert cal.choose_routed(streamed, {512: 0.9, 1024: 1.8, 2048: 4.0, 3072: 9.9, 4096: 9.0})[0] == 2048
+    assert cal.choose_routed(streamed, {n: t / 2 for n, t in streamed.items()})[0] == 4096
+    cut, why = cal.choose_routed(streamed, {n: t * 2 for n, t in streamed.items()})
+    assert cut == 0 and "512" in why
+
+
+def test_cpu_bench_takes_routing_from_the_checkpoint(tmp_path):
+    snap = _snap(tmp_path)
+    (snap / "config.json").write_text(json.dumps({"text_config": {"num_experts_per_tok": 16, "swiglu_limit": 10.0}}))
+    assert cal._moe_activation(snap) == (16, "swiglu_clamp", 1.0, 10.0)
+    (snap / "config.json").write_text(json.dumps({"num_experts_per_tok": 10, "hidden_act": "silu"}))
+    assert cal._moe_activation(snap) == (10, "silu", 1.702, None)
+
+
+def test_report_with_a_prefill_sweep_and_serve_flags():
+    hw = {"date": "2026-11-19T20:00", "host": "box", "gpus_arg": "0,1", "gpus": [], "default_threads": 4,
+          "cpu": {"model": "CPU", "physical_cores": 8, "logical_cpus": 16, "ram_gib": 91.8, "avx2": True,
+                  "avx512f": True, "avx512_bf16": True, "avx512_vnni": True, "avx_vnni": True}}
+    screen = {1.0: {"short": 24.0}, 0.25: {"short": 30.0}}
+    res = {"hw": hw, "depths": {"short": 4100}, "screen": screen, "threads_table": {}, "confirm": {},
+           "decode_fetch": 0.25, "threads": 4, "why": "0.25 is +25%", "num_gpus": 2, "screen_threads": 4,
+           "sweep_s": 600, "out_tokens": 96, "skip": 24, "serve_flags": ["--moe-vram-only"],
+           "prefill": {"streamed": {512: 2.5, 4096: 3.0}, "routed": {512: 0.5, 4096: 4.0}, "cutoff": 512,
+                       "tokens": {512: 476, 4096: 4060},
+                       "why": "routing wins up to 512 tokens"}}
+    report = cal.render_report(res)
+    assert ("Recommendation: scripts/serve.sh --moe-vram-only --moe-decode-fetch 0.25 --threads 8 "
+            "--moe-routed-prefill-tokens 512") in report
+    assert "          4096   (4060)       3.00       4.00" in report and "prefill: routing wins up to 512" in report

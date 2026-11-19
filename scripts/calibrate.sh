@@ -2,10 +2,12 @@
 # Measure the best CPU-assisted decode settings (FP4 or INT4) for this machine and GPU setup, and print
 # the serve.sh flags to use them. Run it with the MODEL / GPUS you serve with.
 #
-#   MODEL=~/models/ftw/q38-fp4 scripts/calibrate.sh
+#   MODEL=~/models/ftw/q38-fp4 scripts/calibrate.sh [serve.sh flags every load runs with]
 #
 # Probes PCIe and the CPU expert kernel, then loads the model twice through serve.sh: plain
-# decode, then CPU-assisted with the settings switched at runtime. See scripts/README.md.
+# decode, then CPU-assisted with the settings switched at runtime. With PREFILL_SWEEP_TOKENS (e.g.
+# 512,1024,2048,4096) prompts of those sizes are timed in both loads (every prefill chunk streamed,
+# then routed) for the --moe-routed-prefill-tokens cutoff. See scripts/README.md.
 set -u
 HERE=$(dirname "$(readlink -f "$0")")
 
@@ -20,6 +22,7 @@ HERE=$(dirname "$(readlink -f "$0")")
 : "${MEASURED_TOKENS:=192}"
 : "${WARMUP_TOKENS:=48}"
 : "${FIXED_CPU_THREADS:=}"
+: "${PREFILL_SWEEP_TOKENS:=}"
 : "${LOAD_TIMEOUT_S:=900}"
 : "${FT_BIN:=$(dirname "$HERE")/.venv/bin/ft}"
 [ -x "$FT_BIN" ] || FT_BIN=$(command -v ft) || { echo "ft not found: install the repo or set FT_BIN" >&2; exit 1; }
@@ -64,7 +67,8 @@ echo "== decode sweep: two loads, plain then CPU-assisted (logs in $work) =="
 "$PY" "$HERE/calibrate.py" run --hw "$work/hw.json" --snap "$MODEL" --gpus "$GPUS" \
   --port "$CALIBRATION_PORT" --work "$work" --out "$work/result.json" \
   --short "$SHORT_CONTEXT_TOKENS" --long "$LONG_CONTEXT_TOKENS" --tokens "$MEASURED_TOKENS" --skip "$WARMUP_TOKENS" \
-  ${FIXED_CPU_THREADS:+--threads "$FIXED_CPU_THREADS"} --load-timeout "$LOAD_TIMEOUT_S" --total-s "$(( $(date +%s) - t_start ))"
+  ${FIXED_CPU_THREADS:+--threads "$FIXED_CPU_THREADS"} --load-timeout "$LOAD_TIMEOUT_S" --total-s "$(( $(date +%s) - t_start ))" \
+  --prefill-sizes "$PREFILL_SWEEP_TOKENS" -- "$@"
 rc=$?
 echo "calibration took $(( $(date +%s) - t_start )) s; logs and raw numbers in $work"
 exit "$rc"

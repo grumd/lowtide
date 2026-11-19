@@ -145,6 +145,24 @@ class EngramRows:
         return self._rows[:, index]
 
 
+def _row_table(source, constants, **kw):
+    """The store's ``DiskRowTable``: launch-gating when captured graphs cannot be uploaded,
+    since the first launch of the decode graph would block at its Engram WAIT before the fill."""
+    from freetoken.engine import graph as graph_mod
+    from freetoken.models.qwen4_exp.ple_disk import DiskRowTable
+
+    if graph_mod.graph_upload_supported():
+        return DiskRowTable(source, constants, **kw)
+
+    class GatedRowTable(DiskRowTable):
+        def _probe_wait_sync(self, mode: str) -> bool:
+            if mode == "wait":
+                raise RuntimeError("FREETOKEN_PLE_SYNC=wait needs cuda.bindings for Hy4 (graph upload)")
+            return False
+
+    return GatedRowTable(source, constants, **kw)
+
+
 class Hy4EngramStore:
     """All Engram tables of the model behind one disk PLE store (``DiskRowTable``).
 
@@ -161,7 +179,7 @@ class Hy4EngramStore:
         max_extend_tokens: int = 8192,
         page_cache: bool = True,
     ) -> None:
-        from freetoken.models.qwen4_exp.ple_disk import DiskRowTable, PleRowSource
+        from freetoken.models.qwen4_exp.ple_disk import PleRowSource
 
         if args.engram_max_ngram_size != 3:
             raise NotImplementedError("the PLE store hashes bigrams and trigrams only")
@@ -205,9 +223,9 @@ class Hy4EngramStore:
             "lookup_pad_id": args.engram_pad_id,
         }
         self.multipliers = [mult[3 * i : 3 * i + 3] for i in range(len(sources))]
-        self.table = DiskRowTable(
+        self.table = _row_table(
             source, constants, max_graph_rows=max_graph_rows, max_extend_tokens=max_extend_tokens,
-            dtype=torch.bfloat16, page_cache=page_cache, graph_fill_worker=True,
+            dtype=torch.bfloat16, page_cache=page_cache,
         )
         self._offsets = offsets
         self._probe = torch.empty((max(max_graph_rows, max_extend_tokens), 0), device=self.table._device)

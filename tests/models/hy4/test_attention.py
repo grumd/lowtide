@@ -1264,6 +1264,8 @@ def test_fp8_attention_linears_real_tensors():
 
 # --- 12. window tier: the sliding layers' storage moves, the outputs do not -------------------------
 
+from freetoken.kvcache.hy4_pool import Hy4WindowKVCache  # noqa: E402
+
 _RING_EDGES = {
     "tiny": {"odd": [0, 13, 14, 51, 52, 53, 97, 150]},
     "realdims": {"odd": [0, 333, 1000, 1601, 2047, 2048, 2049, 2050, 2702]},
@@ -1288,7 +1290,9 @@ def _ring_fixture(gd, size, ring: bool, sched, seed=0):
     chunk = max(b - a for a, b, _ in sched)
     # room for one chunk plus the live window: freed window pages are reused within the run
     window = -(-(chunk + gd.args.sliding_window + 3 * ps) // ps) * ps if ring else None
-    return AttnFixture(config, num_pages, page_size=ps, seed=seed, window_tokens=window)
+    fx = AttnFixture(config, num_pages, page_size=ps, seed=seed, window_tokens=window)
+    assert isinstance(fx.pool, Hy4WindowKVCache) == ring, type(fx.pool)
+    return fx
 
 
 @pytest.mark.parametrize("size", SIZES)
@@ -1346,6 +1350,7 @@ def test_window_tier_two_requests_bitwise():
     for ring in (False, True):
         config = ring_config(gd.config) if ring else gd.config
         fx = AttnFixture(config, 64, page_size=4, seed=5, window_tokens=176 if ring else None)
+        assert isinstance(fx.pool, Hy4WindowKVCache) == ring, type(fx.pool)
         got = {i: ([], []) for i in layers}
         for (a0, a1, phase), (b0, b1, _) in zip(sched_a, sched_b):
             ba, bb = fx.batch(1, a0, a1, phase), fx.batch(2, b0, b1, phase)

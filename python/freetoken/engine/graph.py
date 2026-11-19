@@ -91,13 +91,22 @@ def get_free_memory(device: torch.device) -> int:
     return torch.cuda.mem_get_info(device)[0]
 
 
+def graph_upload_supported() -> bool:
+    """Whether :func:`upload_graph` uploads (it needs ``cuda.bindings``); without it a model
+    whose decode graph WAITs on a host fill must not fill after the launch."""
+    try:
+        from cuda.bindings import driver  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def upload_graph(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> None:
     """Upload ``graph`` at capture: the first launch of a graph with ~6k nodes behind a captured
     flag WAIT (Hy4's Engram) blocks until the WAIT passes, and the fill only runs after the launch."""
-    try:
-        from cuda.bindings import driver
-    except ImportError:
+    if not graph_upload_supported():
         return
+    from cuda.bindings import driver
 
     err = driver.cuGraphUpload(driver.CUgraphExec(graph.raw_cuda_graph_exec()), driver.CUstream(stream.cuda_stream))
     err = err[0] if isinstance(err, tuple) else err

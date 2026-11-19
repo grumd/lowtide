@@ -108,7 +108,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     from .hy4_pool import Hy4WindowKVCache, hy4_window_tokens
 
     if resolve_pool_class(model_config) is Hy4WindowKVCache:
-        return create_kvcache_pool(
+        pool = create_kvcache_pool(
             model_config=model_config,
             num_pages=num_pages + 1,  # +1 for dummy page
             page_size=config.page_size,
@@ -117,6 +117,8 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             dtype=dtype,
             num_req_slots=config.max_running_req + 1,
         )
+        pool.configure_checkpoints(config)
+        return pool
 
     num_swa_tokens = None
     # Both the naive and radix SWA paths share the global-paged swa pool; radix sizes it by

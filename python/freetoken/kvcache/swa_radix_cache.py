@@ -340,23 +340,31 @@ class SWARadixCache:
         return SWAEvictResult(torch.cat(kv) if kv else self.empty,
                               torch.cat(swa) if swa else self.empty)
 
-    def trim_head_swa(self, input_ids: torch.Tensor, keep_from: int) -> torch.Tensor:
+    def trim_head_swa(self, input_ids: torch.Tensor, keep_from: int,
+                      checkpoint_interval: int = 0, checkpoint_window: int = 0) -> torch.Tensor:
         """Tombstone the swa currency of the path strictly below ``keep_from`` (full KV stays),
         returning the freed swa-bearing full indices for the caller to release. Retention
         companion of the finish-time soft pin: only the trailing window ``[keep_from, P)``
         needs to stay swa-live for a next-turn cut near P, so the head is reclaimed eagerly
         instead of lingering as LRU litter. Locked (swa_ref>0), tombstoned and leaf nodes are
-        left untouched; ``keep_from`` must be page-aligned."""
+        left untouched; ``keep_from`` must be page-aligned. With a ``checkpoint_interval``, the
+        windows ``[b - checkpoint_window, b)`` ending at its multiples are kept live too."""
         if keep_from <= 0:
             return self.empty
-        self.match_prefix(input_ids[:keep_from])  # ensure a node boundary at keep_from (splits)
+        iv, w = checkpoint_interval, checkpoint_window
+        keep = [(b - w, b) for b in range(iv, keep_from + 1, iv)] if iv > 0 else []
+        # node boundaries at keep_from and at both edges of every kept window (match splits)
+        for edge in sorted({keep_from, *(e for span in keep for e in span if 0 < e < keep_from)}):
+            self.match_prefix(input_ids[:edge])
         freed: List[torch.Tensor] = []
         node, pos = self.root, 0
         while pos < keep_from:
             child = node.children.get(self.key_fn(input_ids[pos:]))
             if child is None or pos + child.length > keep_from:
                 break
-            if not child.swa_tombstone and child.swa_ref_count == 0 and not child.is_leaf():
+            kept = any(lo <= pos and pos + child.length <= hi for lo, hi in keep)
+            if (not kept and not child.swa_tombstone and child.swa_ref_count == 0
+                    and not child.is_leaf()):
                 freed.append(child.value)
                 self.swa_evictable -= child.length
                 child.swa_tombstone = True

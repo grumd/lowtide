@@ -546,7 +546,7 @@ class OffloadMoeCache:
         """Experts held in VRAM only right now (reads device memory)."""
         return int((self.vram_only_owner >= 0).sum()) if self.pooled else 0
 
-    def use_host_cells(self, pools: dict, late=None) -> None:
+    def use_host_cells(self, pools: dict, late=None, keep_free: int = 0, ranks: int = 1) -> None:
         """Stop keeping host copies of the experts cached in VRAM (``--moe-vram-only``).
 
         ``pools[name]`` is the ``HostPool`` behind bank ``name``'s sources: every expert's row a
@@ -582,7 +582,11 @@ class OffloadMoeCache:
         ``late``: the layers the loader left unread (``checkpoint.ftw.LateLayers``), which
         ``seed_vram_only`` reads on their way into VRAM. Until then their experts read the
         cells of a loaded layer, so the forwards before seeding (graph capture, whose output
-        is discarded) touch only pinned memory."""
+        is discarded) touch only pinned memory.
+
+        ``keep_free``: bytes of host RAM the optional pins (spare cells) leave free, and below which
+        idle points shed host copies (``_shed``); ``ranks``: the processes (TP ranks) that pin the
+        same cells at the same points."""
         import numpy as np
 
         from freetoken.kernel.pinned import device_ptr
@@ -609,6 +613,9 @@ class OffloadMoeCache:
             assert device_ptr(pool) == pool.data_ptr(), "host cells need host memory mapped at its own address"
             ptrs.append(pool.data_ptr())
         self.host_pools = {name: pools[name] for name in self.bank_schema}
+        self._cell_bytes = sum(p.row_bytes for p in self.host_pools.values() if p.releasable)
+        self.host_ram_keep_free, self.host_ram_ranks = keep_free, ranks
+        self._pins_refused = self._cells_shed = 0
         self._copy_src_ptrs = None
         self._copy_src_ptrs_host = []
         E = self.num_experts
@@ -767,6 +774,12 @@ class OffloadMoeCache:
         if required and free.size < n:
             self._return_spares(int(self.vram_only_span[3]))
             free = self.cell_free.nonzero().squeeze(1).cpu().numpy()
+        elif required and int(self.vram_only_span[3]):
+            unbacked = n - int((~self._cell_out[free]).sum())
+            if unbacked > 0 and not self._ram_allows(unbacked, self.host_ram_keep_free):
+                # under the floor the spare cells, pinned already, take the stores first
+                self._return_spares(unbacked)
+                free = self.cell_free.nonzero().squeeze(1).cpu().numpy()
         assert free.size >= n or not required, f"{n} experts to store but {free.size} free host cells"
         n = min(n, int(free.size))
         take = free[np.argsort(self._cell_out[free], kind="stable")[:n]]
@@ -776,11 +789,11 @@ class OffloadMoeCache:
                 return None
             from freetoken.moe.host_banks import HostRamShort, host_ram_headroom
 
-            need = int(back.size) * sum(p.row_bytes for p in self.host_pools.values() if p.releasable)
+            need = int(back.size) * self._cell_bytes * self.host_ram_ranks
             raise HostRamShort(
                 f"--moe-vram-only: {back.size} experts are leaving VRAM and need {need / 2**30:.1f} GiB "
                 f"of host RAM, but only {(host_ram_headroom() or 0) / 2**30:.1f} GiB is free. Stopping the "
-                f"server; free host RAM or run without --moe-vram-only."
+                f"server; free host RAM, cap the prefill chunk (--prefill-batch-max) or run without --moe-vram-only."
             )
         cells = torch.from_numpy(take).to(self.device)
         self.cell_free[cells] = 0
@@ -844,11 +857,7 @@ class OffloadMoeCache:
         slots = torch.arange(first, end, device=self.device)
         settled = self.slot_age[first:end] >= SETTLED_AFTER
         give = slots[settled & (self.vram_only_owner[first:end] < 0)]
-        if give.numel():
-            ids = self.id_of_slot[give].long()
-            self.cell_free[self.host_row[ids].long()] = 1
-            self.host_row[ids] = -1
-            self.vram_only_owner[give] = ids.to(torch.int32)
+        self._give_up_cells(give)
         counts = self.xfer_counts.tolist()
         fetched, evicted, spared = (now - was for now, was in zip(counts, self._counts_at_idle))
         self._counts_at_idle = counts
@@ -862,15 +871,59 @@ class OffloadMoeCache:
             # idle time a busy server never has: pin some here, for at most the time the swaps
             # just cost
             self._top_up_spares(pin=True, limit=max(1, (evicted - spared) // SWAPS_PER_PIN))
-        if fetched:
+        shed = self._shed()
+        end = self.vram_only_end
+        if fetched or shed:
+            floor = ""
+            if self._pins_refused or self._cells_shed:
+                floor = (f"; under the {self.host_ram_keep_free / 2**30:.1f} GiB host RAM floor so far: "
+                         f"{self._pins_refused} spare top-ups not pinned, {self._cells_shed} host copies shed")
             logger.info_rank0(
                 f"host cells: {fetched} experts fetched, {evicted} of them evicted a VRAM-only expert "
                 f"({spared} to a spare cell, {evicted - spared} swapped); {int(give.numel())} experts gave their "
                 f"cells up, {int((self.vram_only_owner >= 0).sum())} of {self._cell_out.size} are in VRAM only "
                 f"(slots {first}..{end} of {self.active_slots}), {int((~self._cell_out).sum())} host cells in RAM, "
-                f"{int(self.vram_only_span[3])} of them spare (aim {self._spare_target})"
+                f"{int(self.vram_only_span[3])} of them spare (aim {self._spare_target})" + floor
             )
         self._idle_pending = True
+
+    def _give_up_cells(self, slots: torch.Tensor) -> None:
+        """The cached experts in ``slots`` (in the VRAM-only range, each with a host copy) become
+        VRAM-only; their cells are free."""
+        if slots.numel():
+            ids = self.id_of_slot[slots].long()
+            self.cell_free[self.host_row[ids].long()] = 1
+            self.host_row[ids] = -1
+            self.vram_only_owner[slots] = ids.to(torch.int32)
+
+    def _shed(self) -> int:
+        """Idle point with less host RAM free than ``host_ram_keep_free``: release cells without
+        losing an expert. Free and spare cells go first, then the host copies of experts cached in
+        the VRAM-only range, most recently used first (the last to be evicted and written back); a
+        prefill chunk's fetches, the next victims, keep theirs. The range takes the whole cache
+        again at once: a workspace that comes back then stores experts, which costs time, not RAM.
+        Returns the cells released."""
+        from freetoken.moe.host_banks import host_ram_headroom
+
+        room = host_ram_headroom() if self.host_ram_keep_free else None
+        if room is None or room >= self.host_ram_keep_free:
+            return 0
+        if self.vram_only_end < self.active_slots:
+            self._troughs.clear()
+            self._set_vram_only_end(self.active_slots)
+        first, end = self.vram_only_first, self.vram_only_end
+        want = -(-(self.host_ram_keep_free - room) // (self._cell_bytes * self.host_ram_ranks))
+        self._return_spares(int(self.vram_only_span[3]))
+        free = self.cell_free.nonzero().squeeze(1).cpu().numpy()
+        short = want - int((~self._cell_out[free]).sum())
+        if short > 0:
+            slots = torch.arange(first, end, device=self.device)
+            held = slots[(self.vram_only_owner[first:end] < 0) & (self.id_of_slot[first:end] >= 0)
+                         & (self.usage[first:end] > SEEDED_USAGE)]
+            self._give_up_cells(held[self.usage[held].argsort(descending=True)[:short]])
+        n = self._release_free_cells(limit=want) // max(1, self._cell_bytes)
+        self._cells_shed += n
+        return n
 
     def _spare_aim(self, span: int) -> int:
         """Spare cells to set aside: what three out of four of the last cycles evicted and a
@@ -899,8 +952,10 @@ class OffloadMoeCache:
         cells = free[~out][: want - have]
         if pin and cells.numel() < want - have:
             more = free[out][: min(want - have - int(cells.numel()), limit or want)]
-            if more.numel() and self._pin_cells(more.cpu().numpy()):
+            if more.numel() and self._pin_cells(more.cpu().numpy(), self.host_ram_keep_free):
                 cells = torch.cat([cells, more])
+            elif more.numel():
+                self._pins_refused += 1
         n = int(cells.numel())
         if n:
             self.cell_free[cells] = 0
@@ -908,14 +963,18 @@ class OffloadMoeCache:
             self.vram_only_span[3] = have + n
         return n
 
-    def _pin_cells(self, cells) -> bool:
-        """Back released ``cells`` with RAM and pin them again; False (nothing done) if host RAM
-        is short."""
+    def _ram_allows(self, cells: int, keep_free: int = 0) -> bool:
+        """Whether pinning ``cells`` more cells leaves ``keep_free`` bytes of host RAM. Every TP rank
+        pins the same count at the same points, so each one counts the RAM of all."""
         from freetoken.moe.host_banks import host_ram_headroom
 
-        need = int(cells.size) * sum(p.row_bytes for p in self.host_pools.values() if p.releasable)
         room = host_ram_headroom()
-        if room is not None and need > room:
+        return room is None or cells * self._cell_bytes * self.host_ram_ranks + keep_free <= room
+
+    def _pin_cells(self, cells, keep_free: int = 0) -> bool:
+        """Back released ``cells`` with RAM and pin them again; False (nothing done) if that would
+        leave less than ``keep_free`` of host RAM."""
+        if not self._ram_allows(int(cells.size), keep_free):
             return False
         for pool in self.host_pools.values():
             pool.commit(cells.tolist())

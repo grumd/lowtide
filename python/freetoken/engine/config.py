@@ -119,6 +119,9 @@ class EngineConfig:
     # the pass that fetches its replacement. The expert cache and elastic VRAM are unchanged
     # (OffloadMoeCache.use_host_cells). FTW checkpoints only.
     moe_vram_only: bool = False
+    # --moe-vram-only: host RAM (GiB, box-wide and under the cgroup limit) the RAM saver leaves free
+    # when it takes cells back for spares; below it, idle points hand cells of VRAM-cached experts back.
+    host_ram_keep_free_gb: float = 4.0
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
@@ -167,6 +170,11 @@ class EngineConfig:
     # --swa-eviction-interval: proactive out-of-window SWA eviction every N forwards.
     # None -> FREETOKEN_SWA_EVICTION_INTERVAL env (legacy), else 128. <= 0 disables it.
     swa_eviction_interval: int | None = None
+    # --swa-window-checkpoint-tokens: models with a window tier (Hy4) on the radix cache keep the
+    # sliding layers' window every N tokens of a sequence, so a prompt that branches mid-message
+    # resumes at the last multiple of N. None -> the model's default; 0 -> only the prompt/reply
+    # end windows. A multiple of the page size and >= the window.
+    swa_window_checkpoint_tokens: int | None = None
     distributed_timeout: float = 1800.0  # TP barriers span the ~30-min serial bank build
     use_dummy_weight: bool = False
     use_pynccl: bool = True
@@ -202,6 +210,12 @@ class EngineConfig:
         parse_config = _load_attr(spec.module, spec.parse_config)
         model_config = parse_config(self.hf_config)
         model_config = replace(model_config, quant=checkpoint_quant_config(self.model_path, self.hf_config, spec))
+        workspace = model_config.prefill_workspace
+        if workspace is not None and len(workspace) == 3:
+            # the third term is the head-sharded part: each TP rank holds 1/size of it
+            base, per_token, sharded = workspace
+            model_config = replace(
+                model_config, prefill_workspace=(base, per_token + sharded // self.tp_info.size))
         if self.mtp_path:
             model_config = self._apply_external_mtp(model_config)
         return model_config
@@ -254,7 +268,8 @@ class EngineConfig:
     def max_seq_len(self) -> int:
         if self.max_seq_len_override is not None:
             return self.max_seq_len_override
-        return self.model_config.rotary_config.max_position
+        default = getattr(self.model_config, "default_max_seq_len", None)
+        return default or self.model_config.rotary_config.max_position
 
     @property
     def max_forward_len(self) -> int:

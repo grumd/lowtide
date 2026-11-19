@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Dict, List
 
 import torch
 from freetoken.core import Batch, get_global_ctx
+from freetoken.engine import graph as graph_mod
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -135,6 +136,8 @@ class VerifyGraphRunner:
                 ):
                     self.logits[:total] = self.model.forward_logits_all()
                 self._reset_moe()
+        # the verify graph WAITs on the PLE fill like the decode graph
+        graph_mod.upload_graph(graph, self.gr.stream)
         self.graph_map[bs] = graph
         self.streams_map[bs] = getattr(batch, "mtp_streams", None)
 

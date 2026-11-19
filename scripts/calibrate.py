@@ -9,7 +9,9 @@ run    two loads of serve.sh: --moe-decode-fetch 1 (plain decode, the reference)
        decode with FREETOKEN_CPU_DECODE_TUNABLE=1, where the internal /v1/admin/decode-tune
        endpoint switches the share and the CPU thread count between requests. Greedy streaming
        decodes at a short and a long context; picks the recommendation, confirms it and prints
-       the report, ending with the serve.sh flags to use.
+       the report, ending with the serve.sh flags to use. With --prefill-sizes the first load
+       streams every prefill chunk and the second routes them, and prompts of those sizes timed
+       in both give the --moe-routed-prefill-tokens cutoff.
 """
 from __future__ import annotations
 
@@ -123,10 +125,20 @@ def _read_ftw_layer(snap: Path, layer: int) -> tuple[dict, int]:
     return banks, per_expert
 
 
+def _moe_activation(snap: Path) -> tuple[int, str, float, float | None]:
+    """top_k and the expert activation of the checkpoint (config.json): a ``swiglu_limit`` means
+    the clamped SwiGLU, as the model loaders build it."""
+    cfg = json.load(open(snap / "config.json"))
+    cfg = cfg.get("text_config", cfg)
+    limit = cfg.get("swiglu_limit")
+    top_k = int(cfg.get("num_experts_per_tok") or 8)
+    return (top_k, "swiglu_clamp", 1.0, float(limit)) if limit else (top_k, "silu", 1.702, None)
+
+
 def _cpu_bench(snap: Path, gpus: list[int], thread_counts: list[int], fmt: str) -> dict:
-    """The CPU decode kernel (fp32 activations, fp32 output) on layer 0's real experts: time per
-    task for 1, 2 and 8 routed experts at each thread count, all 512 experts in rotation so the
-    reads come from RAM, not the L3."""
+    """The CPU decode kernel (fp32 activations, fp32 output) on the first expert layer's real
+    experts: time per task for 1, 2 and 8 routed experts at each thread count, every expert in
+    rotation so the reads come from RAM, not the L3."""
     import types
 
     import torch
@@ -137,8 +149,10 @@ def _cpu_bench(snap: Path, gpus: list[int], thread_counts: list[int], fmt: str) 
     cache = types.SimpleNamespace(quant_format=fmt, num_layers=1, num_experts=E,
                                   bank_sources={k: [v] for k, v in banks.items()})
     cores = physical_core_cpus()
-    top_k = 8
-    ex = CpuMoeExecutor(cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+    top_k, activation, alpha, limit = _moe_activation(snap)
+    top_k = max(top_k, 8)
+    ex = CpuMoeExecutor(cache, top_k=top_k, activation=activation, apply_router_weight_on_input=False,
+                        swiglu_alpha=alpha, swiglu_limit=limit,
                         num_threads=len(cores), max_tokens=1, device=torch.device("cpu"), cpus=cores,
                         out_fp32=True, w4a8=False)
     io = ex.stage(0, 1)
@@ -258,6 +272,15 @@ class Server:
         with urllib.request.urlopen(self.base + "/v1/models", timeout=30) as r:
             return int(json.load(r)["data"][0].get("max_model_len") or 0)
 
+    def prefill(self, prompt: str) -> dict:
+        """Wall time of a one-token reply: the prompt's prefill and one decode step."""
+        body = {"model": self.model, "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 1, "temperature": 0}
+        t0 = time.perf_counter()
+        with self._post("/v1/chat/completions", body, timeout=1800) as r:
+            usage = json.load(r).get("usage") or {}
+        return {"s": time.perf_counter() - t0, "tokens": usage.get("prompt_tokens", 0)}
+
     def decode(self, prompt: str, max_tokens: int, skip: int) -> dict:
         """Greedy streaming decode; tok/s over the tokens after the first ``skip``."""
         body = {"model": self.model, "messages": [{"role": "user", "content": prompt}],
@@ -338,6 +361,25 @@ def choose_threads(table: dict[int, dict[str, float]], depths: list[str]) -> int
     return min(n for n in table if score[n] >= best * (1 - TIE))
 
 
+def choose_routed(streamed: dict[int, float], routed: dict[int, float]) -> tuple[int, str]:
+    """``streamed[n]`` / ``routed[n]`` = seconds for an ``n``-token prompt (one prefill chunk). The
+    cutoff is the largest size up to which routing wins at every size; 0 (stream every chunk) if it
+    loses at the smallest."""
+    sizes = sorted(set(streamed) & set(routed))
+    cut = 0
+    for n in sizes:
+        if routed[n] >= streamed[n]:
+            break
+        cut = n
+    if not cut:
+        return 0, f"routing loses already at {sizes[0]} tokens ({routed[sizes[0]]:.2f} s against streaming's {streamed[sizes[0]]:.2f} s)"
+    if cut == sizes[-1]:
+        return cut, f"routing wins at every size measured, up to {cut} tokens (the cutoff may be higher)"
+    nxt = sizes[sizes.index(cut) + 1]
+    return cut, (f"routing wins up to {cut} tokens ({routed[cut]:.2f} s against {streamed[cut]:.2f} s) and "
+                 f"loses at {nxt} ({routed[nxt]:.2f} s against {streamed[nxt]:.2f} s)")
+
+
 class Serve:
     """serve.sh in the background, on the calibration port; stopped with the script's TERM
     trap, which also clears its systemd scope."""
@@ -350,7 +392,9 @@ class Serve:
         self.avail0 = _mem_available_gib()
         t0 = time.perf_counter()
         with open(self.log, "w") as log:
-            self.proc = subprocess.Popen(["bash", str(Path(__file__).resolve().parent / "serve.sh"), *flags],
+            # the user's serve.sh flags first: the calibration's own come later and win
+            self.proc = subprocess.Popen(["bash", str(Path(__file__).resolve().parent / "serve.sh"),
+                                          *args.serve_flags, *flags],
                                          env=full, stdout=log, stderr=subprocess.STDOUT)
         deadline = t0 + args.load_timeout
         while True:
@@ -414,6 +458,20 @@ def run(args) -> None:
              f"({', '.join(f'{r['tps']:.1f}' for r in rs)})")
         return tps
 
+    def time_prefill(srv, arm):
+        """Each size twice (mean), a fresh nonce first so nothing comes from the prefix cache;
+        one untimed prompt before, the first after a load being slower. Keyed by the size asked
+        for; the prompt the server sees (``prefill["tokens"]``) is a little shorter."""
+        out = {}
+        srv.prefill(f"[{arm} warm-up {time.time_ns()}]\n" + prefill_text[sizes[0]])
+        for n in sizes:
+            runs = [srv.prefill(f"[{arm} {n} {rep} {time.time_ns()}]\n" + prefill_text[n]) for rep in range(2)]
+            prefill.setdefault("tokens", {})[n] = runs[0]["tokens"]
+            out[n] = sum(r["s"] for r in runs) / len(runs)
+            note(f"  prefill {arm:<8} {runs[0]['tokens']:>6} prompt tokens  {out[n]:6.2f} s  "
+                 f"({', '.join(f'{r['s']:.2f}' for r in runs)})")
+        return out
+
     def enter(srv, name):
         # prefill once, untimed; later requests hit the cached prefix. A request for the other
         # context evicts it, so each phase keeps one context's runs together.
@@ -422,10 +480,18 @@ def run(args) -> None:
         ctx_tokens[name] = r["prompt_tokens"]
         note(f"{name} context: {r['prompt_tokens']} tokens (prefill + warm-up {time.perf_counter() - t0:.0f} s)")
 
-    # load 1: the reference
-    serve = Serve(args, "plain", ["--moe-decode-fetch", "1"])
+    sizes = sorted(int(n) for n in args.prefill_sizes.split(",") if n.strip()) if args.prefill_sizes else []
+    # a size is a chunk: leave room for the chat template, or a 4096-token prompt is two 4096-token chunks
+    prefill_text = {n: build_context(repo, tok, n - 64) for n in sizes}
+    prefill = {}
+
+    # load 1: the reference, and the streamed prefill
+    flags = ["--moe-decode-fetch", "1"] + (["--moe-routed-prefill-tokens", "0"] if sizes else [])
+    serve = Serve(args, "plain", flags)
     try:
         srv = Server(args.port)
+        if sizes:
+            prefill["streamed"] = time_prefill(srv, "streamed")
         ctx_max = srv.max_context()
         depths = [("short", args.short)]
         if args.long:
@@ -446,6 +512,8 @@ def run(args) -> None:
 
     # load 2: CPU help, share and threads switched at runtime
     flags = ["--moe-decode-fetch", f"{GRID[1]:g}"]
+    if sizes:  # every sweep prompt routed: the template's tokens on top of the largest size included
+        flags += ["--moe-routed-prefill-tokens", str(2 * max(sizes))]
     if args.threads:
         flags += ["--threads", str(args.threads * len(args.gpus.split(",")))]
     serve = Serve(args, "cpu-assisted", flags, {"FREETOKEN_CPU_DECODE_TUNABLE": "1"})
@@ -455,6 +523,10 @@ def run(args) -> None:
         if state.get("status") != "ok":
             raise SystemExit(f"the server is not tunable: {state}")
         max_threads, threads0 = state["max_threads"], state["threads"]
+        if sizes:
+            prefill["routed"] = time_prefill(srv, "routed")
+            prefill["cutoff"], prefill["why"] = choose_routed(prefill["streamed"], prefill["routed"])
+            note(f"prefill pick: --moe-routed-prefill-tokens {prefill['cutoff']} - {prefill['why']}")
         screen = {1.0: base}
         for name in names:
             enter(srv, name)
@@ -498,17 +570,19 @@ def run(args) -> None:
            "threads": threads if fetch < 1 else hw["default_threads"], "why": why,
            "num_gpus": len(args.gpus.split(",")),
            "screen_threads": threads0, "sweep_s": round(time.perf_counter() - t_begin), "log": log,
-           "out_tokens": args.tokens, "skip": args.skip}
+           "out_tokens": args.tokens, "skip": args.skip, "prefill": prefill, "serve_flags": args.serve_flags}
     json.dump(res, open(args.out, "w"), indent=1)
     report = render_report(res, args.total_s)
     print("\n" + report)
 
 
-def recommendation(fetch: float, threads: int, num_gpus: int = 1) -> str:
-    """``threads`` is per GPU (the calibrated executor size); --threads takes the total."""
-    if fetch >= 1:
-        return "--moe-decode-fetch 1"
-    return f"--moe-decode-fetch {fetch:g} --threads {threads * num_gpus}"
+def recommendation(fetch: float, threads: int, num_gpus: int = 1, routed: int | None = None,
+                   extra: list[str] | None = None) -> str:
+    """``threads`` is per GPU (the calibrated executor size); --threads takes the total. ``extra``:
+    the serve.sh flags the calibration ran with."""
+    flags = " ".join([*(extra or []), "--moe-decode-fetch 1" if fetch >= 1 else
+                      f"--moe-decode-fetch {fetch:g} --threads {threads * num_gpus}"])
+    return flags if routed is None else f"{flags} --moe-routed-prefill-tokens {routed}"
 
 
 def render_report(res: dict, total_s: float | None = None) -> str:
@@ -537,8 +611,20 @@ def render_report(res: dict, total_s: float | None = None) -> str:
         for p, row in sorted(c["shares"].items(), key=lambda kv: -float(kv[0])):
             mark = "  <- pick" if float(p) == res["decode_fetch"] else ""
             lines.append(f"  {float(p):>12g}   " + "   ".join(f"{row[n]:13.1f}" for n in names) + mark)
-    lines += ["", f"Recommendation: scripts/serve.sh {recommendation(res['decode_fetch'], res['threads'], res.get('num_gpus', 1))}",
-              f"  {res['why']}"]
+    pf = res.get("prefill") or {}
+    if pf.get("streamed") and pf.get("routed"):
+        lines.append("Prefill, seconds for a one-token reply (mean of 2): every chunk streamed (first load) "
+                     f"against routed (second load):")
+        lines.append("  chunk tokens (prompt)   streamed     routed")
+        for n in sorted(pf["streamed"], key=int):
+            r = pf["routed"].get(n, pf["routed"].get(str(n)))
+            seen = (pf.get("tokens") or {}).get(n, (pf.get("tokens") or {}).get(str(n), ""))
+            lines.append(f"  {int(n):>12} {f'({seen})' if seen else '':>8}   {pf['streamed'][n]:8.2f}   {r:8.2f}")
+    rec = recommendation(res["decode_fetch"], res["threads"], res.get("num_gpus", 1),
+                         pf.get("cutoff"), res.get("serve_flags"))
+    lines += ["", f"Recommendation: scripts/serve.sh {rec}", f"  {res['why']}"]
+    if "cutoff" in pf:
+        lines.append(f"  prefill: {pf['why']}")
     t = f"two loads and the sweep {res['sweep_s'] / 60:.1f} min"
     if total_s:
         t += f", {(total_s + res['sweep_s']) / 60:.1f} min in all with the probe"
@@ -576,6 +662,9 @@ def main() -> None:
     s.add_argument("--threads", type=int, default=0, help="fix the CPU threads per GPU (no thread sweep)")
     s.add_argument("--load-timeout", type=float, default=900)
     s.add_argument("--total-s", type=float, default=None)
+    s.add_argument("--prefill-sizes", default="", help="prompt sizes (tokens, comma separated) to time "
+                   "with streamed and routed prefill; empty: no prefill sweep")
+    s.add_argument("serve_flags", nargs="*", help="serve.sh flags every load runs with (after --)")
     k = sub.add_parser("skip")
     k.add_argument("--hw", required=True)
     k.add_argument("--why", required=True)

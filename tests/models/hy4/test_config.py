@@ -116,7 +116,7 @@ def test_registry_entries(arch):
 # --- KV pool: routing, cost, elastic tiers (kvcache/hy4_pool.py) ------------------------------------
 
 
-def _engine_config(mc, cache_type="naive", elastic_kv=False):
+def _engine_config(mc, cache_type="naive", elastic_kv=False, checkpoints=None):
     from types import SimpleNamespace
 
     import torch
@@ -127,23 +127,26 @@ def _engine_config(mc, cache_type="naive", elastic_kv=False):
         model_config=mc, page_size=64, dtype=torch.bfloat16, tp_info=get_tp_info(), max_running_req=1,
         max_extend_tokens=8192, swa_eviction_interval=None, cache_type=cache_type, swa_num_pages_override=None,
         swa_full_tokens_ratio=0.2, moe_strategy="offload", elastic_kv=elastic_kv,
+        swa_window_checkpoint_tokens=checkpoints, max_seq_len=262144,
     )
 
 
 def test_pool_routing_and_bytes_per_token(monkeypatch):
-    """Option A: all 42 layers' latent rows + the 1/4 index slab = 48 KiB/token, elastic-capable.
-    Window tier: the 12 indexed layers + index slab + the int32 map per token, the sliding rows
-    a fixed per-request window (+ ratio x tokens on the radix cache without elastic VRAM)."""
+    """Option A (opt-out): all 42 layers' latent rows + the 1/4 index slab = 48 KiB/token,
+    elastic-capable. Window tier (default): the 12 indexed layers + index slab + the int32 map
+    per token, the sliding rows a fixed per-request window (+ the checkpoint reserve on the
+    radix cache, + ratio x tokens there without elastic VRAM)."""
     from freetoken.kvcache import resolve_pool_class
     from freetoken.kvcache.hy4_pool import Hy4KVCache, Hy4WindowKVCache, hy4_window_floor_tokens
     from freetoken.models.hy4.config import SWA_RING_ENV
 
+    monkeypatch.setenv(SWA_RING_ENV, "0")
     mc = parsed_config()
     assert resolve_pool_class(mc) is Hy4KVCache and Hy4KVCache.ELASTIC_VRAM
     per_page, fixed, ps, _ = Hy4KVCache.kv_cost(_engine_config(mc))
     assert (per_page // ps, fixed) == (42 * 576 * 2 + 12 * 128 * 2 // 4, 0) == (49152, 0)
 
-    monkeypatch.setenv(SWA_RING_ENV, "1")
+    monkeypatch.delenv(SWA_RING_ENV)
     mc = parsed_config()
     assert resolve_pool_class(mc) is Hy4WindowKVCache
     cfg = _engine_config(mc)
@@ -152,10 +155,22 @@ def test_pool_routing_and_bytes_per_token(monkeypatch):
     assert per_page // ps == 12 * 576 * 2 + 12 * 128 * 2 // 4 + 4 == 14596
     floor = hy4_window_floor_tokens(cfg)
     assert floor == -(-(512 + 16 + 8192 + 3 * 64) // 64) * 64 == 8960 and fixed == win_row * (floor + 64)
-    radix = _engine_config(mc, cache_type="swa_radix")
+    radix = _engine_config(mc, cache_type="swa_radix", checkpoints=0)
     assert Hy4WindowKVCache.kv_cost(radix)[0] == 64 * 14596 + int(win_row * 64 * 0.2)
     # elastic VRAM cannot move the window tier: no ratio term, the floor only
-    assert Hy4WindowKVCache.kv_cost(_engine_config(mc, "swa_radix", elastic_kv=None))[:2] == (64 * 14596, fixed)
+    el = _engine_config(mc, "swa_radix", elastic_kv=None, checkpoints=0)
+    assert Hy4WindowKVCache.kv_cost(el)[:2] == (64 * 14596, fixed)
+    # checkpoints: 512 rows per 8192 tokens of a 262,144-token sequence = 32 x 17.7 MB
+    for every, n in ((None, 32), (8192, 32), (16384, 16), (32768, 8)):
+        el = _engine_config(mc, "swa_radix", elastic_kv=None, checkpoints=every)
+        assert Hy4WindowKVCache.kv_cost(el)[:2] == (64 * 14596, fixed + n * 512 * win_row)
+    assert 512 * win_row == 17_694_720
+    # a static pool reserves only the checkpoints its full tier can hold (24,576 tokens -> 3)
+    from freetoken.kvcache.hy4_pool import hy4_window_tokens
+
+    static = _engine_config(mc, "swa_radix", checkpoints=8192)
+    assert hy4_window_tokens(static, 24576 // 64) == floor + 3 * 512
+    assert hy4_window_tokens(_engine_config(mc, "swa_radix", elastic_kv=None), 4) == floor + 32 * 512
 
 
 @pytest.mark.parametrize("index_ratio", [1, 4])
@@ -191,7 +206,9 @@ def test_pool_tiers_follow_the_elastic_page_count(monkeypatch):
 
     from freetoken.kvcache import create_kvcache_pool
     from freetoken.kvcache.mha_pool import elastic_tier_allocator
+    from freetoken.models.hy4.config import SWA_RING_ENV
 
+    monkeypatch.setenv(SWA_RING_ENV, "0")
     mc = parsed_config()
     seen = []
 
@@ -224,7 +241,7 @@ def test_window_pool_keeps_its_window_tier_out_of_the_elastic_pages(monkeypatch)
     from freetoken.kvcache.mha_pool import elastic_tier_allocator
     from freetoken.models.hy4.config import SWA_RING_ENV
 
-    monkeypatch.setenv(SWA_RING_ENV, "1")
+    monkeypatch.delenv(SWA_RING_ENV, raising=False)
     mc = parsed_config()
     roles = []
 
@@ -243,3 +260,38 @@ def test_window_pool_keeps_its_window_tier_out_of_the_elastic_pages(monkeypatch)
     pool.free_swa(torch.arange(64, 128))
     assert pool.swa_available_size() == 128 and int(pool.window_slots(torch.tensor([64]))) == -1
     assert int(pool.window_slots(torch.tensor([-1]))) == -1
+
+
+def test_default_context_is_262k_and_override_reaches_the_rope_table():
+    from types import SimpleNamespace
+
+    from freetoken.engine.config import EngineConfig
+
+    mc = parsed_config()
+    assert mc.default_max_seq_len == 262144 and mc.rotary_config.max_position == 1048576
+    max_seq_len = EngineConfig.max_seq_len.fget
+    assert max_seq_len(SimpleNamespace(max_seq_len_override=None, model_config=mc)) == 262144
+    assert max_seq_len(SimpleNamespace(max_seq_len_override=1048576, model_config=mc)) == 1048576
+
+
+@pytest.mark.parametrize("tp, per_token", [(1, 576 << 10), (2, 384 << 10)])
+def test_prefill_workspace_follows_the_tp_size(monkeypatch, tp, per_token):
+    """The head-sharded part of the prefill workspace is per rank: TP=1 holds all of it
+    (measured 1.16 / 2.43 / 4.34 GiB at 2048 / 4096 / 8192-token chunks), TP=2 half."""
+    from types import SimpleNamespace
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine import config as config_mod
+    from freetoken.engine.cache_budget import prefill_reserve_bytes, prefill_workspace
+
+    mc = parsed_config()
+    monkeypatch.setattr(config_mod, "get_model_spec", lambda arch: SimpleNamespace(module="m", parse_config="p"))
+    monkeypatch.setattr(config_mod, "_load_attr", lambda module, name: lambda hf: mc)
+    monkeypatch.setattr(config_mod, "checkpoint_quant_config", lambda *a: mc.quant)
+    cfg = SimpleNamespace(hf_config=SimpleNamespace(architectures=["x"]), model_path="", mtp_path="",
+                          tp_info=DistributedInfo(0, tp))
+    resolved = config_mod.EngineConfig.model_config.func(cfg)
+    assert prefill_workspace(resolved) == (256 << 20, per_token)
+    if tp == 1:
+        for chunk, peak_gib in ((2048, 1.16), (4096, 2.43), (8192, 4.34)):
+            assert prefill_reserve_bytes(None, chunk, prefill_workspace(resolved)) >= peak_gib * 2**30

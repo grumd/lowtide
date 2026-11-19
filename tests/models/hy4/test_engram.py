@@ -10,6 +10,7 @@ store (``Hy4EngramStore`` over the C++ PLE store).
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -360,7 +361,25 @@ def test_decode_has_no_host_sync(tiny, store):
 def test_captured_decode_reads_the_staged_rows(tiny, tables):
     """A decode graph captured with nothing staged (as the engine captures) replays inside the
     host hook; under flag sync the rows are read after the launch and the graph WAITs for them."""
+    _replay_captured_decode(tiny, tables, _make_store(tiny))
+
+
+def test_without_graph_upload_the_store_gates_the_launch(tiny, tables, monkeypatch):
+    """Without cuda.bindings no graph is uploaded at capture, so a fill after the launch could
+    hang its first launch: the store stages the rows before the launch instead."""
+    from freetoken.engine.graph import graph_upload_supported
+
+    monkeypatch.setitem(sys.modules, "cuda.bindings", None)
+    assert not graph_upload_supported()
     store = _make_store(tiny)
+    assert not store.table.wait_sync
+    _replay_captured_decode(tiny, tables, store)
+    monkeypatch.setenv("FREETOKEN_PLE_SYNC", "wait")
+    with pytest.raises(RuntimeError, match="cuda.bindings"):
+        _make_store(tiny)
+
+
+def _replay_captured_decode(tiny, tables, store):
     eng = _engram_on_gpu(tiny, 4)
     ids, want, p = tiny.ids, _golden_hash(tiny), 30
     x = torch.randn(1, eng._n, eng._hidden, device=DEV).to(torch.bfloat16)
