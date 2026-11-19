@@ -846,6 +846,11 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        measured = getattr(config.model_config, "prefill_workspace", None)
+        if measured is not None:
+            # a model that measured its prefill activations keeps them out of the static split
+            # instead of trusting the (1 - memory_ratio) headroom with them
+            fixed_cache_size += measured[0] + measured[1] * config.max_extend_tokens
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
         return resolve_moe_cache_auto(
@@ -880,8 +885,8 @@ class Engine:
         """Elastic VRAM: size the virtual reservations of the expert banks and the KV pool from
         the VRAM free now, before either exists. The physical pool is settled in finalize()."""
         from freetoken.engine.cache_budget import (
-            PREFILL_BYTES_PER_TOKEN, expert_bytes_per_slot, kv_session_pages, plan_elastic_geometry,
-            prefill_reserve_bytes,
+            expert_bytes_per_slot, kv_session_pages, plan_elastic_geometry, prefill_reserve_bytes,
+            prefill_workspace,
         )
         from freetoken.engine.elastic import ElasticVram
 
@@ -893,7 +898,8 @@ class Engine:
         lo, hi = config.prefill_batch_min, config.max_extend_tokens
         if config.prefill_reserve_gb is not None:
             lo = hi  # an explicit reserve is the whole workspace: every chunk is the largest
-        self._elastic_reserve = prefill_reserve_bytes(config.prefill_reserve_gb, lo)
+        workspace = prefill_workspace(config.model_config)
+        self._elastic_reserve = prefill_reserve_bytes(config.prefill_reserve_gb, lo, workspace)
         self._elastic_keep_free = config.vram_keep_free_mb << 20
         free = self._sync_get_memory()[0]
         min_pages = div_ceil(config.elastic_kv_min_tokens, page_tokens)
@@ -920,7 +926,7 @@ class Engine:
             lend_after=config.elastic_lend_after,
             prefill_min_tokens=lo,
             prefill_max_tokens=hi,
-            prefill_bytes_per_token=PREFILL_BYTES_PER_TOKEN,
+            prefill_bytes_per_token=workspace[1],
         )
         object.__setattr__(config, "moe_cache_size", cap_slots)
         object.__setattr__(config, "num_page_override", cap_pages)
@@ -1220,19 +1226,23 @@ class Engine:
             bank_layers, bank_rows = cache.cpu_banks()  # one host pool, addressed by pool row
         sources = {canonical_role(k): v for k, v in bank_layers.items()}
         nvfp4 = set(sources) == set(wcp.Nvfp4CpuPrefill.BANK_ROLES)
+        kind = wcp.Nvfp4CpuPrefill if nvfp4 else wcp.Wna16CpuPrefill
         sample = layers[0]
-        reason = None
+        reason, unsupported = None, False
         if set(sources) != set(roles) and not nvfp4:
             reason = f"expert banks {sorted(cache.bank_sources)} are neither W4A16 nor NVFP4"
         elif cache.decode_target != "gpu" or cache.cpu_layer_ids or cache.verify_cpu:
             reason = "it needs the plain GPU decode target"
-        elif (sample.activation != "silu" or sample.apply_router_weight_on_input or sample.interleaved
-              or sample.has_bias):
-            reason = "the CPU kernel computes silu(gate) * up of concatenated, bias-free gate/up rows"
+        elif (sample.activation not in kind.ACTIVATIONS or sample.apply_router_weight_on_input
+              or sample.interleaved or sample.has_bias):
+            reason = (f"the {'NVFP4' if nvfp4 else 'W4A16'} CPU kernel computes {' / '.join(kind.ACTIVATIONS)} "
+                      f"experts (router weight after down) of concatenated, bias-free gate/up rows, not "
+                      f"{sample.activation!r}")
+            unsupported = True
         elif not wcp.cpu_supported():
             reason = "the CPU lacks AVX-512 BF16"
         if reason:
-            logger.info_rank0(f"CPU prefill off: {reason}")
+            (logger.warning_rank0 if unsupported else logger.info_rank0)(f"CPU prefill off: {reason}")
             return
         tp = self.config.tp_info
         threads = _rank_cpu_threads(self.config)
@@ -1245,7 +1255,8 @@ class Engine:
             if nvfp4:
                 gate_up = sources["gate_up"][0]  # [E, 2I, H/2] uint8
                 hidden, inter = gate_up.shape[2] * 2, gate_up.shape[1] // 2
-                executor = wcp.Nvfp4CpuPrefill(hidden=hidden, inter=inter, **common)
+                executor = wcp.Nvfp4CpuPrefill(hidden=hidden, inter=inter, activation=sample.activation,
+                                               alpha=float(sample.alpha), limit=sample.limit, **common)
                 roles = wcp.Nvfp4CpuPrefill.BANK_ROLES
             else:
                 gate_up = sources["gate_up"][0]
@@ -1284,8 +1295,10 @@ class Engine:
             reason = "it needs --moe-strategy offload with GPU decode"
         elif fmt not in ("nvfp4", "w4a16") or not hasattr(kernel, "decode_overlapped"):
             reason = "it serves NVFP4 and W4A16 experts on the triton kernels only"
-        elif sample.activation != "silu" or sample.apply_router_weight_on_input:
-            reason = "the CPU kernel computes silu(gate) * up with the router weight after down"
+        elif not _cpu_split_decodes(kernel, fmt, sample):
+            reason = (f"the {fmt} GPU / CPU decode split computes "
+                      f"{'silu or swiglu_clamp' if fmt == 'nvfp4' else 'silu'} experts with the router "
+                      f"weight after down, not {sample.activation!r}")
         elif fmt == "w4a16" and not wna16_cpu_supported():
             reason = "the W4A16 CPU kernel needs AVX-512 BF16"
         elif cache._unpinned_layers:
@@ -1319,6 +1332,8 @@ class Engine:
             top_k=sample.top_k,
             activation=sample.activation,
             apply_router_weight_on_input=False,
+            swiglu_alpha=float(sample.alpha),
+            swiglu_limit=sample.limit,
             num_threads=len(cpus),
             # an --ngram-spec verify window computes its CPU routes in the same task
             max_tokens=max(config.max_running_req, 1) * (1 + _ngram_spec_depth()),
@@ -1967,6 +1982,20 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
             override("cuda_graph_bs", kept)
 
 
+def _cpu_split_decodes(kernel, fmt: str, sample) -> bool:
+    """Whether both halves of the CPU-assisted decode compute ``sample``'s experts: the GPU tile
+    decode (``tile_decodes``; the W4A16 kernel has silu only) and the CPU executor (cpu_moe_ext.cpp:
+    NVFP4 runs the generic epilogue, W4A16 silu only)."""
+    from freetoken.moe.cpu_executor import compiled_extension_supports
+
+    if sample.apply_router_weight_on_input:
+        return False
+    tile_decodes = getattr(kernel, "tile_decodes", None)
+    gpu = tile_decodes(sample) if tile_decodes is not None else sample.activation == "silu"
+    cpu = sample.activation == "silu" if fmt == "w4a16" else compiled_extension_supports(sample.activation)
+    return gpu and cpu
+
+
 def _rank_cpu_threads(config: EngineConfig) -> int:
     """This rank's share of -t/--threads (default: every physical core)."""
     from freetoken.moe.cpu_executor import physical_core_cpus
@@ -2315,6 +2344,16 @@ def _adjust_config(config: EngineConfig):
                     f"swa_full_tokens_ratio must be in (0, 1], got {config.swa_full_tokens_ratio}"
                 )
             override("cache_type", "swa_radix")
+
+    if (
+        not is_dsv4
+        and not has_swa_attention
+        and getattr(resolve_pool_class(model_config), "swa_paged", False)
+        and getattr(config, "cache_type", "radix") == "radix"
+    ):
+        # a pool with its own window tier (Hy4) drives the swa currency: radix reuse must
+        # know which prefixes still hold their window
+        override("cache_type", "swa_radix")
 
     if has_linear_attention:
         override(

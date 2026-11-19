@@ -288,6 +288,8 @@ def parse_args(
         marker = " ".join(candidates).lower()
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
             return "gpt_oss"
+        if "hy_v4" in marker or "hyv4" in marker:
+            return "hy_v4"
         # M3 first: its marker also contains the bare "minimax" substring, but the
         # namespaced tool grammar is a different protocol from M2's.
         if "minimax_m3" in marker or "minimax-m3" in marker or "minimaxm3" in marker:
@@ -337,6 +339,8 @@ def parse_args(
         marker = " ".join(candidates).lower()
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
             return "gpt_oss"
+        if "hy_v4" in marker or "hyv4" in marker:
+            return "hy_v4"
         if "deepseek" in marker and any(
             tag in marker for tag in ("v4", "deepseek_v4", "v3.2", "v32")
         ):
@@ -651,6 +655,7 @@ def parse_args(
             "deepseekv32",
             "gemma4",
             "glm47",
+            "hy_v4",
             "minimax",
             "minimax_m3",
             "muse_glimmer",
@@ -666,13 +671,13 @@ def parse_args(
         default="auto",
         choices=[
             "auto", "off", "deepseekv32", "gpt_oss", "qwen3", "glm",
-            "minimax", "minimax_m3", "muse_glimmer", "gemma4",
+            "minimax", "minimax_m3", "muse_glimmer", "gemma4", "hy_v4",
         ],
         help=(
             "Reasoning parser that splits chain-of-thought into reasoning_content "
             "for OpenAI responses. 'auto' selects per model family (gpt-oss Harmony, "
             "<think> for qwen3/glm/minimax, <mm:think> for minimax-m3, ATEM to=self "
-            "channels for muse-glimmer, gemma thought, dsv4); 'off' disables it."
+            "channels for muse-glimmer, gemma thought, dsv4, <think:opensource> for hy4); 'off' disables it."
         ),
     )
 

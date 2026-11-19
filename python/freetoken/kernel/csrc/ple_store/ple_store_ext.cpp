@@ -2,6 +2,8 @@
 // through an extent table (PleRowSource in ple_ssd.py). Engine-thread only, no locks.
 // Duplicate rows in one fill dedup into ONE batched read round; no RAM cache and no
 // per-sequence state. Hash reference: tests/models/qwen4_exp/test_ple_disk.py.
+// Several hash tables may share one store (Hy4 Engram: one per layer, each with its own
+// multipliers, moduli and token lookup table), so a fill is still one batched read round.
 // Platform seams: TableFile (O_DIRECT+pread; Win: NO_BUFFERING), BatchReader (io_uring,
 // pread-pool fallback = the portable shape), cumemop_* (dlopen libcuda; Win: nvcuda).
 
@@ -124,8 +126,9 @@ void pread_min(int fd, uint8_t *buf, int64_t len, int64_t need, int64_t off) {
 
 class TableFile {
  public:
-  explicit TableFile(const std::string &path) {
-    fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+  // page_cache: buffered reads that stay cached (a hot row set worth keeping), never O_DIRECT
+  TableFile(const std::string &path, bool page_cache) : keep_cache_(page_cache) {
+    fd_ = page_cache ? -1 : ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
     direct_ = fd_ >= 0;
     if (fd_ < 0) {
       fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -154,12 +157,13 @@ class TableFile {
 
   // keep buffered fallback reads out of the page cache; a no-op under direct I/O
   void discard_cache(int64_t off, int64_t len) const {
-    if (!direct_) posix_fadvise(fd_, off, len, POSIX_FADV_DONTNEED);
+    if (!direct_ && !keep_cache_) posix_fadvise(fd_, off, len, POSIX_FADV_DONTNEED);
   }
 
  private:
   int fd_ = -1;
   bool direct_ = false;
+  bool keep_cache_ = false;
   int64_t size_ = 0;
 };
 
@@ -444,25 +448,47 @@ class PleStore {
   PleStore(std::vector<std::string> paths, std::vector<int64_t> extent_file,
            std::vector<int64_t> extent_base, int64_t rows_per_extent, int64_t row_bytes,
            int64_t row_stride, std::vector<int64_t> multipliers, std::vector<int64_t> head_vocab_sizes,
-           std::vector<int64_t> head_offsets, int64_t eos_token_id, bool use_io_uring)
+           std::vector<int64_t> head_offsets, int64_t eos_token_id, bool use_io_uring,
+           bool eos_barrier, std::vector<int64_t> lookup_table, int64_t lookup_pad_id,
+           bool page_cache, std::vector<int64_t> extent_rows)
       : row_bytes_(row_bytes),
         row_stride_(row_stride),
         rows_per_extent_(rows_per_extent),
         mult_(std::move(multipliers)),
         sizes_(std::move(head_vocab_sizes)),
         offsets_(std::move(head_offsets)),
-        eos_(eos_token_id) {
-    if (mult_.size() != 3 || sizes_.size() != offsets_.size() || sizes_.empty())
-      throw std::runtime_error("PLE hash geometry: want 3 multipliers and equal-length head tables");
+        eos_(eos_token_id),
+        eos_barrier_(eos_barrier),
+        lut_(std::move(lookup_table)),
+        lut_pad_(lookup_pad_id) {
+    tables_ = mult_.size() / 3;
+    if (mult_.empty() || mult_.size() % 3 != 0 || sizes_.size() != offsets_.size() ||
+        sizes_.empty() || sizes_.size() % tables_ != 0)
+      throw std::runtime_error(
+          "PLE hash geometry: want 3 multipliers per table and equal-length head tables");
+    heads_per_table_ = sizes_.size() / tables_;
+    if (!lut_.empty()) {
+      if (lut_.size() % tables_ != 0)
+        throw std::runtime_error("PLE lookup_table: want one equal-length map per table");
+      lut_size_ = (int64_t)(lut_.size() / tables_);
+      if (lut_pad_ < 0 || lut_pad_ >= lut_size_)
+        throw std::runtime_error("PLE lookup_pad_id lies outside the lookup table");
+    }
     if (row_bytes_ > kPage)
       throw std::runtime_error("PLE row_bytes " + std::to_string(row_bytes_) +
                                " exceeds a page; bounce slots assume one-page rows");
+    if (!extent_rows.empty() && extent_rows.size() != extent_file.size())
+      throw std::runtime_error("PLE extent_rows: want one row count per extent");
     for (const std::string &p : paths)
-      files_.push_back(std::make_unique<TableFile>(p));
-    const int64_t extent_bytes = (rows_per_extent_ - 1) * row_stride_ + row_bytes_;
+      files_.push_back(std::make_unique<TableFile>(p, page_cache));
     for (size_t e = 0; e < extent_file.size(); e++) {
       const size_t fi = (size_t)extent_file.at(e);
       const int64_t base = extent_base.at(e);
+      // rows_per_extent is the row-id stride; extent_rows, when given, is what each extent holds
+      const int64_t rows = extent_rows.empty() ? rows_per_extent_ : extent_rows[e];
+      if (rows > rows_per_extent_)
+        throw std::runtime_error("PLE extent_rows exceed rows_per_extent");
+      const int64_t extent_bytes = (rows - 1) * row_stride_ + row_bytes_;
       if (base + extent_bytes > files_.at(fi)->size())
         throw std::runtime_error(paths[fi] + ": extent needs " +
                                  std::to_string(base + extent_bytes) + " bytes, file has " +
@@ -482,16 +508,31 @@ class PleStore {
   PleStore(const PleStore &) = delete;
   PleStore &operator=(const PleStore &) = delete;
 
-  // Row ids for the token at w[2] with context (w[0], w[1]); mirrors NGramEmbedding.row_ids incl. the eos barrier.
-  void hash_rows(const int64_t *w, int64_t *rows) {
+  // Row ids for the token at w[2] with context (w[0], w[1]), table after table; mirrors
+  // NGramEmbedding.row_ids incl. the eos barrier, or HYV4FlashEngramLayer.hash_ngrams with a map.
+  void hash_rows(const int64_t *w, int64_t *rows) const {
     const int64_t prev1 = w[1];
-    const int64_t prev2 = prev1 == eos_ ? eos_ : w[0];
-    const int64_t bigram = wrap_mul(w[2], mult_[0]) ^ wrap_mul(prev1, mult_[1]);
-    const int64_t trigram = bigram ^ wrap_mul(prev2, mult_[2]);
-    const size_t half = sizes_.size() / 2;
-    for (size_t h = 0; h < sizes_.size(); h++)
-      rows[h] = pos_mod(h < half ? bigram : trigram, sizes_[h]) + offsets_[h];
+    const int64_t prev2 = eos_barrier_ && prev1 == eos_ ? eos_ : w[0];
+    const size_t half = heads_per_table_ / 2;
+    for (size_t t = 0; t < tables_; t++) {
+      const int64_t *m = &mult_[3 * t];
+      const int64_t bigram = wrap_mul(compress(t, w[2]), m[0]) ^ wrap_mul(compress(t, prev1), m[1]);
+      const int64_t trigram = bigram ^ wrap_mul(compress(t, prev2), m[2]);
+      for (size_t h = 0; h < heads_per_table_; h++) {
+        const size_t i = t * heads_per_table_ + h;
+        rows[i] = pos_mod(h < half ? bigram : trigram, sizes_[i]) + offsets_[i];
+      }
+    }
   }
+
+  // Row ids only, no I/O: tokens_addr holds n+2 ids as in stage(), rows_addr n*heads int64.
+  void hash(uintptr_t tokens_addr, int64_t n, uintptr_t rows_addr) const {
+    const int64_t *tokens = reinterpret_cast<const int64_t *>(tokens_addr);
+    int64_t *rows = reinterpret_cast<int64_t *>(rows_addr);
+    for (int64_t i = 0; i < n; i++) hash_rows(tokens + i, rows + i * (int64_t)sizes_.size());
+  }
+
+  int64_t heads() const { return (int64_t)sizes_.size(); }
 
   // Hash and queue one run: tokens_addr holds n+2 ids, the leading two are context. No I/O until flush().
   void stage(uintptr_t tokens_addr, int64_t n, uintptr_t staging_addr) {
@@ -529,6 +570,12 @@ class PleStore {
     int64_t row_off;  // row payload start inside the read buffer
     std::vector<uint8_t *> dsts;
   };
+
+  // Token id -> table t's compressed id; ids past the map read as the pad id's entry.
+  int64_t compress(size_t t, int64_t token) const {
+    if (lut_.empty()) return token;
+    return lut_[t * lut_size_ + (token >= 0 && token < lut_size_ ? token : lut_pad_)];
+  }
 
   // Queue dst on this fill's pending batch; duplicate rows fan out from one read.
   void request_row(int64_t row_id, uint8_t *dst) {
@@ -590,6 +637,11 @@ class PleStore {
   int64_t row_bytes_, row_stride_, rows_per_extent_;
   std::vector<int64_t> mult_, sizes_, offsets_;
   int64_t eos_;
+  bool eos_barrier_;
+  std::vector<int64_t> lut_;
+  int64_t lut_pad_;
+  int64_t lut_size_ = 0;
+  size_t tables_ = 1, heads_per_table_ = 0;
   std::vector<std::unique_ptr<TableFile>> files_;
   std::vector<Extent> extents_;
   std::unique_ptr<BatchReader> reader_;
@@ -605,16 +657,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<PleStore>(m, "PleStore")
       .def(py::init<std::vector<std::string>, std::vector<int64_t>, std::vector<int64_t>,
                     int64_t, int64_t, int64_t, std::vector<int64_t>,
-                    std::vector<int64_t>, std::vector<int64_t>, int64_t, bool>(),
+                    std::vector<int64_t>, std::vector<int64_t>, int64_t, bool, bool,
+                    std::vector<int64_t>, int64_t, bool, std::vector<int64_t>>(),
            py::arg("paths"), py::arg("extent_file"), py::arg("extent_base"),
            py::arg("rows_per_extent"), py::arg("row_bytes"), py::arg("row_stride"),
            py::arg("multipliers"),
            py::arg("head_vocab_sizes"), py::arg("head_offsets"), py::arg("eos_token_id"),
-           py::arg("use_io_uring") = true)
+           py::arg("use_io_uring") = true, py::arg("eos_barrier") = true,
+           py::arg("lookup_table") = std::vector<int64_t>{}, py::arg("lookup_pad_id") = -1,
+           py::arg("page_cache") = false, py::arg("extent_rows") = std::vector<int64_t>{})
       .def("stage", &PleStore::stage, py::arg("tokens_addr"), py::arg("n"),
            py::arg("staging_addr"), py::call_guard<py::gil_scoped_release>())
       .def("flush", &PleStore::flush, py::arg("signal_addr") = 0,
            py::call_guard<py::gil_scoped_release>())
+      .def("hash", &PleStore::hash, py::arg("tokens_addr"), py::arg("n"), py::arg("rows_addr"))
+      .def("heads", &PleStore::heads)
       .def("io_backend", &PleStore::io_backend);
   m.def("memop_write", &memop_write, py::arg("stream"), py::arg("addr"), py::arg("value"));
   m.def("memop_wait_geq", &memop_wait_geq, py::arg("stream"), py::arg("addr"), py::arg("value"));

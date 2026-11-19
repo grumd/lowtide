@@ -13,6 +13,7 @@ from typing import Any, Tuple
 
 from freetoken.tokenizer.effort import (
     EFFORT_SCALE,
+    OFF_EFFORT_SPELLINGS,
     THINKING_ADAPTIVE_KWARGS,
     THINKING_OFF_KWARGS,
     THINKING_ON_KWARGS,
@@ -87,7 +88,7 @@ def derive_think_gears(
 
 
 _THINKING_KWARG_KEYS = ("enable_thinking", "thinking", "thinking_mode", "reasoning_effort")
-_DISABLE_EFFORTS = ("none", "off")
+_DISABLE_EFFORTS = ("none", "off", *OFF_EFFORT_SPELLINGS)
 
 
 def effort_toggle_kwargs(
@@ -97,7 +98,7 @@ def effort_toggle_kwargs(
 ) -> dict:
     """Fold a protocol-level reasoning-effort request into the template kwargs.
     An explicit thinking-related key wins wholesale; unrelated extras ride along.
-    Effort "none"/"off" (case-insensitive) disables thinking; any other or absent
+    Effort "none"/"off"/"no_think" (case-insensitive) disables thinking; any other or absent
     effort enables it, forwarded for templates that grade it (quantized against
     the checkpoint's probed vocabulary at render time). ``thinking_type`` is the
     DeepSeek-wire ``thinking: {"type": ...}`` toggle; when present it decides

@@ -16,6 +16,7 @@ E, L, H, I, TOP_K = 8, 2, 256, 128, 2
 
 class _Executor:
     BANK_ROLES = wcp.Nvfp4CpuPrefill.BANK_ROLES
+    ACTIVATIONS = wcp.Nvfp4CpuPrefill.ACTIVATIONS
     built = []
 
     def __init__(self, **kwargs):
@@ -39,7 +40,7 @@ def _setup(monkeypatch, fetch=0.35, threads=2, activation="silu", avx512_bf16=Tr
         cpu_prefill=None, cpu_prefill_fetch=0.35,
     )
     layer = SimpleNamespace(num_experts=E, top_k=TOP_K, activation=activation, apply_router_weight_on_input=False,
-                            interleaved=False, has_bias=False)
+                            interleaved=False, has_bias=False, alpha=1.0, limit=None)
     eng = Engine.__new__(Engine)
     eng.config = SimpleNamespace(moe_prefill_fetch=fetch, cpu_threads=threads, tp_info=SimpleNamespace(rank=0, size=1))
     eng._maybe_init_wna16_cpu_prefill(cache, [layer] * L)

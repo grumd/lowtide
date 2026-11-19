@@ -138,6 +138,43 @@ def _validate_mtp_artifact(main_config, header: str) -> None:
 _SKIP_DIRS = (".git", ".cache", ".freetoken_expert_cache")
 
 
+HY4_EXPERT_QUANT_ENV = "FREETOKEN_HY4_EXPERT_QUANT"
+
+
+def _require_requant_path(model_path: str) -> None:
+    """Refuse ``--expert-quant nvfp4`` for a family whose ``adjust_hf_config`` hook does not
+    declare a requantized expert format (it would silently write the source format)."""
+    from freetoken.engine.config import family_hf_config
+
+    raw = cached_load_hf_config(model_path)
+    adjusted = family_hf_config(model_path, raw)
+    if adjusted is raw or not adjusted.to_dict().get("quantization_config"):
+        archs = getattr(raw, "architectures", None)
+        raise SystemExit(f"--expert-quant nvfp4: no requantize-at-conversion path for {archs}")
+
+
+def _declare_quantization(model_path: str, out_dir: str) -> None:
+    """Write the quantization_config a family's ``adjust_hf_config`` hook synthesizes (Hy4's
+    requantized NVFP4 experts) into the copied config.json, so the FTW declares the format its
+    banks hold. Families without the hook keep their config.json byte-identical."""
+    from freetoken.engine.config import family_hf_config
+
+    raw = cached_load_hf_config(model_path)
+    adjusted = family_hf_config(model_path, raw)
+    q = adjusted.to_dict().get("quantization_config") if adjusted is not raw else None
+    path = os.path.join(out_dir, "config.json")
+    if q is None or not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if data.get("quantization_config") == q:
+        return
+    data["quantization_config"] = q
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
 def _copy_metadata(model_path: str, out_dir: str) -> list[str]:
     """Copy all non-weight files (config, tokenizer, remote-code, nested model configs)
     preserving directory structure, so the FTW dir is a self-contained checkpoint."""
@@ -329,6 +366,7 @@ def convert_checkpoint(
     mtp_header: str = "",
     ple_mode: str = "bf16",
     vision_mode: str = "on",
+    expert_quant: str = "auto",
 ) -> dict:
     """Write ``model_path`` as an FTW checkpoint at ``out_dir``. Returns the index dict.
 
@@ -374,6 +412,14 @@ def convert_checkpoint(
         os.environ["FREETOKEN_LOAD_VISION"] = "1"
     else:
         os.environ.pop("FREETOKEN_LOAD_VISION", None)
+    if expert_quant not in ("auto", "nvfp4"):
+        raise SystemExit(f"--expert-quant must be auto|nvfp4, got {expert_quant!r}")
+    # Hy4's reader picks its expert format at config-parse time; the flag alone decides
+    # here, so a stray variable in the shell cannot change what gets written
+    os.environ.pop(HY4_EXPERT_QUANT_ENV, None)
+    if expert_quant == "nvfp4":
+        os.environ[HY4_EXPERT_QUANT_ENV] = "nvfp4"
+        _require_requant_path(model_path)
     tp = try_get_tp_info()
     if tp is None:
         set_tp_info(rank=0, size=1)
@@ -541,6 +587,7 @@ def convert_checkpoint(
 
     _progress("finalize")  # writing shard index + copying config/tokenizer
     copied = _copy_metadata(model_path, out_dir)
+    _declare_quantization(model_path, out_dir)
     # Model-specific side tables (qwen4_exp: the PLE n-gram table): .safetensors files
     # the model loads outside the dense stream — without them the FTW dir cannot serve.
     # ``ple_mode`` selects the stored dtype: ``bf16``/``fp8`` re-encode to that dtype

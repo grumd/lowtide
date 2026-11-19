@@ -11,7 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
-from freetoken.tokenizer.effort import EFFORT_SCALE, KNOWN_REASONING_EFFORTS
+from freetoken.tokenizer.effort import EFFORT_SCALE, KNOWN_REASONING_EFFORTS, OFF_EFFORT_SPELLINGS
 
 from .api_models import (
     ChatCompletionRequest,
@@ -41,7 +41,7 @@ from .generation import (
 
 #: The wire superset plus "off", DeepSeek's disable synonym that
 #: effort_toggle_kwargs has always honored.
-_ACCEPTED_EFFORTS = (*KNOWN_REASONING_EFFORTS, "off")
+_ACCEPTED_EFFORTS = (*KNOWN_REASONING_EFFORTS, "off", *OFF_EFFORT_SPELLINGS)
 
 
 def _thinking_type(req: Any) -> str | None:

@@ -18,6 +18,7 @@ from .effort import (
     probe_effort_profile,
     probe_thinking_profile,
     quantize_effort,
+    requests_thinking_off,
 )
 
 logger = init_logger(__name__)
@@ -146,9 +147,14 @@ class TokenizeManager:
         return self._render(_EFFORT_PROBE_MESSAGES, tools, kwargs)
 
     def _sanitize_effort(self, chat_template_kwargs: dict[str, Any]) -> dict[str, Any]:
+        raw = chat_template_kwargs.get("reasoning_effort")
+        if not (isinstance(raw, str) and raw.strip()) and requests_thinking_off(chat_template_kwargs):
+            off_effort = self.effort_profile().off_effort
+            if off_effort is not None:
+                # a template that ignores the off toggles turns thinking off by effort value
+                return {**chat_template_kwargs, "reasoning_effort": off_effort}
         if "reasoning_effort" not in chat_template_kwargs:
             return chat_template_kwargs
-        raw = chat_template_kwargs.get("reasoning_effort")
         mapped = quantize_effort(raw, self.effort_profile())
         if mapped == raw:
             return chat_template_kwargs

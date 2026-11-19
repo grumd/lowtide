@@ -59,6 +59,8 @@ class PleRowSource:
     scale: float
     src_dtype: str
     elem_bytes: int
+    # rows each extent holds when rows_per_extent is only the row-id stride (unequal tables)
+    extent_rows: list[int] | None = None
 
     @property
     def total_rows(self) -> int:
@@ -159,6 +161,8 @@ class DiskRowTable:
         max_graph_rows: int = 256,
         max_extend_tokens: int = 8192,
         dtype: torch.dtype = torch.bfloat16,
+        page_cache: bool = False,
+        graph_fill_worker: bool = False,
     ) -> None:
         from freetoken.kernel import _ple_store
 
@@ -188,6 +192,11 @@ class DiskRowTable:
             head_offsets=offsets,
             eos_token_id=self.eos_token_id,
             use_io_uring=os.getenv(_IO_URING_ENV, "1") != "0",
+            eos_barrier=bool(hash_constants.get("eos_barrier", True)),
+            lookup_table=[int(x) for x in hash_constants.get("lookup_table", ())],
+            lookup_pad_id=int(hash_constants.get("lookup_pad_id", -1)),
+            page_cache=page_cache,
+            extent_rows=list(source.extent_rows or ()),
         )
         self._device = torch.device("cuda", torch.cuda.current_device())
         self._token_bytes = self.heads * source.row_bytes
@@ -226,6 +235,9 @@ class DiskRowTable:
             self._wait_seq = 0  # what the next eager lookup waits for (0: rows already staged)
             self._cur: Future | None = None
             self._ahead: tuple[int, int, int, Future] | None = None  # (uid, start, end, fill)
+        # Decode graph fills on the I/O worker, concurrent with the launch, instead of after it: a
+        # launch can block while the stream sits at the graph's own WAIT (seen with Hy4's decode graph).
+        self._graph_fill_worker = graph_fill_worker and self._wait_sync
         sync = "wait-sync" if self._wait_sync else "launch-gating"
         logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}")
 
@@ -353,6 +365,15 @@ class DiskRowTable:
                 bs = batch.padded_size
                 self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
                 self._readback_event.record(torch.cuda.current_stream(self._device))
+                if self._graph_fill_worker:
+                    # the context is read here: the requests advance once the launch returns
+                    ctx = [torch.tensor(_context(r.input_ids, r.device_len - 1, eos), dtype=torch.int64) for r in reqs]
+
+                    def runs() -> list[torch.Tensor]:
+                        tokens = self._token_readback[:bs].to(torch.int64)
+                        return [torch.cat((c, tokens[i : i + 1])) for i, c in enumerate(ctx)]
+
+                    return self.fill_graph_async(self._readback_event, runs)
 
                 def _complete() -> None:
                     try:
@@ -398,6 +419,14 @@ class DiskRowTable:
     def forward_host_ctx(self, batch: Batch, use_graph: bool):
         """Around one dispatch: stage on enter, run the deferred fill+signal on exit."""
         deferred = self.host_fill_batch(batch, use_graph)
+        if isinstance(deferred, AsyncGraphFill):
+            try:
+                yield
+            except BaseException:
+                deferred.abort()
+                raise
+            deferred.join()
+            return
         yield
         # no try/finally: a failed launch leaves no WAIT pending, so the fill must not run
         if deferred is not None:

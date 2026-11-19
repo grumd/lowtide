@@ -71,6 +71,7 @@ TOOLS_TAG_LIST = [
     "<|channel|>",
     "<function=",
     "<tool_call>",
+    "<tool_call:opensource>",
     "<minimax:tool_call>",
     "]<]minimax[>[<tool_call>",
     "<|python_tag|>",
@@ -1209,23 +1210,29 @@ class Glm47Detector(BaseFormatDetector):
     Reference: https://github.com/vllm-project/vllm/blob/main/vllm/tool_parsers/glm4_moe_tool_parser.py
     """
     toolcall_opener = "<tool_call>"
+    _G_CALL_OPEN = "<tool_call>"
+    _G_CALL_CLOSE = "</tool_call>"
+    _G_KEY_OPEN = "<arg_key>"
+    _G_KEY_CLOSE = "</arg_key>"
+    _G_VAL_OPEN = "<arg_value>"
+    _G_VAL_CLOSE = "</arg_value>"
+
     def __init__(self):
         super().__init__()
-        self.bot_token = "<tool_call>"
-        self.eot_token = "</tool_call>"
+        self.bot_token = self._G_CALL_OPEN
+        self.eot_token = self._G_CALL_CLOSE
         self.tool_call_separator = "\n"
 
-        # Regex patterns for parsing GLM-4.7 tool calls
+        o, c, ko, kc, vo, vc = map(re.escape, (
+            self._G_CALL_OPEN, self._G_CALL_CLOSE, self._G_KEY_OPEN,
+            self._G_KEY_CLOSE, self._G_VAL_OPEN, self._G_VAL_CLOSE,
+        ))
         # Match complete tool call blocks
-        self.func_call_regex = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
-        # Extract function name and arguments from a tool call block
-        # Function name can be followed by newline OR directly by <arg_key>
-        # Pattern: <tool_call>function_name(\n|<arg_key>)...
-        self.func_detail_regex = re.compile(
-            r"<tool_call>([^<\n]+?)(?:\n|(?=<arg_key>)|(?=</tool_call>))(.*?)</tool_call>", re.DOTALL
-        )
+        self.func_call_regex = re.compile(rf"{o}.*?{c}", re.DOTALL)
+        # Function name runs to a newline, the first arg key, or the closing tag
+        self.func_detail_regex = re.compile(rf"{o}([^<\n]+?)(?:\n|(?={ko})|(?={c}))(.*?){c}", re.DOTALL)
         # Extract arg_key/arg_value pairs
-        self.func_arg_regex = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL)
+        self.func_arg_regex = re.compile(rf"{ko}(.*?){kc}\s*{vo}(.*?){vc}", re.DOTALL)
 
         self._last_arguments = ""
         self._normal_text_buffer = ""
@@ -1317,11 +1324,6 @@ class Glm47Detector(BaseFormatDetector):
                 continue
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
-
-    _G_KEY_OPEN = "<arg_key>"
-    _G_KEY_CLOSE = "</arg_key>"
-    _G_VAL_OPEN = "<arg_value>"
-    _G_VAL_CLOSE = "</arg_value>"
 
     def _g_reset(self) -> None:
         self._g_mode = "idle"  # idle|name|invoke|invoke_skip|key|key_skip|preval|preval_skip|pstr|pbuf|pskip
@@ -1537,6 +1539,55 @@ class Glm47Detector(BaseFormatDetector):
         if self.prev_tool_call_arr and residual.strip() == "":
             return ""
         return residual
+
+
+class Hy4Detector(Glm47Detector):
+    """Hy4-flash: GLM-4.7's ``arg_key``/``arg_value`` calls with ``:opensource``-suffixed tags,
+    every call of a turn inside one ``<tool_calls:opensource>`` block, no separators::
+
+        <tool_calls:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Paris</arg_value:opensource></tool_call:opensource></tool_calls:opensource>
+
+    The outer block markers carry nothing, so they are dropped before the GLM-4.7 parse.
+    """
+
+    toolcall_opener = "<tool_calls:opensource>"
+    _G_CALL_OPEN = "<tool_call:opensource>"
+    _G_CALL_CLOSE = "</tool_call:opensource>"
+    _G_KEY_OPEN = "<arg_key:opensource>"
+    _G_KEY_CLOSE = "</arg_key:opensource>"
+    _G_VAL_OPEN = "<arg_value:opensource>"
+    _G_VAL_CLOSE = "</arg_value:opensource>"
+    _BLOCK_OPEN = "<tool_calls:opensource>"
+    _BLOCK_CLOSE = "</tool_calls:opensource>"
+
+    def __init__(self):
+        super().__init__()
+        self._block_hold = ""
+
+    def _drop_block_markers(self, text: str) -> str:
+        return text.replace(self._BLOCK_OPEN, "").replace(self._BLOCK_CLOSE, "")
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        return super().detect_and_parse(self._drop_block_markers(text), tools)
+
+    def block_close_tokens(self) -> tuple:
+        return (self._BLOCK_CLOSE, self.eot_token)
+
+    def parse_streaming_increment(self, new_text: str, tools: List[Tool]) -> StreamingParseResult:
+        buf = self._drop_block_markers(self._block_hold + new_text)
+        # "<tool_call" also prefixes the per-call opener; holding it is harmless, the
+        # next chunk decides which marker it was
+        hold = max(
+            self._ends_with_partial_token(buf, self._BLOCK_OPEN),
+            self._ends_with_partial_token(buf, self._BLOCK_CLOSE),
+        )
+        self._block_hold = buf[len(buf) - hold:] if hold else ""
+        return super().parse_streaming_increment(buf[: len(buf) - hold], tools)
+
+    def finish_streaming(self) -> str:
+        self._buffer += self._block_hold
+        self._block_hold = ""
+        return super().finish_streaming()
 
 
 class DeepSeekV32Detector(BaseFormatDetector):
@@ -3539,6 +3590,7 @@ class FunctionCallParser:
         "gpt-oss": GptOssDetector,
         "gpt_oss": GptOssDetector,
         "glm47": Glm47Detector,
+        "hy_v4": Hy4Detector,
         "llama3": Llama32Detector,
         "minimax": MiniMaxDetector,
         "minimax_m3": MiniMaxM3Detector,

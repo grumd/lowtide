@@ -107,7 +107,8 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         args = self._model_args(config)
         self.config = config
         # TP: the MLA latent KV is shared (MQA-style), only the query/output heads
-        # shard -- the backend sees exactly the heads the model feeds it.
+        # shard -- the backend sees exactly the heads the model feeds it. The attention
+        # paths read the head count off the query, so it may vary per layer (Hy4).
         from freetoken.distributed import get_tp_info
         from freetoken.utils import div_even
 
@@ -238,7 +239,7 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
 
     # ----- decode (CUDA-graph capturable, single code path) -----------------------------
     def _decode(self, md, layer_id, q_nope, q_pe, inputs) -> torch.Tensor:
-        bs = q_nope.shape[0]
+        bs, h = q_nope.shape[:2]
         rows, kvlen = md.rows, md.kvlen
         if not self.dsa_enabled:
             # Identity selection == dense attention: every query walks its request's
@@ -258,9 +259,9 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
                 md.sel.clear()
                 md.sel[layer_id] = (sel, cnt)
             sel, cnt = md.sel[self._leader[layer_id]]
-        q_cat = torch.cat([q_nope, q_pe], dim=-1).view(bs, 1, self.num_heads, self.latent_dim)
+        q_cat = torch.cat([q_nope, q_pe], dim=-1).view(bs, 1, h, self.latent_dim)
         o = self._attend(q_cat, layer_id, sel, cnt)
-        return o.view(bs, self.num_heads, self.kv_lora_rank)
+        return o.view(bs, h, self.kv_lora_rank)
 
     # ----- prefill / extend (eager) ------------------------------------------------------
     def _select_prefill(
@@ -291,7 +292,7 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         return sel.view(1, m, k_sel), cnt.view(1, m)
 
     def _prefill(self, md, layer_id, q_nope, q_pe, batch, inputs) -> torch.Tensor:
-        t = q_nope.shape[0]
+        t, h = q_nope.shape[:2]
         q_cat = torch.cat([q_nope, q_pe], dim=-1)  # [T, H, 576]
         reqs = batch.padded_reqs if hasattr(batch, "padded_reqs") else batch.reqs
         page_table = get_global_ctx().page_table
@@ -311,7 +312,7 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
                 )
                 for i, r in enumerate(reqs)
             ]
-        o = q_cat.new_empty(t, self.num_heads, self.kv_lora_rank)
+        o = q_cat.new_empty(t, h, self.kv_lora_rank)
         for i, r in enumerate(reqs):
             m = qo[i + 1] - qo[i]
             if m == 0:
@@ -326,9 +327,9 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
                 sel = page_table[r.table_idx, : r.device_len].view(1, 1, -1).to(torch.int32)
                 cnt = (batch.positions[qo[i] : qo[i + 1]] + 1).to(torch.int32).view(1, m)
             o[qo[i] : qo[i + 1]] = self._attend(
-                q_cat[qo[i] : qo[i + 1]].view(1, m, self.num_heads, self.latent_dim),
+                q_cat[qo[i] : qo[i + 1]].view(1, m, h, self.latent_dim),
                 layer_id, sel, cnt,
-            ).view(m, self.num_heads, self.kv_lora_rank)
+            ).view(m, h, self.kv_lora_rank)
         return o
 
     # ----- CUDA graph (decode) ----------------------------------------------------------

@@ -258,6 +258,13 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Glm5NextForCausalLM",
         packed_modules_mapping=_GLM5_NEXT_PACKED,
     ),
+    # Hy4-flash (model_type hy_v4_flash): gated MLA with sinks on 12 indexed + 30 sliding
+    # layers, identity hyper-connections x4, LatentMoE (512 experts top-16 in a 1536 latent),
+    # Engram n-gram memories; multimodal wrapper with the text tower at bare model.*, served
+    # text-only. The checkpoint has no quantization_config; the reader dequantizes its FP8.
+    "HYV4FlashForConditionalGeneration": ModelSpec("freetoken.models.hy4", "Hy4ForCausalLM"),
+    # Text-only sibling (the text_config's own architectures entry).
+    "HYV4FlashForCausalLM": ModelSpec("freetoken.models.hy4", "Hy4ForCausalLM"),
 }
 
 

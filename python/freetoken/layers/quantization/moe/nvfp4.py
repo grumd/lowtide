@@ -98,9 +98,17 @@ class TritonNvfp4MoEKernel(MoEKernel):
             if expert_map is not None:
                 topk_ids, n = expert_map[topk_ids.long()].to(torch.int32), t["gate_up"].shape[0]
             return fused_experts_nvfp4(x, *banks, topk_weights, topk_ids, n, act, on_input, alpha, limit)
-        if act == "silu" and not on_input and tile.decode_supported(t["gate_up"], t["down"]):
-            return tile.nvfp4_decode_silu(x, *banks, topk_weights, topk_ids)
+        if self.tile_decodes(layer) and tile.decode_supported(t["gate_up"], t["down"]):
+            return tile.nvfp4_decode_silu(x, *banks, topk_weights, topk_ids, activation=act, alpha=alpha, limit=limit)
         return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, act, on_input, alpha, limit)
+
+    @staticmethod
+    def tile_decodes(layer) -> bool:
+        """Whether the tile decode kernels (and so the copy-overlapped and CPU-assisted decode)
+        compute this layer's expert activation."""
+        from freetoken.moe.fused_nvfp4_tile import DECODE_ACTIVATIONS
+
+        return layer.activation in DECODE_ACTIVATIONS and not layer.apply_router_weight_on_input
 
     def decode_overlapped(self, layer, x, topk_weights, topk_ids, view: ExpertView, copy, start, join, **cpu):
         """Decode while this step's expert copy runs: ``start()`` launches it, the resident routes
@@ -110,14 +118,13 @@ class TritonNvfp4MoEKernel(MoEKernel):
         from freetoken.moe import fused_nvfp4_tile as tile
 
         t = view.tensors
-        if not (
-            layer.activation == "silu" and not layer.apply_router_weight_on_input
-            and tile.decode_supported(t["gate_up"], t["down"])
-        ):
+        if not (self.tile_decodes(layer) and tile.decode_supported(t["gate_up"], t["down"])):
             return None
         banks = (t["gate_up"], t["gate_up_scale"], t["gate_up_global"], t["down"], t["down_scale"], t["down_global"])
         start()
-        return tile.nvfp4_decode_silu(x, *banks, topk_weights, topk_ids, copy=copy, join=join, **cpu)
+        return tile.nvfp4_decode_silu(x, *banks, topk_weights, topk_ids, copy=copy, join=join,
+                                      activation=layer.activation, alpha=float(layer.alpha),
+                                      limit=limit_or_inf(layer), **cpu)
 
 
 # ---------------------------------------------------------------------------

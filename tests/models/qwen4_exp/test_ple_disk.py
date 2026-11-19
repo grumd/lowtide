@@ -79,7 +79,7 @@ def _write_checkpoint(tmp_path, table, n_shards):
     save_file(tensors, str(tmp_path / "model.safetensors"))
 
 
-def _make_table(tmp_path):
+def _make_table(tmp_path, **table_kw):
     from freetoken.models.qwen4_exp.ple_disk import DiskRowTable, source_from_safetensors
 
     args = parse_config(toy_hf_config()).qwen4_args
@@ -96,7 +96,7 @@ def _make_table(tmp_path):
         "per_head_offsets": offsets.tolist(),
         "eos_token_id": EOS,
     }
-    disk = DiskRowTable(source_from_safetensors(str(tmp_path)), constants)
+    disk = DiskRowTable(source_from_safetensors(str(tmp_path)), constants, **table_kw)
     oracle = GpuResidentTable(table.cuda().view(torch.float8_e4m3fn), scale=0.03125)
     return disk, oracle, args
 
@@ -332,6 +332,75 @@ def test_graph_sync_protocol(tmp_path, monkeypatch):
     gated, _, _ = _make_table(tmp_path)
     assert not gated._wait_sync
     assert gated.host_fill_batch(_decode_batch([3, 4], 5), use_graph=True) is None
+
+
+@requires_cuda
+def test_uploaded_graph_launch_does_not_wait_for_the_fill(tmp_path):
+    """A graph with ~6k nodes behind its PLE WAIT: its first launch blocks until the WAIT passes
+    unless the graph was uploaded at capture (engine/graph.py), and the fill only runs after the
+    launch returns. A watchdog signals the flag after 5 s so a regression fails, not hangs."""
+    import threading
+    import time
+
+    from freetoken.engine.graph import upload_graph
+
+    disk, _, args = _make_table(tmp_path)
+    if not disk._wait_sync:
+        pytest.skip("stream memops unavailable: launch-gating, no captured WAIT")
+    row_ids = torch.zeros((1, args.num_ngram_heads), dtype=torch.int64, device="cuda")
+    out = torch.empty((1, args.num_ngram_heads * disk.head_dim), dtype=disk.dtype, device="cuda")
+    x = torch.zeros(16, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            disk.lookup(row_ids, out)
+            for _ in range(8000):
+                x.add_(1)
+        upload_graph(graph, stream)
+        stream.synchronize()
+        released = threading.Timer(5.0, _ple_store.signal_flag, (disk._flag.data_ptr(),))
+        released.start()
+        t = time.perf_counter()
+        graph.replay()
+        launch_s = time.perf_counter() - t
+        disk.fill([torch.tensor([3, 4, 7])], graph=True)
+        stream.synchronize()
+        released.cancel()
+    assert launch_s < 1.0, f"the first launch blocked for {launch_s:.1f} s behind the WAIT"
+    assert int(x[0]) == 8000
+
+
+@requires_cuda
+@torch.inference_mode()  # as the engine runs: the I/O worker thread is outside it
+def test_graph_fill_on_the_worker(tmp_path):
+    """graph_fill_worker (Hy4): the decode fill runs on the I/O worker while the graph launches,
+    so the launch never waits for the host fill; the request context is read before the launch,
+    since the request advances once the launch returns."""
+    disk, oracle, args = _make_table(tmp_path, graph_fill_worker=True)
+    if not disk._wait_sync:
+        pytest.skip("stream memops unavailable: launch-gating, no worker fill")
+    emb = _embedding()
+    row_ids = torch.zeros((1, args.num_ngram_heads), dtype=torch.int64, device="cuda")
+    out = torch.empty((1, args.num_ngram_heads * disk.head_dim), dtype=disk.dtype, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            disk.lookup(row_ids, out)
+    torch.cuda.current_stream().wait_stream(stream)
+    older, newer = 3, 4
+    for token in (7, 9, 13):
+        batch = _decode_batch([older, newer], token)
+        with disk.forward_host_ctx(batch, use_graph=True):
+            graph.replay()
+            batch.reqs[0].device_len += 1
+        torch.cuda.synchronize()
+        ids = emb.row_ids(_meta([[token]], [[older, newer]], decode=True)).cuda()
+        assert _bitwise_equal(out, oracle.lookup(ids)), f"worker fill token {token}"
+        older, newer = newer, token
 
 
 @requires_cuda

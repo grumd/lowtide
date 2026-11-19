@@ -23,6 +23,7 @@ from typing import Any
 from . import request_ring
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
+from freetoken.tokenizer.effort import requests_thinking_off
 from freetoken.tokenizer.tokenize import resolve_thinking_mode
 
 try:
@@ -394,6 +395,10 @@ def _make_reasoning_parser(
             or bool(ctk.get("enable_thinking"))
             or bool(ctk.get("thinking"))
         )
+    elif parser_name == "hy_v4":
+        # Hy4's template opens <think:opensource> at the generation prompt unless thinking is
+        # off (reasoning_effort no_think, which TokenizeManager maps the off toggles to)
+        force_reasoning = not requests_thinking_off(spec.chat_template_kwargs)
     elif parser_name == "minimax_m3":
         # M3's template pre-opens <mm:think> only in thinking_mode "enabled" (the
         # model then emits just the closing tag); "adaptive" (default) leaves the

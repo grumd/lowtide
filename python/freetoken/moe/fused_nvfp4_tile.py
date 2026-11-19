@@ -184,6 +184,10 @@ def _gemv(a, packed, scale, glob, ids, R, top_k, a_row_is_route, tile, routes=0,
     return part, split
 
 
+# the activations nvfp4_decode_silu computes (its reduce epilogue)
+DECODE_ACTIVATIONS = ("silu", "swiglu_clamp")
+
+
 def decode_supported(gate_up_packed: torch.Tensor, down_packed: torch.Tensor, gu_tile=None, dn_tile=None) -> bool:
     gu, dn = gu_tile or _GU_TILE, dn_tile or _DN_TILE
     return (gate_up_packed.shape[2] // 4) % gu[1] == 0 and (down_packed.shape[2] // 4) % dn[1] == 0
@@ -195,8 +199,10 @@ def nvfp4_decode_silu(
     down_packed: torch.Tensor, down_scale: torch.Tensor, down_global: torch.Tensor,
     topk_weights: torch.Tensor, topk_ids: torch.Tensor, gu_tile=None, dn_tile=None,
     copy=None, join=None, cpu_y: torch.Tensor | None = None, cpu_wait=None,
+    activation: str = "silu", alpha: float = 1.0, limit: float = float("inf"),
 ) -> torch.Tensor:
-    """SiLU-gated NVFP4 expert MLP for a few tokens; ``topk_ids`` are cache slots, ``x`` [M, H].
+    """SiLU-gated (or ``swiglu_clamp``: gate <= limit, |up| <= limit, sigmoid(alpha * gate)) NVFP4
+    expert MLP for a few tokens; ``topk_ids`` are cache slots, ``x`` [M, H]. gate/up stay fp32.
 
     With ``copy = (copy_slots, num_copy)`` (this step's expert copy, still running) the routes
     already resident go first, then ``join()`` waits for the copy and the rest follow. Every
@@ -211,6 +217,8 @@ def nvfp4_decode_silu(
     ids = topk_ids.reshape(-1)
     gu_tile, dn_tile = gu_tile or _GU_TILE, dn_tile or _DN_TILE
     skip = cpu_y is not None
+    assert activation in DECODE_ACTIVATIONS, activation
+    clamp = {} if activation == "silu" else dict(alpha=float(alpha), limit=float(limit), CLAMP=True)
     part1 = act = part2 = None
     for routes in ((1, 2) if copy is not None else (0,)):
         if routes == 2:
@@ -223,6 +231,7 @@ def nvfp4_decode_silu(
                                             ROUTES=routes, MAX_COPY=triton.next_power_of_2(R))
         if skip:
             masks.update(ids_ptr=ids, SKIP_NEG=True)
+        masks.update(clamp)
         _reduce_silu_mul_kernel[(R, triton.cdiv(inter, 256))](part1, act, R, inter, SPLIT=s1, BLOCK=256,
                                                                num_warps=2, **masks)
         part2, s2 = _gemv(act, down_packed, down_scale, down_global, ids, R, top_k, True, dn_tile,
@@ -239,4 +248,4 @@ def nvfp4_decode_silu(
     return out
 
 
-__all__ = ["decode_supported", "fused_experts_nvfp4_tile", "nvfp4_decode_silu", "tile_ok"]
+__all__ = ["DECODE_ACTIVATIONS", "decode_supported", "fused_experts_nvfp4_tile", "nvfp4_decode_silu", "tile_ok"]

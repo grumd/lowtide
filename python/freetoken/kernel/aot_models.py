@@ -291,6 +291,16 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         aliases=("zai-org/GLM-5.3-Flash", "LibertAIDAI/GLM-5.3-Flash-NVFP4"),
     ),
     AotModel(
+        # Hy4-flash: MLA latent on the DSA backend like GLM-5.3 (no paged-KV store groups).
+        # No expert formats yet: banks size from the 1536 latent, not hidden_size, and the
+        # served 4-bit format is not settled.
+        name="tencent/Hy4-flash-FP8",
+        architecture="HYV4FlashForConditionalGeneration",
+        arch_aliases=("HYV4FlashForCausalLM",),
+        hidden_size=3072,
+        kv_groups=(),
+    ),
+    AotModel(
         # MiniMaxAI/MiniMax-M2.5 ships block-fp8, which has no expert-bank
         # provider for this arch on main -- the NVFP4 release is the servable
         # offload path, and both share the same attention/embedding shapes.

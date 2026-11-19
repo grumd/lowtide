@@ -6,7 +6,9 @@ from freetoken.tokenizer.effort import (
     EffortProfile,
     KNOWN_REASONING_EFFORTS,
     probe_effort_profile,
+    probe_thinking_profile,
     quantize_effort,
+    requests_thinking_off,
 )
 
 QWEN38 = EffortProfile(
@@ -131,3 +133,51 @@ def test_probe_skips_rounds_whose_baseline_fails():
     profile = probe_effort_profile(render)
     assert profile.supported == frozenset({"xhigh", "medium", "low"})
     assert profile.consumes_effort
+
+
+# --------------------------------------------------------------------------- #
+# Off spellings: Hy4-flash turns thinking off by effort value (no_think) and
+# ignores the enable_thinking / thinking_mode toggles.
+# --------------------------------------------------------------------------- #
+def _hy4_render(kwargs, tools):
+    effort = kwargs.get("reasoning_effort", "high")
+    if effort not in ("max", "high", "no_think"):
+        raise ValueError(f"reasoning_effort error : {effort}")
+    tail = "<think></think>" if effort == "no_think" else "<think>"
+    return f"mode:{effort}|tools={bool(tools)}|{tail}"
+
+
+def test_probe_learns_the_hy4_off_spelling():
+    profile = probe_effort_profile(_hy4_render)
+    assert profile.supported == frozenset({"high", "max"}) and profile.default == "high"
+    assert profile.off_effort == "no_think"
+    thinking = probe_thinking_profile(_hy4_render, profile)
+    assert thinking.toggleable and thinking.default_state == "on"
+
+
+def test_off_spelling_needs_a_validating_template():
+    assert probe_effort_profile(_qwen38_render).off_effort is None
+    # interpolates anything: "no_think" renders differently but means nothing to it
+    interpolating = probe_effort_profile(lambda kwargs, tools: f"p|{kwargs.get('reasoning_effort')}")
+    assert interpolating.off_effort is None
+
+
+def test_off_efforts_map_to_the_off_spelling_only_where_one_exists():
+    hy4 = probe_effort_profile(_hy4_render)
+    for value in ("none", "off", "no_think", "None"):
+        assert quantize_effort(value, hy4) == "no_think"
+    assert quantize_effort("high", hy4) == "high"
+    assert quantize_effort("low", hy4) is None
+    assert quantize_effort("none", QWEN38) is None
+    assert quantize_effort("no_think", DSV4_OFFICIAL) is None
+
+
+def test_requests_thinking_off():
+    assert requests_thinking_off({"enable_thinking": False, "thinking_mode": "disabled"})
+    assert requests_thinking_off({"reasoning_effort": "no_think"})
+    assert requests_thinking_off({"reasoning_effort": "None"})
+    assert not requests_thinking_off({})
+    assert not requests_thinking_off(None)
+    assert not requests_thinking_off({"enable_thinking": True, "reasoning_effort": "high"})
+    # an explicit effort decides over the toggles
+    assert not requests_thinking_off({"enable_thinking": False, "reasoning_effort": "max"})

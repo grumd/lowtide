@@ -111,6 +111,11 @@ def create_dsv4_sparse_backend(config: ModelConfig):
     BackendInfo(supported_types=frozenset({AttnType.MLA, AttnType.DSA})),
 )
 def create_dsa_backend(config: ModelConfig):
+    # Hy4 also groups its index (ratio 4), so it must branch before the kpool check.
+    if getattr(config, "model_type", None) == "hy_v4_flash":
+        from freetoken.models.hy4.backend import Hy4AttnBackend
+
+        return Hy4AttnBackend(config)
     # MLA with a grouped index (index_ratio > 1) is the kpool indexer layout.
     if any(s.mla and s.index_ratio > 1 for s in config.kv_cache_group_specs()):
         from .dsa_indexer_kpool import Glm5NextDSABackend

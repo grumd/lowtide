@@ -137,14 +137,24 @@ def resolve_moe_cache_auto(
 PREFILL_BYTES_PER_TOKEN = 230 * 1024
 
 
-def prefill_reserve_bytes(prefill_reserve_gb: float | None, chunk_tokens: int) -> int:
+def prefill_workspace(model_config) -> tuple[int, int]:
+    """(base bytes, bytes per chunk token) of prefill activations over the idle footprint: the
+    model's own measurement (``ModelConfig.prefill_workspace``), else the Qwen3.8 figures below."""
+    measured = getattr(model_config, "prefill_workspace", None)
+    return measured if measured is not None else (256 << 20, PREFILL_BYTES_PER_TOKEN)
+
+
+def prefill_reserve_bytes(
+    prefill_reserve_gb: float | None, chunk_tokens: int, workspace: tuple[int, int] | None = None
+) -> int:
     """VRAM kept back for prefill activations under elastic VRAM. Auto: 256 MiB + 230 KiB per
     token of the prefill chunk it covers (--prefill-batch-min). Qwen3.8-Flash-Next FP4 prefills at 261k
     tokens of depth peaked 526 / 947 / 2030 MiB over the idle footprint with 2048 / 4096 / 8192-
     token chunks (RTX 3080, 2026-10-27), the same on one unsplit GPU as on each TP=2 rank."""
     if prefill_reserve_gb is not None:
         return int(prefill_reserve_gb * 2**30)
-    return (256 << 20) + PREFILL_BYTES_PER_TOKEN * chunk_tokens
+    base, per_token = workspace if workspace is not None else (256 << 20, PREFILL_BYTES_PER_TOKEN)
+    return base + per_token * chunk_tokens
 
 
 def kv_session_pages(config) -> int:

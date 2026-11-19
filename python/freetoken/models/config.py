@@ -348,6 +348,10 @@ class ModelConfig:
     # geometry, Engram n-gram memory geometry and the DSpark draft scalars the model
     # module needs. Opaque to model-agnostic engine code; None for every other model.
     dsv41_args: Any | None = None
+    # Hy4-flash (hy_v4_flash) payload (Hy4Args): per-layer-type MLA head counts and rope thetas,
+    # the compressed-indexer geometry, the LatentMoE widths, the identity-HC knobs and the
+    # Engram hash geometry. Opaque to model-agnostic engine code; None for every other model.
+    hy4_args: Any | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
@@ -360,6 +364,9 @@ class ModelConfig:
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
     slot_states: Tuple[SlotStateSpec, ...] = ()
+    # (base bytes, bytes per chunk token) of prefill activations over the idle footprint, per
+    # rank, as the model measured it; None -> the engine's defaults (engine/cache_budget.py).
+    prefill_workspace: Tuple[int, int] | None = None
 
     @property
     def is_moe(self) -> bool:

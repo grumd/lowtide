@@ -516,6 +516,18 @@ def test_prefill_reserve_auto_scales_with_the_chunk_and_honors_an_override():
     assert prefill_reserve_bytes(1.5, 16384) == int(1.5 * gib)
 
 
+def test_a_model_without_its_own_prefill_workspace_keeps_the_default():
+    from types import SimpleNamespace
+
+    from freetoken.engine.cache_budget import PREFILL_BYTES_PER_TOKEN, prefill_reserve_bytes, prefill_workspace
+
+    default = prefill_workspace(SimpleNamespace())
+    assert default == prefill_workspace(SimpleNamespace(prefill_workspace=None)) == (256 << 20, PREFILL_BYTES_PER_TOKEN)
+    assert prefill_reserve_bytes(None, 2048, default) == prefill_reserve_bytes(None, 2048)
+    own = prefill_workspace(SimpleNamespace(prefill_workspace=(1 << 20, 1000)))
+    assert prefill_reserve_bytes(None, 2048, own) == (1 << 20) + 2048 * 1000
+
+
 def test_elastic_geometry_caps_each_side_beside_the_other_ones_minimum():
     from freetoken.engine.cache_budget import plan_elastic_geometry
 

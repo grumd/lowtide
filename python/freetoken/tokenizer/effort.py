@@ -71,6 +71,20 @@ THINKING_OFF_KWARGS = {"enable_thinking": False, "thinking_mode": "disabled"}
 THINKING_ON_KWARGS = {"enable_thinking": True, "thinking_mode": "enabled"}
 THINKING_ADAPTIVE_KWARGS = {"thinking_mode": "adaptive"}
 
+#: Effort values a template may read as "thinking off" (Hy4-flash: ``no_think``, whose template
+#: ignores the toggles above). Adopted only from a validating template that accepts one.
+OFF_EFFORT_SPELLINGS = ("no_think",)
+_OFF_EFFORTS = ("none", "off", *OFF_EFFORT_SPELLINGS)
+
+
+def requests_thinking_off(chat_template_kwargs: dict[str, Any] | None) -> bool:
+    """Whether the kwargs ask for thinking off: an explicit effort decides, else the toggles."""
+    ctk = chat_template_kwargs or {}
+    effort = ctk.get("reasoning_effort")
+    if isinstance(effort, str) and effort.strip():
+        return effort.strip().lower() in _OFF_EFFORTS
+    return ctk.get("enable_thinking") is False or ctk.get("thinking_mode") == "disabled"
+
 
 @dataclass(frozen=True)
 class EffortProfile:
@@ -84,7 +98,8 @@ class EffortProfile:
     template interpolates anything". ``strength_dialect`` True means the
     template reads the ``reasoning_strength`` spelling (muse-glimmer's family,
     whose documented ladder tops out at xhigh) rather than only
-    ``reasoning_effort``.
+    ``reasoning_effort``. ``off_effort`` is the effort value that turns thinking off
+    (``OFF_EFFORT_SPELLINGS``), for a template whose toggles are effort values.
     """
 
     supported: frozenset[str]
@@ -92,6 +107,7 @@ class EffortProfile:
     consumes_effort: bool
     validates: bool = False
     strength_dialect: bool = False
+    off_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +144,8 @@ def quantize_effort(value: Any, profile: EffortProfile) -> str | None:
     the template default. With "max" excluded the remaining scale values are
     unique, so quantization is deterministic across processes.
     """
+    if profile.off_effort and isinstance(value, str) and value.strip().lower() in _OFF_EFFORTS:
+        return profile.off_effort
     supported = effective_efforts(profile)
     if not supported:
         return None
@@ -213,6 +231,21 @@ def probe_effort_profile(
     except Exception:  # noqa: BLE001 -- a rejecting template is not this dialect
         strength_dialect = False
 
+    off_effort = None
+    if rejected:
+        # only a template that rejects unknown efforts can be trusted to mean an off spelling
+        try:
+            baseline = render({}, None)
+            for name in OFF_EFFORT_SPELLINGS:
+                try:
+                    if _renderings_differ(render({"reasoning_effort": name}, None), baseline):
+                        off_effort = name
+                        break
+                except Exception:  # noqa: BLE001 -- rejected: not this template's spelling
+                    continue
+        except Exception:  # noqa: BLE001 -- bare render fails: nothing to compare against
+            off_effort = None
+
     supported = frozenset(name for name in KNOWN_REASONING_EFFORTS if name not in rejected)
     consumes = bool(rejected or diverged)
     default = None
@@ -226,6 +259,7 @@ def probe_effort_profile(
         consumes_effort=consumes,
         validates=bool(rejected),
         strength_dialect=strength_dialect,
+        off_effort=off_effort,
     )
 
 
@@ -238,7 +272,10 @@ def probe_thinking_profile(
     template that rejects any toggle probe is treated as not toggleable."""
     try:
         baseline = render({}, None)
-        off = render(dict(THINKING_OFF_KWARGS), None)
+        off_kwargs = dict(THINKING_OFF_KWARGS)
+        if efforts.off_effort:
+            off_kwargs["reasoning_effort"] = efforts.off_effort
+        off = render(off_kwargs, None)
         on = render(dict(THINKING_ON_KWARGS), None)
     except Exception:  # noqa: BLE001 -- can't observe the toggle; assume none
         return ThinkingProfile(efforts=efforts, toggleable=False, has_adaptive=False, default_state="on")

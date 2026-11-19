@@ -412,6 +412,20 @@ class ThinkReasoningParser(BaseReasoningParser):
         )
 
 
+class Hy4ReasoningParser(BaseReasoningParser):
+    """Hy4-flash: ``<think:opensource>`` / ``</think:opensource>``. The template opens the block
+    at the generation prompt unless ``reasoning_effort`` is ``no_think`` (then it renders the
+    empty pair), so thinking output starts inside reasoning and carries only the closer."""
+
+    def __init__(self, force_reasoning: bool = True, stream_reasoning: bool = True) -> None:
+        super().__init__(
+            think_start_token="<think:opensource>",
+            think_end_token="</think:opensource>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+        )
+
+
 class MiniMaxM3ReasoningParser(BaseReasoningParser):
     """Reasoning parser for MiniMax-M3's ``<mm:think>...</mm:think>`` protocol.
 
@@ -882,6 +896,7 @@ class ReasoningParser:
         "minimax_m3": MiniMaxM3ReasoningParser,
         "muse_glimmer": MuseGlimmerReasoningParser,
         "gemma4": GemmaThoughtReasoningParser,
+        "hy_v4": Hy4ReasoningParser,
     }
 
     def __init__(

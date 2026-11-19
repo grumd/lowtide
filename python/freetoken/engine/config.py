@@ -194,7 +194,7 @@ class EngineConfig:
 
     @cached_property
     def hf_config(self):
-        return cached_load_hf_config(self.model_path)
+        return family_hf_config(self.model_path, cached_load_hf_config(self.model_path))
 
     @cached_property
     def model_config(self) -> ModelConfig:
@@ -263,6 +263,17 @@ class EngineConfig:
     @property
     def distributed_addr(self) -> str:
         return "tcp://127.0.0.1:2333"
+
+
+def family_hf_config(model_path: str, hf_config: Any) -> Any:
+    """``hf_config`` as the family's optional ``adjust_hf_config(model_path, hf_config)`` hook returns it (Hy4: the quantization its reader serves, not the release's FP8 declaration); unchanged for families without one."""
+    archs = getattr(hf_config, "architectures", None) or ()
+    try:
+        spec = get_model_spec(archs[0])
+        hook = _load_attr(spec.module, "adjust_hf_config")
+    except (IndexError, ValueError, AttributeError):
+        return hf_config
+    return hook(model_path, hf_config)
 
 
 def checkpoint_quant_config(model_path: str, hf_config: Any, spec: Any):

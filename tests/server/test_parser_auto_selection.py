@@ -40,6 +40,9 @@ NO_REASONING_FORMAT = {
 GENERIC_TOOL_CALL_FALLBACK = "llama3"
 NO_DEDICATED_TOOL_FORMAT = {"LlamaForCausalLM"}
 
+# Architectures registered before their parsers exist; empty once every family is wired.
+PARSERS_PENDING: set[str] = set()
+
 
 class _Config:
     def __init__(self, data: dict) -> None:
@@ -69,14 +72,14 @@ def test_inferred_parser_names_are_names_the_factories_know(architecture):
 
 def test_only_the_families_without_a_thinking_format_get_no_reasoning_parser():
     fell_through = {a for a in ARCHITECTURES if _inferred(a)[1] is None}
-    assert fell_through == NO_REASONING_FORMAT
+    assert fell_through == NO_REASONING_FORMAT | PARSERS_PENDING
 
 
 def test_only_the_families_without_a_tool_format_get_the_generic_fallback():
     fell_through = {
         a for a in ARCHITECTURES if _inferred(a)[0] == GENERIC_TOOL_CALL_FALLBACK
     }
-    assert fell_through == NO_DEDICATED_TOOL_FORMAT
+    assert fell_through == NO_DEDICATED_TOOL_FORMAT | PARSERS_PENDING
 
 
 def test_qwen3_5_is_not_shadowed_by_the_generic_qwen_branch():
@@ -85,6 +88,12 @@ def test_qwen3_5_is_not_shadowed_by_the_generic_qwen_branch():
     assert _inferred("Qwen3_5MoeForConditionalGeneration")[0] == "qwen3_coder"
     assert _inferred("Qwen3_5ForConditionalGeneration")[0] == "qwen3_coder"
     assert _inferred("Qwen3MoeForCausalLM")[0] == "qwen25"
+
+
+@pytest.mark.parametrize("architecture", ["HYV4FlashForConditionalGeneration", "HYV4FlashForCausalLM"])
+def test_hy4_gets_its_own_tag_parsers(architecture):
+    """Hy4's tags carry an ``:opensource`` suffix; the GLM / qwen3 parsers would never match them."""
+    assert _inferred(architecture) == ("hy_v4", "hy_v4")
 
 
 def test_an_explicit_choice_beats_inference():

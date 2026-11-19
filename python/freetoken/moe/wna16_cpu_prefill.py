@@ -61,6 +61,11 @@ def load_nvfp4_extension():
     )
 
 
+def _check_activation(executor, activation: str) -> None:
+    if activation not in executor.ACTIVATIONS:
+        raise NotImplementedError(f"{type(executor).__name__} computes {executor.ACTIVATIONS} experts, not {activation!r}")
+
+
 def rank_cpus(threads: int, rank: int, world: int) -> list[int]:
     """This rank's share of the physical cores (one logical CPU each), so the ranks' pools
     never contend for a core."""
@@ -75,8 +80,12 @@ def rank_cpus(threads: int, rank: int, world: int) -> list[int]:
 class Wna16CpuPrefill:
     """Thin owner of the C++ executor plus the pinned staging buffers for one rank."""
 
+    # expert activations the kernel computes (the engine's capability check)
+    ACTIVATIONS = ("silu",)
+
     def __init__(self, *, hidden: int, inter: int, down_groups: int, k_off: int, num_experts: int,
-                 top_k: int, max_tokens: int, threads: int, cpus: list[int]) -> None:
+                 top_k: int, max_tokens: int, threads: int, cpus: list[int], activation: str = "silu") -> None:
+        _check_activation(self, activation)
         ext = load_extension()
         self._init_buffers(ext.Wna16CpuPrefill(threads, cpus, hidden, inter, down_groups, k_off, num_experts),
                            hidden, top_k, max_tokens)
@@ -131,11 +140,17 @@ class Nvfp4CpuPrefill(Wna16CpuPrefill):
     """The NVFP4 executor (nvfp4_cpu.h) behind the same staging buffers and interface."""
 
     BANK_ROLES = ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")
+    ACTIVATIONS = ("silu", "swiglu_clamp")
 
     def __init__(self, *, hidden: int, inter: int, num_experts: int, top_k: int, max_tokens: int,
-                 threads: int, cpus: list[int]) -> None:
+                 threads: int, cpus: list[int], activation: str = "silu", alpha: float = 1.0,
+                 limit: float | None = None) -> None:
+        _check_activation(self, activation)
+        clamp = activation == "swiglu_clamp"
         ext = load_nvfp4_extension()
-        self._init_buffers(ext.Nvfp4CpuPrefill(threads, cpus, hidden, inter, num_experts), hidden, top_k, max_tokens)
+        impl = ext.Nvfp4CpuPrefill(threads, cpus, hidden, inter, num_experts, clamp=clamp, alpha=float(alpha),
+                                   limit=float("inf") if limit is None else float(limit))
+        self._init_buffers(impl, hidden, top_k, max_tokens)
         logger.info(f"nvfp4 CPU prefill experts: {threads} threads on cpus {cpus}")
 
     def set_layer(self, layer_id: int, banks: dict[str, torch.Tensor]) -> None:

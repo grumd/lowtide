@@ -206,6 +206,47 @@ class Qwen38LikeTokenizer:
         return torch.tensor([[7, 8]], dtype=torch.long)
 
 
+class Hy4LikeTokenizer:
+    """Fake of Hy4-flash's template: thinking is set only by reasoning_effort (max / high /
+    no_think, anything else raises); enable_thinking and thinking_mode are never read."""
+
+    def __init__(self) -> None:
+        self.chat_template_kwargs = None
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.chat_template_kwargs = kwargs
+        effort = kwargs.get("reasoning_effort", "high")
+        if effort not in ("max", "high", "no_think"):
+            raise ValueError(f"reasoning_effort error : {effort}")
+        return "prompt <think></think>" if effort == "no_think" else "prompt <think>"
+
+    def encode(self, prompt, return_tensors=None, add_special_tokens=True):
+        return torch.tensor([[7, 8]], dtype=torch.long)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"enable_thinking": False, "thinking_mode": "disabled"},
+    {"reasoning_effort": "none"},
+    {"reasoning_effort": "no_think"},
+    {"enable_thinking": False, "reasoning_effort": None},
+])
+def test_thinking_off_reaches_a_template_that_only_reads_effort(kwargs):
+    manager = TokenizeManager(Hy4LikeTokenizer())
+    msg = TokenizeMsg(uid=1, text=[{"role": "user", "content": "hello"}],
+                      sampling_params=SamplingParams(), chat_template_kwargs=kwargs)
+    assert manager.render_prompt(msg) == "prompt <think></think>"
+
+
+def test_thinking_off_leaves_toggle_templates_alone():
+    tokenizer = Qwen38LikeTokenizer()
+    manager = TokenizeManager(tokenizer)
+    off = {"enable_thinking": False, "thinking_mode": "disabled"}
+    msg = TokenizeMsg(uid=1, text=[{"role": "user", "content": "hello"}],
+                      sampling_params=SamplingParams(), chat_template_kwargs=off)
+    assert manager.render_prompt(msg) == "prompt effort=off"
+    assert "reasoning_effort" not in tokenizer.chat_template_kwargs
+
+
 def test_tokenize_quantizes_foreign_effort_onto_the_template_vocabulary():
     """DeepSeek-dialect "high" must reach a Qwen3.8-style template as its
     nearest supported gear, not raw (raw would raise_exception)."""

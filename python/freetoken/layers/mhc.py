@@ -19,6 +19,11 @@ PR #53906) bit-for-bit in fp32; the per-layer weights are ``hc_{attn,ffn}_fn`` /
 correctness baseline; the fused triton kernel (``kernel/triton/mhc.py``,
 dispatched by ``mhc_fused_post_pre`` below) replaces it on CUDA and is
 validated against this file.
+
+The ``hc_*`` functions are the identity variant (Hy4-flash, transformers
+``HYV4FlashHyperConnection`` / ``HYV4FlashHyperHead``): no comb, each stream gets
+``res_j += post_j * x``, post is ``post_mult * sigmoid(.) + hc_eps``, and ``fn``
+has 2n rows (n for the final ``hc_head``, which has no post gate).
 """
 
 from __future__ import annotations
@@ -140,6 +145,67 @@ def mhc_fused_post_pre(
     )
 
 
+def hc_pre(
+    residual: torch.Tensor,  # [T, n, hidden]
+    fn: torch.Tensor,  # [2n or n, n*hidden] fp32
+    hc_scale: torch.Tensor,  # [2] or [1] fp32
+    hc_base: torch.Tensor,  # [2n or n] fp32
+    rms_eps: float,
+    hc_eps: float,
+    post_mult: float,
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Identity hc_pre. Returns (post [T, n] fp32 or None for n rows, pre [T, n] fp32,
+    mixes [T, rows] fp32, layer_input [T, hidden])."""
+    t, n, _ = residual.shape
+    flat = residual.reshape(t, -1).to(torch.float32)
+    mixes = (flat @ fn.t()) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + rms_eps)
+    pre = torch.sigmoid(mixes[:, :n] * hc_scale[0] + hc_base[:n]) + hc_eps
+    post = None
+    if fn.shape[0] > n:
+        post = post_mult * torch.sigmoid(mixes[:, n:] * hc_scale[1] + hc_base[n:]) + hc_eps
+    layer_input = (pre.unsqueeze(-1) * residual).sum(dim=1).to(residual.dtype)
+    return post, pre, mixes, layer_input
+
+
+def hc_post(x: torch.Tensor, residual: torch.Tensor, post_mix: torch.Tensor) -> torch.Tensor:
+    """Identity hc_post: ``res_j + post_j * x`` in fp32, one rounding to the stream dtype."""
+    if residual.is_cuda:
+        from freetoken.kernel.triton.mhc import hc_post_triton
+
+        return hc_post_triton(x, residual, post_mix)
+    out = post_mix.to(torch.float32).unsqueeze(-1) * x.to(torch.float32).unsqueeze(-2) + residual.to(torch.float32)
+    return out.to(residual.dtype)
+
+
+def hc_post_pre(
+    x: torch.Tensor | None,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor | None,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    post_mult: float,
+    mixes_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    """Identity hc_post of the previous sublayer (skipped when ``post_mix is None``), then
+    this sublayer's hc_pre. Returns (residual_new, post or None, pre, layer_input); fused
+    triton kernel on CUDA, decomposed torch otherwise."""
+    if residual.is_cuda:
+        from freetoken.kernel.triton.mhc import hc_post_pre_triton
+
+        return hc_post_pre_triton(
+            x, residual, post_mix, fn, hc_scale, hc_base, rms_eps, hc_eps, post_mult, mixes_out
+        )
+    if post_mix is not None:
+        residual = hc_post(x, residual, post_mix)
+    post, pre, mixes, layer_input = hc_pre(residual, fn, hc_scale, hc_base, rms_eps, hc_eps, post_mult)
+    if mixes_out is not None:
+        mixes_out.copy_(mixes)
+    return residual, post, pre, layer_input
+
+
 __all__ = [
     "hc_expand",
     "hc_contract",
@@ -147,4 +213,7 @@ __all__ = [
     "mhc_post",
     "mhc_fused_post_pre",
     "mhc_fused_post_pre_torch",
+    "hc_pre",
+    "hc_post",
+    "hc_post_pre",
 ]

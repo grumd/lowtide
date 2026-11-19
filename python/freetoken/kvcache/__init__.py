@@ -46,6 +46,11 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
         from .dsv4_paged_pool import DSV4PagedKVCache
 
         return DSV4PagedKVCache
+    hy4 = getattr(model_config, "hy4_args", None)
+    if hy4 is not None and AttnType.DSA in types:
+        from .hy4_pool import Hy4KVCache, Hy4WindowKVCache
+
+        return Hy4WindowKVCache if hy4.swa_ring else Hy4KVCache
     if AttnType.SWA in types:
         from .hybrid_swa_pool import HybridSWAKVCache
 
@@ -100,6 +105,19 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         pool._init_paged_state(config.max_running_req, config.cache_type != "naive")
         return pool
 
+    from .hy4_pool import Hy4WindowKVCache, hy4_window_tokens
+
+    if resolve_pool_class(model_config) is Hy4WindowKVCache:
+        return create_kvcache_pool(
+            model_config=model_config,
+            num_pages=num_pages + 1,  # +1 for dummy page
+            page_size=config.page_size,
+            num_swa_tokens=hy4_window_tokens(config, num_pages + 1),
+            device=device,
+            dtype=dtype,
+            num_req_slots=config.max_running_req + 1,
+        )
+
     num_swa_tokens = None
     # Both the naive and radix SWA paths share the global-paged swa pool; radix sizes it by
     # ratio (cross-request reuse), naive by concurrency x window.
@@ -133,6 +151,27 @@ def create_kvcache_pool(
     num_req_slots: int | None = None,
     kv_tier_cells: int = 0,
 ) -> BaseKVCachePool:
+    hy4 = getattr(model_config, "hy4_args", None)
+    if hy4 is not None and hy4.swa_ring:
+        from .hy4_pool import Hy4WindowKVCache
+
+        if num_swa_tokens is None or num_req_slots is None or kv_tier_cells:
+            raise ValueError("the Hy4 window pool needs num_swa_tokens and num_req_slots, and no --kv-tier")
+        n = model_config.num_layers
+        return Hy4WindowKVCache(
+            latent_dim=hy4.latent_dim,
+            num_pages=num_pages,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            index_head_dim=hy4.index_head_dim,
+            indexed_layer_ids=tuple(i for i in hy4.indexed_layer_ids if i < n),
+            sliding_layer_ids=tuple(i for i in hy4.sliding_layer_ids if i < n),
+            window=hy4.sliding_window,
+            num_window_tokens=num_swa_tokens,
+            num_req_slots=num_req_slots,
+            index_ratio=hy4.index_ratio,
+        )
     if kv_tier_cells and model_config.has_swa_attention:
         raise ValueError("--kv-tier serves QSA (Qwen3.8-Flash-Next) pools only")
     if model_config.has_swa_attention:
@@ -251,6 +290,10 @@ def create_kvcache_pool(
                 # kpool tail rings are keyed by Req.table_idx; + 1 covers the dummy request row.
                 if num_req_slots is None:
                     raise ValueError("kpool pools need num_req_slots (max_running_req + 1)")
+                if hy4 is not None:
+                    from .hy4_pool import Hy4KVCache
+
+                    return Hy4KVCache(**common, index_ratio=spec.index_ratio, num_req_slots=num_req_slots)
                 return KpoolDSAKVCache(
                     **common,
                     index_ratio=spec.index_ratio,

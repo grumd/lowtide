@@ -60,11 +60,18 @@ class MLAKVCache(BaseKVCachePool):
         return layer_id if self._layer_index is None else self._layer_index[layer_id]
 
     def _alloc(self, num_pages: int) -> None:
+        from .mha_pool import alloc_tier, paged_run_intervals
+
         self._num_pages = num_pages
-        self._kv_buffer = torch.empty(
+        page_bytes = self._page_size * self._latent_dim * self._dtype.itemsize
+        # plain torch.empty unless elastic VRAM installed its allocator (the pool opted in)
+        self._kv_buffer = alloc_tier(
+            "kv",
             (1, self._num_layers, num_pages, self._page_size, 1, self._latent_dim),
-            device=self._device,
-            dtype=self._dtype,
+            self._dtype,
+            self._device,
+            # one run per layer; its last page is the dummy page padded rows point at
+            paged_run_intervals(self._num_layers, num_pages * page_bytes, page_bytes, page_bytes),
         )
 
     # -- views (addressed by GLOBAL layer id; remapped when layer_ids was given) --
@@ -174,15 +181,25 @@ class DSAKVCache(MLAKVCache):
     def _alloc(self, num_pages: int) -> None:
         # Both slabs in one allocation step so rebuild can never leave one grown
         # and the other stale.
+        from .mha_pool import alloc_tier, paged_run_intervals
+
         super()._alloc(num_pages)
         # bf16 == the 2 bytes/token/layer the KV cost model budgets for this slab
         # (cache_status._kv_cost_model); keep the two in lockstep.
-        self._index_k_buffer = torch.zeros(
-            self._num_index_layers,
-            self._index_rows(num_pages),
-            self._index_head_dim,
-            dtype=torch.bfloat16,
-            device=self._device,
+        rows = self._index_rows(num_pages)
+        row_bytes = self._index_head_dim * 2
+        page_bytes = (self._index_rows(num_pages + 1) - rows) * row_bytes
+        run_bytes = rows * row_bytes
+        self._index_k_buffer = alloc_tier(
+            "index",
+            (self._num_index_layers, rows, self._index_head_dim),
+            torch.bfloat16,
+            self._device,
+            # the rows past the usable pages (dummy page shadow, scratch rows) stay backed
+            paged_run_intervals(
+                self._num_index_layers, run_bytes, page_bytes, run_bytes - (num_pages - 1) * page_bytes
+            ),
+            zero=True,
         )
 
     def rebuild(self, num_pages: int) -> None:

@@ -91,6 +91,20 @@ def get_free_memory(device: torch.device) -> int:
     return torch.cuda.mem_get_info(device)[0]
 
 
+def upload_graph(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> None:
+    """Upload ``graph`` at capture: the first launch of a graph with ~6k nodes behind a captured
+    flag WAIT (Hy4's Engram) blocks until the WAIT passes, and the fill only runs after the launch."""
+    try:
+        from cuda.bindings import driver
+    except ImportError:
+        return
+
+    err = driver.cuGraphUpload(driver.CUgraphExec(graph.raw_cuda_graph_exec()), driver.CUstream(stream.cuda_stream))
+    err = err[0] if isinstance(err, tuple) else err
+    if err != driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuGraphUpload failed: {err}")
+
+
 class GraphRunner:
     def __init__(
         self,
@@ -184,6 +198,7 @@ class GraphRunner:
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                     self.buffer.logits[:bs] = model.forward()
                 self._reset_moe_offload_cache()
+            upload_graph(graph, self.stream)
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph

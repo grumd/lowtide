@@ -12,11 +12,16 @@ struct Nvfp4CpuPrefill {
   nvfp4cpu::Dims d{};
   int num_experts;
 
-  Nvfp4CpuPrefill(int threads, std::vector<int> cpus, int hidden, int inter, int num_experts_)
+  Nvfp4CpuPrefill(int threads, std::vector<int> cpus, int hidden, int inter, int num_experts_, bool clamp,
+                  double alpha, double limit)
       : num_experts(num_experts_) {
     TORCH_CHECK(hidden % 64 == 0 && inter % 64 == 0, "unsupported nvfp4 shape (hidden and inter must be multiples of 64)");
+    TORCH_CHECK(!clamp || limit > 0, "the swiglu clamp needs a positive limit");
     d.H = hidden;
     d.I = inter;
+    d.clamp = clamp;
+    d.alpha = float(alpha);
+    d.limit = float(limit);
     d.gu_p_s = int64_t(2 * inter) * (hidden / 2);
     d.gu_s_s = int64_t(2 * inter) * (hidden / 16);
     d.gu_g_s = 2 * inter;
@@ -78,8 +83,9 @@ struct Nvfp4CpuPrefill {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<Nvfp4CpuPrefill>(m, "Nvfp4CpuPrefill")
-      .def(py::init<int, std::vector<int>, int, int, int>(), py::arg("threads"), py::arg("cpus"), py::arg("hidden"),
-           py::arg("inter"), py::arg("num_experts"))
+      .def(py::init<int, std::vector<int>, int, int, int, bool, double, double>(), py::arg("threads"), py::arg("cpus"),
+           py::arg("hidden"), py::arg("inter"), py::arg("num_experts"), py::arg("clamp") = false,
+           py::arg("alpha") = 1.0, py::arg("limit") = 0.0)
       .def("set_layer", &Nvfp4CpuPrefill::set_layer)
       .def("forward", &Nvfp4CpuPrefill::forward, py::arg("layer"), py::arg("x"), py::arg("ids"), py::arg("w"),
            py::arg("y"), py::arg("precise") = false)

@@ -67,6 +67,10 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
                    help="include the vision tower's bf16 tensors in the FTW (default on; only when "
                         "the checkpoint carries a vision_config). Serving it still requires "
                         "--load-vision; 'off' drops the tower for a smaller text-only FTW")
+    p.add_argument("--expert-quant", choices=["auto", "nvfp4"], default="auto",
+                   help="routed-expert format of the FTW: 'auto' keeps the family's own; 'nvfp4' "
+                        "requantizes them round-to-nearest (Hy4-flash: FP8 -> NVFP4, the only family "
+                        "with this path; others refuse)")
     p.add_argument("--gpu", type=single_gpu_arg, default=None,
                    help="GPU for the repack: a GPU UUID (GPU-xxxx..., as nvidia-smi -L prints) or "
                         "an nvidia-smi index (default: the first visible GPU)")
@@ -87,7 +91,7 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
         moe_backend=ns.moe_backend, quant_backend=ns.quant_backend, shard_limit=shard_limit, device=device,
         include_engram=ns.include_engram, include_dspark=ns.include_dspark,
         mtp_mode=ns.mtp, mtp_header=ns.mtp_header, ple_mode=ns.ple,
-        vision_mode=ns.vision,
+        vision_mode=ns.vision, expert_quant=ns.expert_quant,
     )
     dt = time.perf_counter() - t
     c = index["counts"]
