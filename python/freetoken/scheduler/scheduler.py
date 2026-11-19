@@ -501,7 +501,9 @@ class Scheduler(SchedulerIOMixin):
         getter = getattr(model, "dspark_draft", None)
         if callable(getter) and getter() is not None:
             return DSparkManager(self)
-        if ENV.NGRAM_SPEC:
+        dfly = getattr(model, "dfly_drafter", None)
+        if ENV.NGRAM_SPEC or (callable(dfly) and dfly() is not None):
+            # Hy4's DFly2 drafter feeds the same verify rounds as the prompt lookup
             from freetoken.engine.verify_graph import ngram_spec_unsupported
 
             why = ngram_spec_unsupported(model, self.engine.linear_state_pool)
@@ -1414,6 +1416,9 @@ class Scheduler(SchedulerIOMixin):
                 boundaries=batch.is_decode and (not mtp.enabled or getattr(mtp, "is_ngram", False)),
             )
         forward_output = self.engine.forward_batch(batch, sample_args)
+        keep = getattr(mtp, "keep_draft_state", None) if mtp.enabled else None
+        if keep is not None:
+            keep(batch)
         if batch.is_decode and mtp.enabled and getattr(mtp, "uses_streams", False):
             # Per-request draft input for the next MTP round: the last position's
             # residual streams. None (CUDA-graph replay) makes the request MTP-

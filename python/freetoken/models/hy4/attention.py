@@ -141,7 +141,9 @@ class Hy4CompressedIndexer(BaseOP):
 
 
 class Hy4Attention(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
+    def __init__(
+        self, config: ModelConfig, layer_id: int, *, prefix: str = "", indexer: bool = True, fp8: bool | None = None
+    ):
         args = config.hy4_args
         self.layer_id = layer_id
         self.indexed = args.is_indexed(layer_id)
@@ -159,7 +161,7 @@ class Hy4Attention(BaseOP):
 
         self.q_a_proj = LinearReplicated(hidden, args.q_lora_rank, has_bias=False, quant_config=quant, prefix=f"{prefix}.q_a_proj")
         self.q_a_layernorm = RMSNorm(args.q_lora_rank, eps=args.norm_eps)
-        fp8 = args.fp8_attention(layer_id)
+        fp8 = args.fp8_attention(layer_id) if fp8 is None else fp8
 
         def proj(isize: int, osize: int, name: str):
             if fp8:
@@ -176,7 +178,7 @@ class Hy4Attention(BaseOP):
         self.o_proj = proj(h * v, hidden, "o_proj")
         self.post_proj_norm = RMSNorm(hidden, eps=args.norm_eps)
         self.sinks = torch.empty(h, dtype=torch.float32)
-        if self.indexed:
+        if self.indexed and indexer:
             self.compressed_indexer = Hy4CompressedIndexer(config, prefix=f"{prefix}.compressed_indexer")
         self._w_uk: torch.Tensor | None = None
         self._w_uv: torch.Tensor | None = None

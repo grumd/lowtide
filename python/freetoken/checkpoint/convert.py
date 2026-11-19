@@ -382,7 +382,8 @@ def convert_checkpoint(
 
     ``mtp_mode`` controls the (dense) MTP draft head, mirroring ``ft serve --mtp``:
     ``"auto"``/``"on"`` include the head embedded in the checkpoint (when its config
-    declares ``mtp_num_hidden_layers``); ``"off"`` never includes it; ``"file"`` includes
+    declares ``mtp_num_hidden_layers``, and a family's own-kind drafter such as Hy4's DFly2);
+    ``"off"`` never includes it; ``"file"`` includes
     the standalone artifact ``mtp_header`` (directory or single .safetensors), replacing
     any embedded head, after validating its geometry against the base model."""
     from freetoken.distributed import DistributedInfo, set_tp_info, try_get_tp_info
@@ -474,10 +475,15 @@ def convert_checkpoint(
     _progress("dense", 0, 0)  # phase start; per-tensor cumulative bytes follow (total unknown)
     dense_bytes = 0
     _mtp_path = mtp_header if mtp_mode == "file" else ""
+    from freetoken.models.weight import ftw_side_tensors
+
+    side_owns, side_iter = ftw_side_tensors(model_path) if mtp_mode != "off" else (None, None)
     for name, tensor in count_bar(load_weight(model_path, torch.device("cpu"),
                                               include_moe_experts=include_moe_experts,
                                               mtp_path=_mtp_path),
                                   "Converting dense weights"):
+        if side_owns is not None and side_owns(name):
+            continue
         writer.add_tensor(name, tensor, kind="weight")
         n_weight += 1
         dense_bytes += tensor.numel() * tensor.element_size()
@@ -585,6 +591,13 @@ def convert_checkpoint(
             raise SystemExit("--include-dspark: the checkpoint ships no draft head (mtp.*)")
         # else: a dense MTP head (e.g. qwen4_exp) — already yielded by the dense reader.
 
+    # 4) Side payloads a family keeps under their own kind (Hy4: the DFly2 drafter, raw checkpoint
+    #    tensors), counted and flagged per kind like the sections above.
+    n_side: dict[str, int] = {}
+    for name, tensor, kind in side_iter or ():
+        writer.add_tensor(name, tensor, kind=kind)
+        n_side[kind] = n_side.get(kind, 0) + 1
+
     _progress("finalize")  # writing shard index + copying config/tokenizer
     copied = _copy_metadata(model_path, out_dir)
     _declare_quantization(model_path, out_dir)
@@ -662,6 +675,7 @@ def convert_checkpoint(
             "weight": n_weight,
             "experts_bank": n_bank + n_alpha,
             "dspark_experts_bank": n_dspark_bank + n_dspark_alpha,
+            **n_side,
         },
         "copied_metadata": copied,
         # Which optional side payloads this FTW carries. The loader reads these to decide
@@ -677,6 +691,7 @@ def convert_checkpoint(
             # Whether the vision tower's bf16 tensors ride the FTW dense stream (only when
             # the checkpoint has a vision_config and --vision on).
             "vision": bool(vision_mode == "on" and getattr(mc, "is_multimodal", False)),
+            **{kind: True for kind in n_side},
         },
     })
     return index

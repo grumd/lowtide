@@ -342,7 +342,7 @@ def test_engine_passes_the_clamp_to_the_cpu_decode_executor(monkeypatch):
     ex = _nvfp4_experts()
     cache = SimpleNamespace(decode_target="gpu", cpu_layer_ids=[], verify_cpu=False, _unpinned_layers=[],
                             set_decode_fetch=lambda f: built.append(("fetch", f)))
-    host = SimpleNamespace(device=torch.device("cpu"), cpu_moe_executor=None)
+    host = SimpleNamespace(device=torch.device("cpu"), cpu_moe_executor=None, model=None)
     config = SimpleNamespace(tp_info=SimpleNamespace(rank=0, size=1), cpu_threads=4, max_running_req=1)
     eng.Engine._maybe_init_cpu_decode(host, config, cache, [ex])
     kw = built[0]

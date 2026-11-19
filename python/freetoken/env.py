@@ -104,6 +104,8 @@ class EnvClassSingleton:
     NGRAM_SPEC_MAX_DRAFT = EnvInt(7)
     NGRAM_SPEC_MIN_MATCH = EnvInt(3)
     NGRAM_SPEC_POLICY = EnvStr("adaptive")
+    # Hy4-flash's DFly2 drafter (--mtp on): drafts verified per round, 1..5 (the released block).
+    DFLY_DRAFT_TOKENS = EnvInt(2)
     # Draft vocabulary size: the draft chain's argmax runs over the lm_head rows of the V most
     # frequently generated tokens (learned from the served traffic, see engine/draft_vocab.py)
     # instead of the whole vocab. 0 = always the full vocab.

@@ -611,6 +611,20 @@ class Engine:
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
 
         # ======================= Graph capture initialization ========================
+        setup_draft = getattr(self.model, "setup_draft_buffers", None)
+        if setup_draft is not None:
+            # a draft head's static target-row export must exist before the graphs capture it
+            from .graph import _determine_cuda_graph_bs
+
+            _gbs = _determine_cuda_graph_bs(
+                cuda_graph_bs=config.cuda_graph_bs, cuda_graph_max_bs=config.cuda_graph_max_bs,
+                free_memory=init_free_memory,
+            )
+            _req = max(1, config.max_running_req)
+            setup_draft(
+                rows=max(max(_gbs, default=1), _req * (1 + _spec_depth(self.model))),
+                slots=config.max_running_req + 1, device=self.device,
+            )
         self.dummy_req = Req(
             input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
             table_idx=config.max_running_req,
@@ -733,7 +747,7 @@ class Engine:
         from freetoken.env import ENV as _ENV
 
         if (
-            _ENV.NGRAM_SPEC
+            (_ENV.NGRAM_SPEC or _dfly_drafter(self.model) is not None)
             and _decode_bs
             and hasattr(self.attn_backend, "init_capture_verify")
             and verify_store_attr(self.attn_backend) is not None
@@ -741,7 +755,7 @@ class Engine:
         ):
             from freetoken.engine.verify_graph import MultiWidthVerifyGraphs
 
-            _widths = list(range(2, _ngram_spec_depth() + 2))
+            _widths = list(range(2, _spec_depth(self.model) + 2))
             _max_req = max(1, config.max_running_req)
             _bs_list = sorted({b for b in _decode_bs if b <= _max_req} | {_max_req})
             self.ngram_verify_graphs = MultiWidthVerifyGraphs(
@@ -761,6 +775,14 @@ class Engine:
                 ),
             )
             logger.info_rank0(f"n-gram verify CUDA graphs captured: widths {_widths}, bs={_bs_list}")
+            capture_draft = getattr(self.model, "capture_draft_graphs", None)
+            if capture_draft is not None and _dfly_drafter(self.model) is not None:
+                # the draft pass of Hy4's DFly2 rounds, before elastic VRAM settles
+                capture_draft(
+                    _bs_list, min(5, max(1, int(_ENV.DFLY_DRAFT_TOKENS.value))), config.max_running_req, self.device,
+                    self.graph_runner.stream, getattr(self.graph_runner, "pool", None),
+                )
+                logger.info_rank0(f"DFly2 draft CUDA graphs captured: bs={_bs_list}")
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
@@ -1366,7 +1388,7 @@ class Engine:
             swiglu_limit=sample.limit,
             num_threads=len(cpus),
             # an --ngram-spec verify window computes its CPU routes in the same task
-            max_tokens=max(config.max_running_req, 1) * (1 + _ngram_spec_depth()),
+            max_tokens=max(config.max_running_req, 1) * (1 + _spec_depth(self.model)),
             device=self.device,
             fmt=fmt,
             cpus=cpus,
@@ -2034,10 +2056,19 @@ def _rank_cpu_threads(config: EngineConfig) -> int:
     return max(1, total // config.tp_info.size)
 
 
-def _ngram_spec_depth() -> int:
+def _dfly_drafter(model):
+    getter = getattr(model, "dfly_drafter", None)
+    return getter() if callable(getter) else None
+
+
+def _spec_depth(model) -> int:
+    """The longest speculative window's draft count: --ngram-spec's and the DFly2 drafter's."""
     from freetoken.env import ENV
 
-    return max(int(ENV.NGRAM_SPEC_MAX_DRAFT.value), 0) if ENV.NGRAM_SPEC else 0
+    depth = max(int(ENV.NGRAM_SPEC_MAX_DRAFT.value), 0) if ENV.NGRAM_SPEC else 0
+    if _dfly_drafter(model) is not None:
+        depth = max(depth, min(5, max(1, int(ENV.DFLY_DRAFT_TOKENS.value))))
+    return depth
 
 
 def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:

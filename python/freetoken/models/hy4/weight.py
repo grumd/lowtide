@@ -13,7 +13,8 @@ Every checkpoint key has exactly one consumer, decided by ``classify``:
   (RTN ``quantize_nvfp4`` of the exact fp32 FP8 product) when the expert kind is NVFP4.
 * ``engram_table``: ``engram_layer.multi_head_embedding.embedding.weight``, never loaded;
   ``engram_table_sources`` records its shard and byte offset for the host row store.
-* ``skip``: ``vit.*`` (text-only serving) and ``model.dfly_layers.*`` (no DFly drafter).
+* ``skip``: ``vit.*`` (text-only serving), ``model.dfly_layers.*`` unless the DFly2 drafter is
+  built (``--mtp on``), and its ``confidence_head`` always (no serving port uses it).
 * ``beyond_cap``: layers past ``FREETOKEN_HY4_MAX_LAYERS``.
 
 The dense stream checks at its end that it read every ``dense`` key exactly once, so a
@@ -58,8 +59,13 @@ SAFETENSORS_DTYPES = {
 }
 SKIP_PREFIXES = (
     ("vit.", "vision tower (text-only serving)"),
-    ("model.dfly_layers.", "DFly draft layers (no drafter support)"),
+    ("model.dfly_layers.", "DFly2 drafter (built only with --mtp on)"),
 )
+DFLY_PREFIX = "model.dfly_layers."
+# trained for adaptive block lengths; vLLM and SGLang ignore it (SPEC 11.6)
+DFLY_UNUSED = "model.dfly_layers.confidence_head."
+# FTW index kind of the drafter's tensors (checkpoint names): the generic replay skips them
+DFLY_FTW_KIND = "dfly"
 ENGRAM_TABLE_SUFFIX = "engram_layer.multi_head_embedding.embedding.weight"
 EXPERT_LEAVES = ("gate_up_proj", "gate_up_proj_scale_inv", "down_proj", "down_proj_scale_inv")
 # F32 in the checkpoint, bf16 in the reference (absent from _keep_in_fp32_modules_strict)
@@ -72,7 +78,9 @@ EXPERT_QUANT_ENV = "FREETOKEN_HY4_EXPERT_QUANT"
 _LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
 
 
-def classify(name: str, num_layers: int) -> str:
+def classify(name: str, num_layers: int, dfly: bool = False) -> str:
+    if dfly and name.startswith(DFLY_PREFIX):
+        return "skip" if name.startswith(DFLY_UNUSED) else "dense"
     for prefix, _why in SKIP_PREFIXES:
         if name.startswith(prefix):
             return "skip"
@@ -327,11 +335,14 @@ _TP_ROWS = (
     ".self_attn.gate_proj.weight", ".self_attn.gate_proj.weight_scale_inv",
     ".self_attn.sinks",
     ".mlp.gate_proj.weight", ".mlp.up_proj.weight",
+    ".mlp.gate_proj.weight_scale_inv", ".mlp.up_proj.weight_scale_inv",
     ".mlp.shared_experts.gate_proj.weight", ".mlp.shared_experts.up_proj.weight",
+    "dfly.hidden_correction.gate_proj.weight", "dfly.hidden_correction.up_proj.weight",
 )
 _TP_COLS = (
     ".self_attn.o_proj.weight", ".self_attn.o_proj.weight_scale_inv",
-    ".mlp.down_proj.weight", ".mlp.shared_experts.down_proj.weight",
+    ".mlp.down_proj.weight", ".mlp.down_proj.weight_scale_inv", ".mlp.shared_experts.down_proj.weight",
+    "dfly.hidden_correction.down_proj.weight",
 )
 _TP_VOCAB = ("lm_head.weight", "model.embed_tokens.weight")
 FP8_BLOCK = 128
@@ -421,11 +432,102 @@ def _iter_dense_full(src: TensorSource, config, device: torch.device) -> Iterato
     yield "model.embed_tokens.weight", r.take("model.embed_tokens.weight", bf16)
     yield "model.norm.weight", r.take("model.norm.weight", bf16)
     yield "lm_head.weight", r.take("lm_head.weight", bf16)
-    _check_consumed(src, config.num_layers)
+    if args.dfly_enabled:
+        yield from _iter_dfly(r, args)
+    _check_consumed(src, config.num_layers, args.dfly_enabled)
 
 
-def _check_consumed(src: TensorSource, num_layers: int) -> None:
-    expected = {k for k in src.keys() if classify(k, num_layers) == "dense"}
+def _iter_dfly(r: _DenseReader, args: Hy4Args) -> Iterator[tuple[str, torch.Tensor]]:
+    """The DFly2 drafter (``model.dfly_layers.*``) under ``Hy4DFly``'s names, unsharded. Its FP8
+    linears stay e4m3 + block scales (W8A16) whatever ``dense_fp8`` says."""
+    bf16, f32 = torch.bfloat16, torch.float32
+    for i in range(args.dfly_num_layers):
+        src, dst = f"{DFLY_PREFIX}{i}", f"dfly.layers.{i}"
+        a, da = f"{src}.self_attn", f"{dst}.self_attn"
+        for name in ("q_a_proj", "kv_a_proj_with_mqa", "kv_b_proj"):
+            yield f"{da}.{name}.weight", r.linear(f"{a}.{name}")
+        for d, c in (("q_b_proj", "q_b_proj"), ("gate_proj", "linear_gate"), ("o_proj", "o_proj")):
+            w, sc = r.fp8_linear(f"{a}.{c}")
+            yield f"{da}.{d}.weight", w
+            yield f"{da}.{d}.weight_scale_inv", sc
+        for norm in ("q_a_layernorm", "kv_a_layernorm", "post_proj_norm"):
+            yield f"{da}.{norm}.weight", r.take(f"{a}.{norm}.weight", bf16)
+        # stored bf16 (the target's are F32), used as fp32 logits
+        yield f"{da}.sinks", r.take(f"{a}.learnable_sink_param", bf16).to(f32)
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            w, sc = r.fp8_linear(f"{src}.mlp.{proj}")
+            yield f"{dst}.mlp.{proj}.weight", w
+            yield f"{dst}.mlp.{proj}.weight_scale_inv", sc
+        for norm in ("input_layernorm", "post_attention_layernorm"):
+            yield f"{dst}.{norm}.weight", r.take(f"{src}.{norm}.weight", bf16)
+    yield "dfly.final_norm.weight", r.take(f"{DFLY_PREFIX}final_norm.weight", bf16)
+    f = f"{DFLY_PREFIX}mtp_fusion"
+    for norm in ("enorm", "hnorm"):
+        yield f"dfly.fusion.{norm}.weight", r.take(f"{f}.{norm}.weight", bf16)
+    yield "dfly.fusion.eh_proj.weight", r.linear(f"{f}.eh_proj")
+    yield "dfly.fusion.gate", r.take(f"{f}.gate", bf16)
+    c = f"{DFLY_PREFIX}hidden_correction"
+    for norm in ("hidden_norm", "embed_norm"):
+        yield f"dfly.hidden_correction.{norm}.weight", r.take(f"{c}.{norm}.weight", bf16)
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        yield f"dfly.hidden_correction.{proj}.weight", r.linear(f"{c}.{proj}")
+
+
+class _DictSource(TensorSource):
+    """Tensors already in memory (the FTW's drafter entries) behind the reader interface."""
+
+    def __init__(self, tensors: dict[str, torch.Tensor]):
+        super().__init__()
+        self._t = tensors
+
+    def keys(self) -> list[str]:
+        return list(self._t)
+
+    def _tensor(self, name: str) -> torch.Tensor:
+        return self._t[name]
+
+
+def ftw_side_tensors(model_path: str) -> Iterator[tuple[str, torch.Tensor, str]]:
+    """ft checkpoint hook: the drafter as FTW kind ``dfly``, checkpoint names and raw bytes (FP8 stays
+    FP8). ``iter_ftw_extra`` maps and slices it at serve time, so the FTW stays TP-agnostic."""
+    src = CheckpointSource(model_path)
+    try:
+        for name in sorted(k for k in src.keys() if k.startswith(DFLY_PREFIX)):
+            yield name, src.get(name), DFLY_FTW_KIND
+    finally:
+        src.close()
+
+
+def ftw_side_owns(name: str) -> bool:
+    """Dense-stream names ``ftw_side_tensors`` stores instead (a ``--mtp on`` conversion builds the
+    drafter, and the replay must not see it twice)."""
+    return name.startswith("dfly.")
+
+
+def iter_ftw_extra(model_path: str, config, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """FTW replay hook: the drafter, stored under its checkpoint names as kind ``dfly`` (added
+    next to the converted FTW), mapped and sliced for this rank. Nothing unless it is built."""
+    from freetoken.checkpoint.ftw import iter_ftw_weights
+
+    args: Hy4Args = config.hy4_args
+    if not args.dfly_enabled:
+        return
+    tensors = {k: v.clone() for k, v in iter_ftw_weights(model_path, kinds=(DFLY_FTW_KIND,))}
+    if not tensors:
+        raise FileNotFoundError(
+            f"{model_path}: --mtp on needs the DFly2 drafter, but the FTW has no {DFLY_FTW_KIND!r} entries"
+        )
+    src = _DictSource(tensors)
+    tp = get_tp_info()
+    for name, w in _iter_dfly(_DenseReader(src, device), args):
+        yield name, tp_shard_key(name, w, tp)
+    unread = sorted(k for k in tensors if classify(k, config.num_layers, True) == "dense" and k not in src.reads)
+    if unread:
+        raise ValueError(f"FTW drafter entries left unread: {unread[:8]}")
+
+
+def _check_consumed(src: TensorSource, num_layers: int, dfly: bool = False) -> None:
+    expected = {k for k in src.keys() if classify(k, num_layers, dfly) == "dense"}
     unread = sorted(expected - set(src.reads))
     stray = sorted(k for k, n in src.reads.items() if k not in expected or n != 1)
     if unread or stray:
@@ -434,7 +536,8 @@ def _check_consumed(src: TensorSource, num_layers: int) -> None:
             f"{len(stray)} read off-plan or more than once {stray[:8]}"
         )
     skipped = Counter(
-        why for k in src.keys() for prefix, why in SKIP_PREFIXES if k.startswith(prefix)
+        why for k in src.keys() for prefix, why in SKIP_PREFIXES
+        if k.startswith(prefix) and classify(k, num_layers, dfly) == "skip"
     )
     for why, n in sorted(skipped.items()):
         logger.info("hy4 reader: skipped %d tensors: %s", n, why)
@@ -761,6 +864,7 @@ __all__ = [
     "engram_sources",
     "engram_table_sources",
     "expert_quantization_config",
+    "iter_ftw_extra",
     "iter_dense",
     "iter_expert_chunks",
     "iter_expert_pieces",

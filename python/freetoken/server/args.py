@@ -95,6 +95,7 @@ _ENV_FLAG_VALUE = {
     "ngram_spec_max_draft": "FREETOKEN_NGRAM_SPEC_MAX_DRAFT",
     "ngram_spec_min_match": "FREETOKEN_NGRAM_SPEC_MIN_MATCH",
     "ngram_spec_policy": "FREETOKEN_NGRAM_SPEC_POLICY",
+    "dfly_draft_tokens": "FREETOKEN_DFLY_DRAFT_TOKENS",
 }
 
 
@@ -787,6 +788,10 @@ def parse_args(
                              "acceptance say it pays; always: verify every proposal; fixed / "
                              "fixed-null: every step a full-width round, drafts padded (exactness "
                              "diagnostics).")
+    parser.add_argument("--dfly-draft-tokens", type=int, choices=range(1, 6), default=None,
+                        dest="dfly_draft_tokens", metavar="{1..5}",
+                        help="Hy4-flash DFly2 drafter (--mtp on): drafts verified per round "
+                             "(default 2; 3-5 pay only on copy-heavy text).")
     parser.add_argument("--dspark-k", type=int, default=None, dest="dspark_k",
                         help="DSpark draft chain length k (default: the draft block size).")
     parser.add_argument("--mamba-ssm-dtype", choices=["float32", "bfloat16", "float16"], default=None,

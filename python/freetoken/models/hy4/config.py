@@ -44,6 +44,11 @@ SERVE_DEFAULTS = {
 }
 
 
+def dfly_requested() -> bool:
+    """``--mtp on`` (the env gate every draft head reads)."""
+    return os.environ.get("FREETOKEN_ENABLE_MTP", "") == "1"
+
+
 def swa_ring_enabled() -> bool:
     return os.environ.get(SWA_RING_ENV, "1").strip() not in ("", "0")
 
@@ -65,6 +70,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
     args = replace(load_args(hf_config), swa_ring=swa_ring_enabled())
     text = getattr(hf_config, "text_config", hf_config)
     num_layers = max_layers(args.num_layers)
+    dfly = dfly_requested() and args.dfly_num_layers > 0 and max(args.dfly_target_layers) < num_layers
+    args = replace(args, dfly_enabled=dfly)
 
     indexed_ids = tuple(i for i in args.indexed_layer_ids if i < num_layers)
     rotary_config = RotaryConfig(
@@ -129,6 +136,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         vision_config=None,  # text-only; vit.* is skipped by the reader
         image_token_id=args.image_token_id,
         hy4_args=args,
+        # the FTW replay keeps the drafter's tensors only when it is built
+        mtp_enabled=dfly,
         prefill_workspace=PREFILL_WORKSPACE,
         default_max_seq_len=min(DEFAULT_CONTEXT, args.max_position),
     )

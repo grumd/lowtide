@@ -34,6 +34,7 @@ def _mgr(k=7, anchor=None, image=None, interval=64, mode="always", off_file=None
     m._mode_file, m._off_file, m._mode_next, m._paused_flag, m._tp = mode_file, off_file, None, False, False
     m._image_token_id = image
     m.policy = DraftPolicy(k + 1)
+    m._init_sources(True, None, 0)
     return m
 
 
@@ -414,3 +415,75 @@ def test_policy_prices_only_adopted_costs():
     rank1.observe_cost(2, 500.0)  # measured after the sync point: not priced yet
     assert [rank0.choose(*g) for g in grid] == [rank1.choose(*g) for g in grid]
     assert rank0.choose(7, match=30) == 7
+
+
+# ---------------------------------------------------------------- the DFly2 drafter as a source
+
+
+def _dfly_mgr(k=7, dfly_k=5, **kw):
+    m = _mgr(k=k, mode="adaptive", **kw)
+    m._init_sources(True, object(), dfly_k)
+    return m
+
+
+def test_dfly_drafts_where_the_lookup_has_nothing():
+    from freetoken.scheduler.ngram_spec import DFLY
+
+    m = _dfly_mgr()
+    r = _req(list(range(1, 9)))  # no repeat
+    m._dfly_pos[r.uid] = r.cached_len
+    assert m.plan_one(r) == (r, [0] * 5, DFLY)
+    r.remain_len = 3
+    assert m.plan_one(r)[1] == [0, 0]
+    # kept state from an older length (a plain step not exported yet): a plain step first
+    m._dfly_pos[r.uid] = r.cached_len - 1
+    assert m.plan_one(r) is None
+    # a lookup proposal the policy takes wins
+    m = _dfly_mgr(k=7)
+    m._set_mode("always")
+    r = _req(_IDS)
+    m._dfly_pos[r.uid] = r.cached_len
+    _, drafts, match = m.plan_one(r)
+    assert drafts == [4, 5, 6, 7, 8, 9, 10] and match == 3
+    # DFly2 alone (--mtp on without --ngram-spec): the lookup never proposes
+    m._init_sources(False, object(), 5)
+    m._dfly_pos[r.uid] = r.cached_len
+    assert m.plan_one(r)[2] == DFLY
+
+
+def test_publish_keeps_the_drafter_state_of_the_last_committed_row():
+    """After a round the drafter's next source is the verify row of the last committed token
+    (row a of the request's k + 1), kept for the request's new length."""
+    m = _dfly_mgr(k=3, dfly_k=3)
+    kept = []
+    m.engine = SimpleNamespace(
+        device=torch.device("cpu"), linear_state_pool=None,
+        model=SimpleNamespace(
+            commit_mtp_verify=lambda pool, slots, lens: None,
+            dfly_keep=lambda slots, rows: kept.append((slots.tolist(), rows.tolist())),
+        ),
+    )
+    m._req_stats, m.stats_rounds, m.stats_drafted, m.stats_accepted, m._a_hist = {}, 0, 0, 0, [0] * 4
+    m._rounds_logged = 0
+    sched = m.sched
+    sched.cache_manager.rollback_last = lambda r, keep: None
+    sched.token_pool = torch.zeros(4, 64, dtype=torch.int32)
+    sched.eos_token_ids, sched.toolcall_anchor_id = {99}, None
+    sched.decode_manager = SimpleNamespace(remove_req=lambda r: None)
+    sched.send_result = lambda reply: None
+    sched._kv_usage_pages = lambda: (0, 0)
+    sched._mamba_slot_usage = lambda: None
+    sched._swa_token_usage = lambda: None
+    sched._gpu_mem_bytes = lambda: 0
+    reqs = []
+    for uid, slot in ((1, 2), (2, 3)):
+        buf = torch.arange(64, dtype=torch.int32)
+        r = _Req(uid=uid, table_idx=slot, linear_slot_idx=None, _ids_buf=buf, input_ids=buf[:14], cached_len=10,
+                 device_len=14, sampling_params=SimpleNamespace(ignore_eos=False, stop_strs=None),
+                 output_budget_exhausted=False, toolcall_anchor_len=None)
+        r.append_host = (lambda r, buf: lambda t: setattr(r, "input_ids", buf[: r.input_ids.numel() + 1]))(r, buf)
+        reqs.append(r)
+    m._publish(reqs, [10, 10], 3, [[11, 12, 50], [11, 40, 41]], [3, 3], [2, 1], [13, 12], [True, True])
+    assert kept == [([2, 3], [2, 4 + 1])]
+    assert m._dfly_pos == {1: 13, 2: 12} and [r.cached_len for r in reqs] == [13, 12]
+    assert m.src_stats["dfly"] == [2, 6, 3]

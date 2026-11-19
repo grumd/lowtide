@@ -247,6 +247,17 @@ def side_table_files(model_path: str) -> list[str]:
         return []
 
 
+def ftw_side_tensors(model_path: str):
+    """A family's tensors that an FTW stores under their own kind instead of the dense stream
+    (Hy4's DFly2 drafter): ``(owns, iterator of (name, tensor, kind))``, where ``owns(name)`` marks
+    the dense-stream names they replace; ``(None, None)`` when the family has none."""
+    _config, spec = _spec_for_model_path(model_path)
+    fn = _model_override(spec, "ftw_side_tensors")
+    if fn is None:
+        return None, None
+    return _model_override(spec, "ftw_side_owns"), fn(model_path)
+
+
 def load_weight(
     model_path: str,
     device: torch.device,
@@ -337,6 +348,14 @@ def _load_weight_inner(
             if _shard_fn is not None and _tp.size > 1:
                 tensor = _shard_fn(name, tensor, model_path, _tp)
             yield name, tensor
+        if mtp_on:
+            # a draft head stored as its own FTW kind (Hy4's DFly2), already sliced per rank
+            try:
+                _extra = _load_attr(_spec.module, "iter_ftw_extra")
+            except AttributeError:
+                _extra = None
+            if _extra is not None:
+                yield from _extra(model_path, _cfg, device)
         return
 
     _config, spec = _spec_for_model_path(model_path)

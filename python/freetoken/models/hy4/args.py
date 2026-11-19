@@ -92,6 +92,13 @@ class Hy4Args:
     # ---- KV pool ----
     # sliding layers keep only their window in a page-bound window tier (kvcache/hy4_pool.py)
     swa_ring: bool = True
+    # ---- DFly2 drafter (top-level dfly_* keys, SPEC section 11) ----
+    dfly_num_layers: int = 0
+    # draft layer i reads target layer dfly_target_layers[i]'s latents and index selection
+    dfly_target_layers: Tuple[int, ...] = ()
+    dfly_mask_token_id: int = -1
+    # built and served for this run (--mtp on; config.parse_config)
+    dfly_enabled: bool = False
 
     @property
     def num_layers(self) -> int:
@@ -190,6 +197,34 @@ def _engram_sizes(text: Any, layer_ids: Tuple[int, ...], orders: int, heads: int
             )
         out.append(tuple(int(v) for order in sizes for v in order))
     return tuple(out)
+
+
+def _dfly(hf_config: Any, layer_types: Tuple[str, ...], candidate_topk: int) -> dict:
+    """The drafter geometry, or none when the checkpoint ships no drafter or one this port does
+    not implement (SPEC 11.1: slot0 fusion, hidden correction, no extra local window, the
+    target's own selection on the layers it reads)."""
+    n = int(_get(hf_config, "dfly_num_hidden_layers", 0) or 0)
+    if n <= 0:
+        return {}
+    targets = tuple(int(i) for i in (_get(hf_config, "dfly_target_kv_layers", None) or ()))
+    index = tuple(int(i) for i in (_get(hf_config, "dfly_target_index_layer", None) or targets))
+    window = _get(hf_config, "dfly_context_local_window", None)
+    supported = (
+        len(targets) == n
+        and index == targets
+        and all(0 <= i < len(layer_types) and layer_types[i] == INDEXED for i in targets)
+        and _get(hf_config, "dfly_mtp_fusion", "slot0") == "slot0"
+        and bool(_get(hf_config, "dfly_enable_hidden_correction", True))
+        and not window
+        and int(_get(hf_config, "dfly_target_index_topk", candidate_topk)) == candidate_topk
+    )
+    if not supported:
+        return {}
+    return {
+        "dfly_num_layers": n,
+        "dfly_target_layers": targets,
+        "dfly_mask_token_id": int(_get(hf_config, "dfly_mask_token_id", -1)),
+    }
 
 
 def load_args(hf_config: Any) -> Hy4Args:
@@ -298,6 +333,8 @@ def load_args(hf_config: Any) -> Hy4Args:
         image_token_id=_get(hf_config, "image_token_id", None),
         video_token_id=_get(hf_config, "video_token_id", None),
         dense_fp8=bool(_get(hf_config, DENSE_FP8_KEY, True)),
+        **_dfly(hf_config, layer_types, int(_get(text, "compressed_indexer_group_topk", 512))
+                * int(_get(text, "compressed_indexer_compress_ratio", 4))),
     )
 
 

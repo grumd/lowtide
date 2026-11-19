@@ -26,6 +26,13 @@ in-flight token is guessed); only then is the step drained early and a real prop
 ordinary text pays one dictionary lookup per step. A window never commits past the next
 decode snapshot boundary, so the hybrid prefix cache keeps its reuse points.
 
+With Hy4-flash's DFly2 drafter (``--mtp on``) a request that has no lookup proposal the policy takes
+gets the drafter's ``--dfly-draft-tokens`` drafts instead, every round: greedy drafts are a point
+mass, so the acceptance above stays the exact rule. The drafter reads the target's state at the
+last accepted row, which every target forward exports (``keep_draft_state`` for prefill / decode,
+``_publish`` for a round); a request whose kept state is not at its current length takes a plain
+step first.
+
 Under TP every rank runs this manager and the rounds are collectives, so every rank must plan
 the same windows. The plan depends only on host state all ranks share (ids, lengths, accepted
 counts) plus the policy's priced costs and the diagnostics files, which rank 0 sends along with
@@ -276,7 +283,8 @@ class DraftPolicy:
         )
 
 
-Plan = Tuple[Req, List[int], int]  # (request, drafts, match length)
+Plan = Tuple[Req, List[int], int]  # (request, drafts, match length; DFLY = drafter)
+DFLY = -1
 MODES = ("adaptive", "always", "fixed", "fixed-null")
 
 
@@ -292,6 +300,10 @@ class NgramSpecManager:
         self.engine = sched.engine
         self.enabled = True
         self.k = max(1, int(ENV.NGRAM_SPEC_MAX_DRAFT.value))
+        getter = getattr(self.engine.model, "dfly_drafter", None)
+        # prompt lookup on (--ngram-spec); off when only the DFly2 drafter brought the manager up
+        self._init_sources(bool(ENV.NGRAM_SPEC), getter() if callable(getter) else None,
+                           int(ENV.DFLY_DRAFT_TOKENS.value))
         # a longer window would get hybrid-radix track metadata the GDN verify never writes
         assert self.k + 1 <= CHUNK_SIZE, f"--ngram-spec-max-draft + 1 must fit one GDN chunk ({CHUNK_SIZE})"
         self.min_match = max(3, int(ENV.NGRAM_SPEC_MIN_MATCH.value))
@@ -312,13 +324,26 @@ class NgramSpecManager:
         self.stats_accepted = 0
         self.stats_rounds = 0
         self._rounds_logged = 0
-        self._a_hist = [0] * (self.k + 1)
+        self._a_hist = [0] * (max(self.k, self.dfly_k) + 1)
         self._last_plain_t: float | None = None
         self._debug = os.environ.get("FREETOKEN_NGRAM_SPEC_DEBUG") == "1"
-        logger.info_rank0(
-            f"n-gram speculative decoding: drafts up to {self.k} tokens from context repeats of "
-            f">= {self.min_match} tokens, policy {self.mode}"
-        )
+        if self.lookup:
+            logger.info_rank0(
+                f"n-gram speculative decoding: drafts up to {self.k} tokens from context repeats of "
+                f">= {self.min_match} tokens, policy {self.mode}"
+            )
+        if self.dfly is not None:
+            logger.info_rank0(f"DFly2 speculative decoding: {self.dfly_k} drafts per round")
+
+    def _init_sources(self, lookup: bool, dfly, dfly_k: int) -> None:
+        self.lookup = lookup
+        self.dfly = dfly
+        self.dfly_k = min(5, max(1, dfly_k)) if dfly is not None else 0
+        self._dfly_pos: Dict[int, int] = {}  # uid -> cached_len its kept drafter state is for
+        # per draft source: rounds, drafted, accepted; drafter forward ms
+        self.src_stats = {"ngram": [0, 0, 0], "dfly": [0, 0, 0]}
+        self._dfly_hist = [0] * (self.dfly_k + 1)
+        self.dfly_ms = 0.0
 
     def _set_mode(self, mode: str) -> None:
         self.mode = mode
@@ -337,7 +362,8 @@ class NgramSpecManager:
         d = self._drafters.get(r.uid)
         if d is None:
             d = self._drafters[r.uid] = SuffixDrafter(self.min_match)
-            self._req_stats[r.uid] = [0, 0, 0, 0]
+            # rounds, drafted, accepted, round tokens; then the drafter's rounds, drafted, accepted
+            self._req_stats[r.uid] = [0, 0, 0, 0, 0, 0, 0]
             if self._mode_next is not None and self._mode_next != self.mode:
                 logger.info_rank0(f"ngram-spec policy -> {self._mode_next}")
                 self._set_mode(self._mode_next)
@@ -394,6 +420,12 @@ class NgramSpecManager:
             if not self.eligible(r):
                 continue
             if r in flying:
+                if self._dfly_on() and r.remain_len >= 3:
+                    # the in-flight step keeps the drafter state current
+                    out.append(r)
+                    continue
+                if not self.lookup:
+                    continue
                 drafts, match = self._drafter(r).propose(self.k + 1)
                 if len(drafts) >= 2 and (self.always or self.policy.choose(len(drafts) - 1, match, probe=False)):
                     out.append(r)
@@ -422,14 +454,23 @@ class NgramSpecManager:
             k = min(k, (r.cached_len // interval + 1) * interval - r.cached_len - 1)
         if k <= 0:
             return None
-        drafts, match = self._drafter(r).propose(k)
-        drafts = self._truncate(drafts)
-        if not drafts:
-            return None
-        n = len(drafts) if self.always else self.policy.choose(len(drafts), match, probe)
-        if n <= 0:
-            return None
-        return (r, drafts[:n], match)
+        if self.lookup:
+            drafts, match = self._drafter(r).propose(k)
+            drafts = self._truncate(drafts)
+            if drafts:
+                n = len(drafts) if self.always else self.policy.choose(len(drafts), match, probe)
+                if n > 0:
+                    return (r, drafts[:n], match)
+        if self._dfly_on():
+            n = min(k, self.dfly_k)
+            if self._dfly_pos.get(r.uid) != r.cached_len:
+                return None
+            # placeholders: run_plans drafts them
+            return (r, [0] * n, DFLY)
+        return None
+
+    def _dfly_on(self) -> bool:
+        return self.dfly is not None
 
     def _truncate(self, drafts: List[int]) -> List[int]:
         """Image placeholders never come from the model; a tool-call opener ends the window so a
@@ -453,12 +494,17 @@ class NgramSpecManager:
                 self._drafter(r)
         for uid in [u for u in self._drafters if u not in live]:
             del self._drafters[uid]
-            rounds, drafted, accepted, toks = self._req_stats.pop(uid, [0, 0, 0, 0])
+            self._dfly_pos.pop(uid, None)
+            rounds, drafted, accepted, toks, d_rounds, d_drafted, d_accepted = self._req_stats.pop(uid, [0] * 7)
             if rounds:
+                dfly = (
+                    f"; dfly {d_rounds} rounds, {d_drafted} drafted, {d_accepted} accepted "
+                    f"({d_accepted / max(1, d_rounds):.2f} per round)" if d_rounds else ""
+                )
                 logger.info_rank0(
                     f"ngram-spec request {uid}: {rounds} rounds, {drafted} drafted, {accepted} accepted "
                     f"(rate {accepted / max(1, drafted):.2f}, {accepted / rounds:.2f} per round), "
-                    f"{toks} tokens from rounds"
+                    f"{toks} tokens from rounds{dfly}"
                 )
 
     # ------------------------------------------------------------- scheduler hooks
@@ -484,6 +530,10 @@ class NgramSpecManager:
     def run_plans(self, plans: List[Plan]) -> None:
         """One synchronous round over ``plans``; requests with another proposal right after it
         skip this iteration's plain decode step (the next iteration's round takes them)."""
+        if any(m == DFLY for _, _, m in plans):
+            plans = self._draft(plans)
+            if not plans:
+                return
         t0 = time.perf_counter()
         width = 1 + max(len(d) for _, d, _ in plans)
         a_list = self._round(plans)
@@ -498,6 +548,41 @@ class NgramSpecManager:
         self._last_plain_t = None
         reqs = [r for r, _, _ in plans if r in self.sched.decode_manager.running_reqs]
         self._deferred = {r for r in reqs if self.plan_one(r, probe=False) is not None}
+
+    def _draft(self, plans: List[Plan]) -> List[Plan]:
+        """Fill the drafter's placeholder plans with its greedy drafts (one block pass for all)."""
+        eng = self.engine
+        dev = eng.device
+        t0 = time.perf_counter()
+        idx = [i for i, (_, _, m) in enumerate(plans) if m == DFLY]
+        reqs = [plans[i][0] for i in idx]
+        k = max(len(plans[i][1]) for i in idx)
+        host = torch.tensor(
+            [[r.table_idx, int(r.input_ids[r.cached_len]), r.cached_len] for r in reqs], dtype=torch.int64,
+        ).pin_memory().to(dev, non_blocking=True)
+        drafts = eng.model.dfly_draft(host[:, 0], host[:, 1].to(torch.int32), host[:, 2], k).tolist()
+        self.dfly_ms += (time.perf_counter() - t0) * 1e3
+        if self._debug:  # every rank: TP ranks must draft the same tokens
+            logger.info(f"dfly drafts: {[(r.uid, r.cached_len, d) for r, d in zip(reqs, drafts)]}")
+        out = list(plans)
+        for j, i in enumerate(idx):
+            r, d, _ = plans[i]
+            out[i] = (r, self._truncate(drafts[j][: len(d)]), DFLY)
+        return [p for p in out if p[1]]
+
+    def keep_draft_state(self, batch) -> None:
+        """After a target prefill / decode forward (engine stream): each request keeps its row's
+        final hidden and selections for its next draft."""
+        if self.dfly is None or not batch.reqs:
+            return
+        reqs = batch.reqs
+        slots = torch.tensor([r.table_idx for r in reqs], dtype=torch.int64).pin_memory()
+        self.engine.model.dfly_keep(
+            slots.to(self.engine.device, non_blocking=True),
+            torch.arange(len(reqs), device=self.engine.device),
+        )
+        for r in reqs:
+            self._dfly_pos[r.uid] = r.cached_len
 
     def note_plain_step(self, single: bool) -> None:
         """Overlap loop, after a plain decode step launched: the time between two consecutive
@@ -551,8 +636,9 @@ class NgramSpecManager:
 
         a_list, bonus_list = self._accept(reqs, logits, drafts, real, k, dev)
         for (_, d, match), a in zip(plans, a_list):
-            self.policy.observe_round(len(d), a, match)
-        self._publish(reqs, C, k, drafts, real, a_list, bonus_list)
+            if match != DFLY:
+                self.policy.observe_round(len(d), a, match)
+        self._publish(reqs, C, k, drafts, real, a_list, bonus_list, [m == DFLY for _, _, m in plans])
         return a_list
 
     def _accept(self, reqs, logits, drafts, real, k, dev):
@@ -587,7 +673,7 @@ class NgramSpecManager:
             bonus_list.append(int(bonus))
         return a_list, bonus_list
 
-    def _publish(self, reqs, C, k, drafts, real, a_list, bonus_list) -> None:
+    def _publish(self, reqs, C, k, drafts, real, a_list, bonus_list, from_dfly=None) -> None:
         """Publish accepted drafts + bonus, roll back the rejected pages, commit the accepted
         prefix into the GDN / PLE slots (same bookkeeping as ``MTPManager.finish_round``)."""
         sched, eng = self.sched, self.engine
@@ -640,11 +726,22 @@ class NgramSpecManager:
             r.input_ids = r._ids_buf[:keep_to]
             plans.append((r, rext_end, keep_to, finished, bonus_published))
             st = self._req_stats.get(r.uid)
+            dfly = bool(from_dfly and from_dfly[i])
             if st is not None:
                 st[0] += 1
                 st[1] += real[i]
                 st[2] += a
                 st[3] += rext_end - C[i] + (1 if bonus_published else 0) - 1
+                if dfly:
+                    st[4] += 1
+                    st[5] += real[i]
+                    st[6] += a
+            src = self.src_stats["dfly" if dfly else "ngram"]
+            src[0] += 1
+            src[1] += real[i]
+            src[2] += a
+            if dfly:
+                self._dfly_hist[min(a, self.dfly_k)] += 1
             self.stats_rounds += 1
             self.stats_drafted += real[i]
             self.stats_accepted += a
@@ -666,6 +763,16 @@ class NgramSpecManager:
                     torch.tensor(slots, dtype=torch.int32).to(dev, non_blocking=True),
                     torch.tensor(lens, dtype=torch.int32).to(dev, non_blocking=True),
                 )
+        if self.dfly is not None:
+            # the drafter's next source row: the verify row of the last committed token
+            rows = [i * (k + 1) + p[1] - C[i] - 1 for i, p in enumerate(plans)]
+            slots = [r.table_idx for r, *_ in plans]
+            eng.model.dfly_keep(
+                torch.tensor(slots, dtype=torch.int64).to(dev, non_blocking=True),
+                torch.tensor(rows, dtype=torch.int64).to(dev, non_blocking=True),
+            )
+            for r, rext_end, *_ in plans:
+                self._dfly_pos[r.uid] = rext_end
         for r, rext_end, keep_to, finished, _bp in plans:
             r.cached_len = rext_end
             if finished:
@@ -691,11 +798,18 @@ class NgramSpecManager:
         if self._rounds_logged >= 100:
             self._rounds_logged = 0
             ran = max(1, sum(self._a_hist))
-            cond = " ".join(f"a>={j}:{sum(self._a_hist[j:]) / ran:.2f}" for j in range(1, self.k + 1))
+            cond = " ".join(f"a>={j}:{sum(self._a_hist[j:]) / ran:.2f}" for j in range(1, len(self._a_hist)))
+            dfly = ""
+            if self.dfly is not None:
+                d = self.src_stats["dfly"]
+                dfly = (
+                    f" | dfly {d[0]} rounds, {d[2] / max(1, d[0]):.2f} accepted per round, hist {self._dfly_hist}, "
+                    f"draft {self.dfly_ms / max(1, d[0]):.1f} ms/round"
+                )
             logger.info_rank0(
                 f"ngram-spec: {self.stats_rounds} rounds, drafted {self.stats_drafted}, accepted "
                 f"{self.stats_accepted} (rate {self.stats_accepted / max(1, self.stats_drafted):.2f}) | "
-                f"{cond} | cost ms {self.policy.cost_table()}"
+                f"{cond} | cost ms {self.policy.cost_table()}{dfly}"
             )
 
 

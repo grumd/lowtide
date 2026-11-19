@@ -160,6 +160,7 @@ With `--moe-strategy offload` (the default for MoE models), GPU decode and an MH
 | `--[no-]mtp-head-fp8` | on | Quantize the bf16 MTP draft head to fp8 per row at load |
 | `--dspark-verify` | decode | DeepSeek-V4.1 DSpark verify path: `decode` aligns the attention reduction with plain decode; `prefill` keeps the ascending-window extend. Inert without the DSpark draft head |
 | `--dspark-k` | draft block size | DSpark draft chain length |
+| `--dfly-draft-tokens` | 2 | Hy4-flash's DFly2 drafter (`--mtp on`): drafts verified per round, 1-5. Longer drafts pay only on copy-heavy text (code edits, tool calls); on prose 4-5 is slower than plain decode. Greedy drafts from one block pass over the target's cached latents; the verify is `--ngram-spec`'s (lossless, not bit-identical to plain decode). With `--ngram-spec` a lookup proposal the policy takes is verified instead. The FTW needs the drafter's tensors (FTW kind `dfly`) |
 | `--[no-]ngram-spec` | off | Prompt-lookup speculative decoding without a draft head: verify the continuation of an earlier repeat of the request's context (code edits, quoted input, tool-call JSON) where the measured round cost and acceptance say it pays. Lossless: every emitted token is the target's argmax (greedy) or a sample of the target distribution, computed by the verify window (not bit-identical to plain decode). Verify CUDA graphs per window width cost ~240 MB of VRAM. For models without a draft head; a served MTP head drafts instead (upstream's `--mtp-ngram` overrides its chain with a simple n-gram match) |
 | `--ngram-spec-max-draft` | 7 | Longest `--ngram-spec` draft (the verify window is one token longer) |
 | `--ngram-spec-min-match` | 3 | Shortest context repeat, in tokens, a draft is taken from |
@@ -278,7 +279,8 @@ ft checkpoint --model <hf_dir> --out <ftw_dir> [options]
 
 Converts an HF safetensors checkpoint to FTW, FreeToken's self-contained
 fast-load format; point `ft serve --model` at the output dir. The FTW carries
-everything the source had (including the draft head), so the server replays it
+everything the source had (including the draft head; Hy4-flash's DFly2 drafter is stored
+under FTW kind `dfly` and loaded with `ft serve --mtp on`), so the server replays it
 without re-reading the HF shards. See the FTW caveats in
 [models.md](models.md#notes).
 

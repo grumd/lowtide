@@ -70,9 +70,11 @@ def test_flat_text_config_parses_like_the_wrapper():
     wrapped = parsed_config(moe_strategy="fused")
     assert flat.architectures == ["HYV4FlashForCausalLM"]
     assert flat.attention_groups == wrapped.attention_groups
-    # the image/video ids live on the wrapper only
+    # the image/video ids and the drafter's dfly_* keys live on the wrapper only
     assert (flat.hy4_args.image_token_id, flat.hy4_args.video_token_id) == (None, None)
-    no_ids = dict(image_token_id=None, video_token_id=None)
+    assert flat.hy4_args.dfly_num_layers == 0 and wrapped.hy4_args.dfly_target_layers == (25, 29, 33, 37, 41)
+    no_ids = dict(image_token_id=None, video_token_id=None, dfly_num_layers=0, dfly_target_layers=(),
+                  dfly_mask_token_id=-1)
     assert dataclasses.replace(flat.hy4_args, **no_ids) == dataclasses.replace(wrapped.hy4_args, **no_ids)
 
 

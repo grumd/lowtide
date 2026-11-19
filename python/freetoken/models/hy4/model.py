@@ -167,6 +167,68 @@ class Hy4ForCausalLM(BaseLLMModel):
             quant_config=config.quant,
             prefix="lm_head",
         )
+        self.dfly = None
+        if config.hy4_args.dfly_enabled:
+            from .dfly import Hy4DFly
+
+            self.dfly = Hy4DFly(config)
+        self._dfly_tap = None
+        self._dfly_graphs = None
+
+    # ----- DFly2 drafter --------------------------------------------------------------------
+    def dfly_drafter(self):
+        """The drafter when this serve builds it (``--mtp on``), else None."""
+        return self.dfly
+
+    def setup_draft_buffers(self, rows: int, slots: int, device: torch.device) -> None:
+        """Before any graph capture: the static target-row export the drafter reads (``rows``
+        = the most rows one forward hands over, ``slots`` = request table rows)."""
+        if self.dfly is None:
+            return
+        from .dfly import DFlyTap
+
+        args = self._config.hy4_args
+        self._dfly_tap = DFlyTap(
+            self.dfly.target_layers, args.hidden_size, args.candidate_topk, rows, slots, device
+        )
+        get_global_ctx().attn_backend.dfly_tap = self._dfly_tap
+
+    def dfly_keep(self, slots: torch.Tensor, rows: torch.Tensor) -> None:
+        self._dfly_tap.keep(slots, rows)
+
+    def capture_draft_graphs(self, bs_list, max_k: int, pad_slot: int, device, stream, pool) -> None:
+        """With the verify graphs: the draft for every batch size and draft count 1..``max_k``."""
+        if self.dfly is None:
+            return
+        from .dfly import DFlyGraphs
+
+        self._dfly_graphs = DFlyGraphs(
+            self._dfly_eager, bs_list, range(1, max_k + 1), pad_slot, device, stream, pool
+        )
+
+    def dfly_draft(self, slots: torch.Tensor, bonus: torch.Tensor, anchor: torch.Tensor, k: int) -> torch.Tensor:
+        """``k`` drafts per request ``[n, k]`` int32 from the state kept in table rows ``slots``,
+        each block starting with the pending token ``bonus`` at position ``anchor``."""
+        graphs = self._dfly_graphs
+        if graphs is not None and graphs.can_use(slots.shape[0], k):
+            return graphs.run(slots, bonus, anchor, k)
+        return self._dfly_eager(slots, bonus, anchor, k)
+
+    def _dfly_eager(self, slots: torch.Tensor, bonus: torch.Tensor, anchor: torch.Tensor, k: int) -> torch.Tensor:
+        tap = self._dfly_tap
+        return self.dfly.forward(
+            self.model.embed_tokens, self.lm_head, bonus, anchor,
+            tap.hidden.index_select(0, slots), tap.sel.index_select(1, slots), k,
+        )
+
+    def _export_hidden(self, out: torch.Tensor) -> None:
+        tap = self._dfly_tap
+        if tap is None:
+            return
+        batch = get_global_ctx().batch
+        if batch.is_prefill and not getattr(batch, "mtp_verify", False):
+            out = out[batch.attn_metadata.get_last_indices(batch.size)]
+        tap.put_hidden(out)
 
     def load_host_tables(self, engine_config) -> int:
         """Open the Engram row tables in place (page-cached reads; only staging is pinned) and
@@ -193,15 +255,20 @@ class Hy4ForCausalLM(BaseLLMModel):
         the checkpoint layout (glm_moe_dsa precedent)."""
         for layer in self.model.layers.op_list:
             layer.self_attn.prepare_for_runtime()
+        if self.dfly is not None:
+            self.dfly.prepare_for_runtime()
         torch.cuda.empty_cache()
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
+        self._export_hidden(output)
         return self.lm_head.forward(output)
 
     def forward_logits_all(self) -> torch.Tensor:
         """Every forwarded row's fp32 logits [T, vocab] (speculative verify), no last-row selection."""
-        return self.lm_head.forward_all(self.model.forward(get_global_ctx().batch.input_ids))
+        output = self.model.forward(get_global_ctx().batch.input_ids)
+        self._export_hidden(output)
+        return self.lm_head.forward_all(output)
 
     def select_verify_width(self, t: int) -> None:
         """After a captured verify of width ``t`` (no Python ran): its stash is the one to commit."""

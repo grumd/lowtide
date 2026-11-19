@@ -172,3 +172,33 @@ def test_offload_walk_sees_each_moe_layer_once():
     assert len(layers) == config.num_moe_layers == 41
     assert len({id(layer) for layer in layers}) == 41
     assert [layer._layer_id for layer in model.model._engram_layers] == [1, 11, 21, 31]
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_dfly_drafter_tensors_fill_the_drafter(monkeypatch, tp):
+    """--mtp on: the drafter's 117 tensors are consumed (confidence head skipped), every drafter
+    parameter gets one tensor of its shape, and at TP=2 the FP8 slices keep whole scale blocks."""
+    from freetoken.distributed import DistributedInfo, get_tp_info
+    from freetoken.distributed import info as tp_info
+    from freetoken.models.hy4.weight import ftw_side_owns, tp_shard_key
+
+    monkeypatch.setenv("FREETOKEN_ENABLE_MTP", "1")
+    config = parsed_config()
+    assert config.hy4_args.dfly_enabled and config.mtp_enabled
+    entries = listing()
+    buckets = {k: classify(k, config.num_layers, True) for k in entries if k.startswith("model.dfly_layers.")}
+    assert Counter(buckets.values()) == {"dense": 115, "skip": 2}
+    src = ListingSource(entries)
+    dense = dict(iter_dense(src, config, META))
+    drafter = {k: v for k, v in dense.items() if k.startswith("dfly.")}
+    assert len(drafter) == 115
+    # a --mtp on conversion drops exactly these from the dense stream (stored as kind "dfly")
+    assert {k for k in dense if ftw_side_owns(k)} == set(drafter)
+    monkeypatch.setattr(tp_info, "_TP_INFO", DistributedInfo(tp - 1, tp))
+    sd = meta_model(config).state_dict()
+    for name, t in drafter.items():
+        t = tp_shard_key(name, t, get_tp_info())
+        assert (tuple(t.shape), t.dtype) == (tuple(sd[name].shape), sd[name].dtype), name
+    assert {k for k in sd if k.startswith("dfly.")} == set(drafter)
+    monkeypatch.delenv("FREETOKEN_ENABLE_MTP")
+    assert not parsed_config().hy4_args.dfly_enabled
