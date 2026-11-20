@@ -88,15 +88,15 @@ needs_checkpoint = [
 ]
 
 
-# --- reference goldens (hy4/golden, written by the transformers reference harness) ------------
+# --- reference goldens (written by the transformers reference harness) ------------------------
 
-# Directory holding tiny.pt, tiny_ckpt/ and realdims/; defaults to the port workspace's copy.
+# Directory holding tiny.pt, tiny_ckpt/ and realdims/.
 GOLDEN_ENV = "FREETOKEN_HY4_GOLDEN"
 
 
 def golden_dir() -> Path | None:
-    path = os.environ.get(GOLDEN_ENV) or str(Path(__file__).resolve().parents[5] / "hy4" / "golden")
-    return Path(path) if os.path.isfile(os.path.join(path, "tiny.pt")) else None
+    path = os.environ.get(GOLDEN_ENV)
+    return Path(path) if path and os.path.isfile(os.path.join(path, "tiny.pt")) else None
 
 
 needs_golden = [

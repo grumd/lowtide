@@ -37,7 +37,6 @@ REQUIRED_LAYERS = (1, 21, 41)
 OPTIONAL_LAYERS = (11, 31)
 LIMIT = 10.0
 VRAM_CAP = 8 << 30
-SCRATCH = Path(__file__).resolve().parents[5] / "hy4" / "tmp" / "step6"
 
 _HAVE_REAL = model_path() is not None and golden_dir() is not None and torch.cuda.is_available()
 needs_real = pytest.mark.skipif(not _HAVE_REAL, reason="needs FREETOKEN_HY4_MODEL, the hy4 goldens and CUDA")
@@ -382,7 +381,7 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
 
 @pytest.mark.needs_weights
 @needs_real
-def test_ftw_round_trip(monkeypatch):
+def test_ftw_round_trip(monkeypatch, tmp_path):
     """``ft checkpoint --expert-quant nvfp4`` (subprocess, FREETOKEN_HY4_MAX_LAYERS=3) vs the reader:
     expert banks and dense tensors bitwise, the config declares NVFP4 on its own, no Engram table
     rides along and the FTW points back at its source for it."""
@@ -399,8 +398,7 @@ def test_ftw_round_trip(monkeypatch):
     from freetoken.moe.legacy_format import canonical_role
     from freetoken.utils import cached_load_hf_config
 
-    out = SCRATCH / "ftw_L3"
-    shutil.rmtree(out, ignore_errors=True)
+    out = tmp_path / "ftw_L3"
     dev = _device()
     env = {**os.environ, "PYTHONPATH": str(Path(freetoken.__file__).resolve().parents[1]),
            MAX_LAYERS_ENV: "3", EXPERT_QUANT_ENV: "bf16"}  # the flag must win over a stray variable
