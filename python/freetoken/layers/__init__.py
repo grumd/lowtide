@@ -7,7 +7,7 @@ from .activation import (
     swiglu_clamp_and_mul,
     swigluoai_and_mul,
 )
-from .base import BaseOP, OPList, StateLessOP
+from .base import BaseOP, OPList, StateLessOP, iter_ops
 from .embedding import ParallelLMHead, VocabParallelEmbedding
 from .linear import (
     LinearColParallelMerged,
@@ -16,12 +16,13 @@ from .linear import (
     LinearReplicated,
     LinearRowParallel,
 )
-from .moe import MoELayer, OffloadMoELayer, make_moe_layer
+from .moe import MoELayer, OffloadMoELayer, iter_moe_layers, make_moe_layer
 from .norm import (
     GatedRMSNorm,
     GemmaPlusOneRMSNorm,
     GemmaPlusOneRMSNormFused,
     GemmaRMSNorm,
+    LayerNorm,
     RMSNorm,
     RMSNormFused,
 )
@@ -38,12 +39,14 @@ __all__ = [
     "BaseOP",
     "StateLessOP",
     "OPList",
+    "iter_ops",
     "VocabParallelEmbedding",
     "ParallelLMHead",
     "LinearColParallelMerged",
     "LinearRowParallel",
     "LinearOProj",
     "LinearQKVMerged",
+    "LayerNorm",
     "RMSNorm",
     "RMSNormFused",
     "GatedRMSNorm",
@@ -55,5 +58,6 @@ __all__ = [
     "LinearReplicated",
     "MoELayer",
     "OffloadMoELayer",
+    "iter_moe_layers",
     "make_moe_layer",
 ]

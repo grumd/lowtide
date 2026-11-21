@@ -91,7 +91,7 @@ class Qwen4ExpIndexer(BaseOP):
         self.eps = config.rms_norm_eps
         self._split = [self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim]
         self.index_qk_proj = LinearReplicated(
-            args.hidden_size, sum(self._split), has_bias=False,
+            args.hidden_size, sum(self._split), has_bias=False, output_sizes=self._split,
             quant_config=config.quant, prefix=f"{prefix}.index_qk_proj",
         )
         self.q_layernorm = GemmaPlusOneRMSNorm(self.head_dim, eps=self.eps)
@@ -172,6 +172,8 @@ class Qwen4ExpAttention(BaseOP):
             max_position=rotary.max_position,
             base=rotary.base,
             rope_scaling=tuple(rotary.scaling.items()) if rotary.scaling else None,
+            mrope_section=tuple(rotary.mrope_section) if rotary.mrope_section is not None else None,
+            mrope_layout=rotary.mrope_layout,
         )
         self.indexer = Qwen4ExpIndexer(config, layer_id, prefix=f"{prefix}.indexer")
 
@@ -186,7 +188,7 @@ class Qwen4ExpAttention(BaseOP):
         self.q_norm.forward_inplace(q)
         self.k_norm.forward_inplace(k)
         q, k = self.rotary.forward(
-            batch.positions, q.view(-1, self.local_q * self.head_dim), k.view(-1, self.local_kv * self.head_dim)
+            batch.get_attn_positions(), q.view(-1, self.local_q * self.head_dim), k.view(-1, self.local_kv * self.head_dim)
         )
         index = self.indexer.forward(x)
         o = get_global_ctx().attn_backend.qsa_forward(

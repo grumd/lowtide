@@ -50,14 +50,14 @@ def _cm(interval: int | None) -> CacheManager:
 def test_zero_interval_disables_eviction():
     cm = _cm(0)
     assert cm.swa_eviction_interval == 0
-    cm.maybe_free_swa_out_of_window([_Boom()], forward_iter=1)
+    cm.maybe_free_swa_out_of_window([_Boom()])
     cm.free_swa_out_of_window_extend([_Boom()])
 
 
 def test_positive_interval_reaches_the_eviction_body():
     cm = _cm(1)
     with pytest.raises(AssertionError):
-        cm.maybe_free_swa_out_of_window([_Boom()], forward_iter=1)
+        cm.maybe_free_swa_out_of_window([_Boom()])
     with pytest.raises(AssertionError):
         cm.free_swa_out_of_window_extend([_Boom()])
 

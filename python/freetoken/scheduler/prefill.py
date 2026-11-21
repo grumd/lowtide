@@ -1,21 +1,24 @@
 from __future__ import annotations
 
+import math
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, List, Tuple
 
 import torch
-from freetoken.core import Batch, Req
+from freetoken.core import Batch, Req, ReqStats
 from freetoken.utils import align_down, div_ceil, init_logger
 
+from .mm import mm_chunk_end, mm_rows_after
 from .utils import PendingReq
 
 if TYPE_CHECKING:
     from freetoken.kvcache import BaseCacheHandle
     from freetoken.message import UserMsg
+    from freetoken.mm.encoder_cache import EncoderCache
 
     from .cache import CacheManager
     from .decode import DecodeManager
-    from .mm import MMImage, MMInputs
     from .table import TableManager
 
 logger = init_logger(__name__)
@@ -47,33 +50,52 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    encoder_cache: EncoderCache | None = None
+    # end a chunk before an image it would cut; only models whose image spans attend in both directions need it
+    keep_images_whole: bool = False
+    # the whole budget of this pass; token_budget shrinks as requests are admitted
+    pass_budget: int = 0
     # SWA-pool tokens charged to reqs admitted so far this pass. Mirrors reserved_size: swa is
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
-    # Gives images their soft tokens; returns an error string instead of raising.
-    embed_images: Callable[[List[MMImage]], str | None] | None = None
+    # slots a decode step may hold past a request's own length; reserved with it
+    token_headroom: int = 0
     # Elastic VRAM: the batch's token budget, sized from the first request's remaining tokens with
     # its prefill workspace taken (Scheduler._size_prefill_chunk); asked once, after that
     # request's admission has backed its pages. Later requests share what is left of it.
     size_chunk: Callable[[int], int] | None = None
 
+    def __post_init__(self) -> None:
+        if not self.pass_budget:
+            self.pass_budget = self.token_budget
+
+    def _kv_reservation_size(self, total_len: int, cached_len: int) -> int:
+        """Return the token-equivalent cost of the additional KV pages for a request."""
+        page_size = self.cache_manager.page_size
+        return (
+            div_ceil(total_len, page_size) - div_ceil(cached_len, page_size)
+        ) * page_size
+
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
             return None
 
-        # TODO: consider host cache match case
-        mr = self.cache_manager.match_req(req)
+        # TODO: consider host cache match case (it needs the same replay cap)
+        replay = self.cache_manager.prefix_replay_tokens
+        mr = self.cache_manager.match_req(req, max_len=max(0, req.input_len - replay) if replay else None)
         handle = mr.cuda_handle
         cached_len = handle.cached_len
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
-        estimated_len = extend_len + req.output_len
+        estimated_size = self._kv_reservation_size(
+            req.input_len + req.output_len + self.token_headroom, cached_len
+        )
 
-        if estimated_len + self.reserved_size > self.cache_manager.available_size:
+        if estimated_size + self.reserved_size > self.cache_manager.available_size:
             return None
         self.cache_manager.lock(handle)
-        if estimated_len + self.reserved_size > self.cache_manager.available_size:
+        if estimated_size + self.reserved_size > self.cache_manager.available_size:
             return self.cache_manager.unlock(handle)
 
         # Second currency (hybrid GDN): reserve 1 live + 2 ping-pong state slots; evict tree
@@ -97,15 +119,6 @@ class PrefillAdder:
                 min(max(extend_len, 1), self.cache_manager.sliding_window_size) + 1, ps
             ) * ps
             if self.cache_manager.swa_available_size - self.reserved_swa < need_swa:
-                return self.cache_manager.unlock(handle)
-
-        # Only now, with the prefix hit known and the request certain to be admitted, embed
-        # the images it will forward; ones inside the hit never reach the vision tower.
-        if req.mm is not None and (missing := req.mm.missing(cached_len)):
-            error = (self.embed_images(missing) if self.embed_images is not None
-                     else "image inputs need the scheduler's vision tower")
-            if error is not None:
-                req.error = error
                 return self.cache_manager.unlock(handle)
 
         if self.cache_manager.elastic is not None:
@@ -150,6 +163,7 @@ class PrefillAdder:
         remain_len = pending_req.input_len - cached_len
         if self.size_chunk is not None:
             self.token_budget = min(self.token_budget, self.size_chunk(min(remain_len, self.token_budget)))
+            self.pass_budget = min(self.pass_budget, self.token_budget)
             self.size_chunk = None
         chunk_size = min(self.token_budget, remain_len)
         if self.cache_manager.swa_paged:
@@ -181,9 +195,6 @@ class PrefillAdder:
                 if aligned <= 0:
                     return None
                 chunk_size = aligned
-            self.reserved_swa += (
-                div_ceil(cached_len + chunk_size, ps) - div_ceil(cached_len, ps)
-            ) * ps
         align = self.cache_manager.prefill_chunk_align
         if align > 1 and 0 < chunk_size < remain_len:
             # An unaligned chunk end is correct, it just loses this prompt's snapshot boundaries --
@@ -191,10 +202,27 @@ class PrefillAdder:
             # the request until it gets a bigger turn.
             aligned = align_down(cached_len + chunk_size, align) - cached_len
             chunk_size = aligned if aligned > 0 else chunk_size
+        if self.keep_images_whole and pending_req.mm_items and chunk_size < remain_len:
+            # a cut image would attend within only the part already in the cache: end the chunk before it, decided last because the caps above only move the end earlier and would undo it
+            unit = math.lcm(self.cache_manager.page_size if self.cache_manager.swa_paged else 1, align if align > 1 else 1)
+            end = mm_chunk_end(pending_req.mm_items, cached_len, cached_len + chunk_size, unit)
+            cut = next((hi for item in pending_req.mm_items for lo, hi in item.offsets if lo < end < hi), None)
+            if cut is not None and self.token_budget < self.pass_budget and cut - cached_len <= self.pass_budget:
+                # other requests took part of this pass; a pass of its own holds the image whole
+                return None
+            chunk_size = end - cached_len
+        if self.cache_manager.swa_paged:
+            ps = self.cache_manager.page_size
+            self.reserved_swa += (div_ceil(cached_len + chunk_size, ps) - div_ceil(cached_len, ps)) * ps
         is_chunked = chunk_size < remain_len
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
-        self.reserved_size += remain_len + pending_req.output_len
+        # CacheManager allocates each request independently in whole pages. Reserve the same
+        # page span here; charging raw tokens can admit several short requests against one page
+        # even though allocate_paged() needs a separate page for each request.
+        self.reserved_size += self._kv_reservation_size(
+            pending_req.input_len + pending_req.output_len + self.token_headroom, cached_len
+        )
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
@@ -207,8 +235,14 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
-            mm=pending_req.mm,
+            prompt_len=pending_req.input_len,
         )
+        req.mm_items = pending_req.mm_items
+        req.mrope_positions_full = pending_req.mrope_positions_full
+        req.mrope_delta = pending_req.mrope_delta
+        # one ReqStats across all chunk Reqs of the request: the stamps the scheduler
+        # takes on the final chunk's Req must survive the intermediate ones
+        req.stats = pending_req.stats
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
         req.linear_slot_idx = linear_slot_idx
@@ -255,11 +289,6 @@ class PrefillAdder:
                 next_track_idx=0,
                 restore_src=restore_src,
             )
-            if req is not None and req.mm is not None:
-                # admitted: every image past the hit has its soft tokens and the rest are in
-                # the locked prefix, so the pixels (~48 MiB per 1080p image) are dead weight
-                for img in req.mm.images:
-                    img.pixel_values = img.grid_thw = None
             if req is None:
                 # no aligned chunk this pass: undo the admission (a continuation keeps its
                 # resources -- they belong to the prior chunk's Req)
@@ -277,15 +306,26 @@ class PrefillManager:
     cache_manager: CacheManager
     table_manager: TableManager
     decode_manager: DecodeManager
-    embed_images: Callable[[List[MMImage]], str | None] | None = None
+    encoder_cache: EncoderCache | None = None
+    keep_images_whole: bool = False
+    token_headroom: int = 0
     # PrefillAdder.size_chunk for every batch (elastic VRAM's prefill workspace), None = off
     size_chunk: Callable[[int], int] | None = None
     pending_list: List[PendingReq] = field(default_factory=list)
-    # (uid, error) of requests dropped at admission; the scheduler replies and clears it
-    failed: List[Tuple[int, str]] = field(default_factory=list)
 
-    def add_one_req(self, req: UserMsg, mm: MMInputs | None = None) -> None:
-        self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params, mm=mm))
+    def add_one_req(self, req: UserMsg) -> None:
+        stats = ReqStats(enqueued_at=time.perf_counter())
+        self.pending_list.append(
+            PendingReq(
+                req.uid,
+                req.input_ids,
+                req.sampling_params,
+                mm_items=req.mm_items,
+                mrope_positions_full=req.mrope_positions,
+                mrope_delta=req.mrope_delta,
+                stats=stats,
+            )
+        )
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:
@@ -297,7 +337,9 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
-            embed_images=self.embed_images,
+            encoder_cache=self.encoder_cache,
+            keep_images_whole=self.keep_images_whole,
+            token_headroom=self.token_headroom,
             size_chunk=self.size_chunk,
         )
         reqs: List[Req] = []
@@ -323,18 +365,25 @@ class PrefillManager:
                     prompt_admissions.append(
                         (req.uid, pending_req.input_len, req.cache_handle.cached_len)
                     )
+                    # The first prefill chunk is launching: queue time ends here and the
+                    # prompt span starts (ReqStats carries both to the final chunk's Req).
+                    pending_req.stats.first_chunk_at = time.perf_counter()
+                    pending_req.stats.cache_n = req.cache_handle.cached_len
+                    pending_req.stats.prompt_n = pending_req.input_len - req.cache_handle.cached_len
+                    if pending_req.mm_items and self.encoder_cache is not None:
+                        # claim the rows every chunk of this request will gather; the entry outlives the chunks
+                        for item in pending_req.mm_items:
+                            self.encoder_cache.register(
+                                item.hash, req.uid, mm_rows_after(item, req.cache_handle.cached_len)
+                            )
                 log_new_tokens += req.extend_len
                 if not is_continuation:
                     log_cached_tokens += req.cache_handle.cached_len
             else:
-                if pending_req.error is not None:
-                    self.failed.append((pending_req.uid, pending_req.error))
                 break  # We cannot add more requests
-        rest = [p for p in self.pending_list[len(reqs) :] if p.error is None]
         if len(reqs) == 0:
-            self.pending_list = rest
             return None
-        self.pending_list = chunked_list + rest
+        self.pending_list = chunked_list + self.pending_list[len(reqs) :]
         batch = Batch(reqs=reqs, phase="prefill")
         batch.log_new_tokens = log_new_tokens
         batch.log_cached_tokens = log_cached_tokens

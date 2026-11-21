@@ -6,13 +6,16 @@ from typing import Any, Tuple
 
 import torch
 
+from freetoken.layers.quantization import QuantConfig
 from freetoken.models.config import (
+    mrope_layout_from_rope_params,
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
     ModelConfig,
     RotaryConfig,
     SlotStateSpec,
 )
+from freetoken.models.qwen3_vl.config import parse_vision_config
 
 
 # `ft serve` offload defaults per GPU count (engine/auto_config.py), measured on RTX 3080s at PCIe 4.0 x8;
@@ -21,61 +24,6 @@ SERVE_DEFAULTS = {
     1: {"moe_routed_prefill_tokens": 4096, "moe_decode_fetch": 0.1},
     2: {"moe_routed_prefill_tokens": 3072},
 }
-
-@dataclass(frozen=True)
-class Qwen4VisionConfig:
-    """Qwen3.8-Flash-Next vision tower geometry (model_type qwen4_exp_vision)."""
-
-    hidden_size: int
-    intermediate_size: int
-    depth: int
-    num_heads: int
-    patch_size: int
-    temporal_patch_size: int
-    in_channels: int
-    spatial_merge_size: int
-    out_hidden_size: int
-    num_position_embeddings: int
-    rope_theta: float = 10000.0
-
-    @property
-    def head_dim(self) -> int:
-        return self.hidden_size // self.num_heads
-
-
-def _parse_vision_config(top_cfg: Any) -> Qwen4VisionConfig | None:
-    """The vision tower config, or None when the checkpoint has none / vision is disabled.
-
-    Vision is opt-in (``FREETOKEN_LOAD_VISION`` / ``--load-vision``): the tower is ~1 GiB
-    of resident bf16 weights text-only serving never touches, so it is neither built nor
-    loaded unless requested."""
-    from freetoken.models.config import vision_load_enabled
-
-    if not vision_load_enabled():
-        return None
-    vc = getattr(top_cfg, "vision_config", None)
-    if vc is None:
-        return None
-    rope = getattr(vc, "rope_parameters", None) or {}
-    depth = getattr(vc, "depth", None)
-    if depth is None:
-        depth = getattr(vc, "num_hidden_layers")
-    num_heads = getattr(vc, "num_heads", None)
-    if num_heads is None:
-        num_heads = getattr(vc, "num_attention_heads")
-    return Qwen4VisionConfig(
-        hidden_size=int(vc.hidden_size),
-        intermediate_size=int(vc.intermediate_size),
-        depth=int(depth),
-        num_heads=int(num_heads),
-        patch_size=int(vc.patch_size),
-        temporal_patch_size=int(vc.temporal_patch_size),
-        in_channels=int(getattr(vc, "in_channels", 3)),
-        spatial_merge_size=int(vc.spatial_merge_size),
-        out_hidden_size=int(vc.out_hidden_size),
-        num_position_embeddings=int(vc.num_position_embeddings),
-        rope_theta=float(rope.get("rope_theta", 10000.0)),
-    )
 
 
 @dataclass(frozen=True)
@@ -108,6 +56,9 @@ class Qwen4ExpArgs:
     # loop is wired; when disabled, iter_weights keeps dropping the mtp.* tensors.
     mtp_num_layers: int = 0
     mtp_enabled: bool = False
+    image_token_id: int | None = None
+    # GGUF stores ssm_out with its value-head columns in llama.cpp's tiled order
+    gdn_out_heads_tiled: bool = False
 
     @property
     def index_topk_blocks(self) -> int:
@@ -144,12 +95,16 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
     """Per-request PLE state riding the linear-state slots (see LinearStatePool.slot_states)."""
     if not args.ple_layer_ids:
         return ()
+    # ple.py imports this module
+    from .ple import PLEConvVerify, PLENgramVerify
+
     return (
         # dilated-conv left context; replicated (not TP-sharded), model dtype
         SlotStateSpec(
             name=PLE_CONV_STATE,
             shape=(args.ple_state_width, args.ple_conv_state_len),
             layer_ids=args.ple_layer_ids,
+            verify=PLEConvVerify,
         ),
         # last ngram_size-1 token ids, shared by every PLE layer; eos = hash boundary
         SlotStateSpec(
@@ -157,6 +112,7 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
             shape=(args.ngram_size - 1,),
             dtype=torch.int32,
             fill_value=float(args.ngram_boundary_token_id),
+            verify=PLENgramVerify,
         ),
     )
 
@@ -208,28 +164,13 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
 
-    # Quant roles come from the shared dialect layer (the same resolution the engine
-    # uses), not a second detector: FP8 block builds quantize only the routed experts;
-    # compressed-tensors NVFP4 / modelopt exports follow their ignore/target lists.
-    from freetoken.models.quant import quant_config_for, role_quants
-    from freetoken.models.register import get_model_spec
-
-    _spec = get_model_spec(hf_config.architectures[0])
-    _roles = role_quants(
-        quant_config_for(hf_config, _spec),
-        expert="model.layers.0.mlp.experts.0.gate_proj",
-        attn="model.layers.0.self_attn.q_proj",
-        dense="model.layers.0.mlp.shared_expert.gate_proj",
-        lm_head="lm_head",
-    )
-    expert_quant = _roles["expert_quant"]
-    attn_quant = _roles["attn_quant"]
-    dense_quant = _roles["dense_quant"]
-    lm_head_quant = _roles["lm_head_quant"]
-
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
+
+    # the engine reads this flag for its MoE strategy decisions; every module takes its own scheme from the QuantConfig when it is built
+    expert_scheme = QuantConfig.from_hf(hf_config).scheme_for_name("model.language_model.layers.0.mlp.experts.0.gate_proj")
+    expert_quant = "none" if expert_scheme is None else str(expert_scheme.kind)
 
     # HF stores ple_layer_ids one-indexed (validated upstream as [1, num_layers]).
     ple_layer_ids = tuple(int(i) - 1 for i in (getattr(text, "ple_layer_ids", None) or ()))
@@ -237,12 +178,19 @@ def parse_config(hf_config: Any) -> ModelConfig:
         if layer_types[lid] != "linear_attention":
             raise ValueError(f"PLE must sit on a linear_attention layer, got layer {lid}")
 
+    vision_config = parse_vision_config(hf_config)
     full_rotary = RotaryConfig(
         head_dim=head_dim,
         rotary_dim=rotary_dim,
         max_position=text.max_position_embeddings,
         base=rope_theta,
         scaling=rope_scaling,
+        mrope_section=(
+            list(rope_params["mrope_section"])
+            if vision_config is not None and "mrope_section" in rope_params
+            else None
+        ),
+        mrope_layout=mrope_layout_from_rope_params(rope_params),
     )
     # MTP draft layers ride the SAME QSA pool/backend as the full-attention layers:
     # their layer ids continue after the main stack (mtp.py builds blocks with
@@ -311,6 +259,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         index_ratio=int(text.indexer_compress_ratio),
         mtp_num_layers=_mtp_num_layers,
         mtp_enabled=_mtp_enabled,
+        image_token_id=getattr(hf_config, "image_token_id", None),
     )
 
     return ModelConfig(
@@ -338,13 +287,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
         use_qk_norm=True,
         model_type=getattr(hf_config, "model_type", "qwen4_exp"),
         architectures=getattr(hf_config, "architectures", ["Qwen4ExpForConditionalGeneration"]),
-        vision_config=_parse_vision_config(hf_config),  # None unless --load-vision
+        vision_config=vision_config,
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,
-        attn_quant=attn_quant,
-        dense_quant=dense_quant,
-        lm_head_quant=lm_head_quant,
         qwen4_args=qwen4_args,
         mtp_enabled=_mtp_enabled,
         slot_states=ple_slot_states(qwen4_args),

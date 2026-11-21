@@ -38,6 +38,7 @@ from typing import Sequence
 
 import torch
 
+from .format import NONE, KVFormat
 from .mha_pool import MHAKVCache, alloc_tier, paged_run_intervals
 
 # The index tiers are always 2-byte (compute dtype); spec_kv_bytes_per_token budgets the same.
@@ -45,6 +46,8 @@ _INDEX_DTYPE_BYTES = 2
 # kernel/csrc/jit/kv_tier.cuh: the resolve kernel's sweep window, and the ctl word that narrows the cache
 _TIER_MIN_SLOTS = 1024
 _CTL_ACTIVE = 10
+# t/h/w int32 rope position kept per KV slot on mrope models
+_ROPE_POS_BYTES = 3 * 4
 
 
 class QSAKVCache(MHAKVCache):
@@ -93,6 +96,8 @@ class QSAKVCache(MHAKVCache):
         ring_capacity: int | None = None,
         layer_ids: Sequence[int] | None = None,
         kv_tier_cells: int = 0,
+        mrope: bool = False,
+        kv_format: KVFormat = NONE,
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -120,6 +125,7 @@ class QSAKVCache(MHAKVCache):
         self._index_dtype = dtype
         self._page_size = page_size
         self.kv_tier_cells = kv_tier_cells
+        self._mrope = mrope
         super().__init__(
             num_kv_heads=num_kv_heads,
             num_layers=num_layers,
@@ -129,6 +135,7 @@ class QSAKVCache(MHAKVCache):
             dtype=dtype,
             device=device,
             layer_ids=layer_ids,
+            kv_format=kv_format,
         )
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
@@ -139,9 +146,11 @@ class QSAKVCache(MHAKVCache):
     def tiered(self) -> bool:
         return self.kv_tier_cells > 0
 
-    def _alloc_kv_buffer(self, shape, dtype, device, intervals) -> torch.Tensor:
+    def _alloc_kv_buffer(self, shape, dtype, device, intervals, *, zero: bool = False) -> torch.Tensor:
         if not self.tiered:
-            return super()._alloc_kv_buffer(shape, dtype, device, intervals)
+            return super()._alloc_kv_buffer(shape, dtype, device, intervals, zero=zero)
+        if self.kv_format.quantized:
+            raise ValueError("--kv-tier keeps a 16-bit K/V; it does not combine with a quantized --kv-cache-dtype")
         from freetoken.kernel.pinned import alloc_pinned_tensor
         from freetoken.moe.host_banks import _BLK, HostBank
 
@@ -380,6 +389,18 @@ class QSAKVCache(MHAKVCache):
             dtype=self._index_dtype,
             device=self._device,
         )
+        # 3-axis rope position of every stored token: a compressed group ropes at its first token, which under mrope is not derivable from the logical position
+        self._rope_positions = None
+        if self._mrope:
+            rope_page = self._page_size * _ROPE_POS_BYTES
+            self._rope_positions = alloc_tier(
+                "rope_pos",
+                (num_pages * self._page_size, 3),
+                torch.int32,
+                self._device,
+                paged_run_intervals(1, num_pages * rope_page, rope_page, rope_page),
+                zero=True,
+            )
 
     def rebuild(self, num_pages: int) -> None:
         if self.tiered:
@@ -391,6 +412,7 @@ class QSAKVCache(MHAKVCache):
         # cannot drop a live request's pending members.
         self._cmp_k_buffer = None
         self._pending_ring = None
+        self._rope_positions = None
         super().rebuild(num_pages)
         self._zero_kv_slabs()
         try:
@@ -399,6 +421,7 @@ class QSAKVCache(MHAKVCache):
             self._kv_buffer = None
             self._k_buffer = None
             self._v_buffer = None
+            self._scale_buffer = None
             raise
 
     @classmethod
@@ -414,11 +437,14 @@ class QSAKVCache(MHAKVCache):
         for spec in config.model_config.kv_cache_group_specs():
             if spec.is_swa:
                 continue
-            kv_bytes = spec_kv_bytes_per_token(spec, config)
+            kv_bytes = spec_kv_bytes_per_token(spec, config, getattr(config, "kv_format", NONE))
             if spec.attn_type is AttnType.QSA:
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
-                ring = cls.ring_capacity_for(spec.index_ratio, cls.speculative_depth(config.model_config))
+                ring = cls.ring_capacity_for(
+                    spec.index_ratio,
+                    max(getattr(config, "decode_rows_per_req", 1) - 1, cls.speculative_depth(config.model_config)),
+                )
                 fixed += num_req_slots * row * (ring + 1)
                 if tier_cells:
                     # tiered: only the index slab is paged VRAM; the K/V is in host RAM and
@@ -434,6 +460,8 @@ class QSAKVCache(MHAKVCache):
                     stage = (kv_bytes - slab) // spec.num_layers
                     fixed += stage * config.page_size
                     kv_bytes = slab + stage
+                if config.model_config.model_is_mrope:
+                    kv_bytes += _ROPE_POS_BYTES
             per_token += kv_bytes
         return per_token * config.page_size, fixed, config.page_size, 0
 
@@ -479,15 +507,18 @@ class QSAKVCache(MHAKVCache):
             * self._index_head_dim
             * self._index_dtype.itemsize
         )
-        return kv + slab // tokens, swa
+        return kv + slab // tokens + (_ROPE_POS_BYTES if self._mrope else 0), swa
 
     def page_views(self) -> list[torch.Tensor]:
         pages = self._kv_buffer.shape[2]
         rows = self._page_size // self._index_ratio
         slab = self._cmp_k_buffer[:, : pages * rows].unflatten(1, (pages, rows)).permute(1, 0, 2, 3)
+        extra = [slab]
+        if self._rope_positions is not None:
+            extra.append(self._rope_positions.view(pages, self._page_size, 3))
         if self.tiered:
-            return [slab]  # VRAM tiers only; the host pages move in move_host_pages
-        return super().page_views() + [slab]
+            return extra  # VRAM tiers only; the host pages move in move_host_pages
+        return super().page_views() + extra
 
     def cmp_k_cache(self, slot: int) -> torch.Tensor:
         """Compressed index keys of one sparse layer: ``[rows, index_head_dim]``."""
@@ -496,6 +527,12 @@ class QSAKVCache(MHAKVCache):
     def pending_ring(self, slot: int) -> torch.Tensor:
         """One sparse layer's pending ring: ``[num_req_slots, ring_capacity, index_head_dim]``."""
         return self._pending_ring[:, slot]
+
+    @property
+    def rope_positions(self) -> torch.Tensor:
+        """``[num_tokens, 3]`` int32 t/h/w rope position per KV slot (written by the QSA backend)."""
+        assert self._rope_positions is not None, "rope positions are only kept on mrope models"
+        return self._rope_positions
 
     @property
     def cmp_scratch_base(self) -> int:

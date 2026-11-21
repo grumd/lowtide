@@ -89,22 +89,11 @@ def iter_expert_tensors_parallel(
     Peak host memory is ~(prefetch+1) shards + the banks the caller fills. Order is
     shard-then-header order (NOT global), so the consumer must place by ``name``.
     """
+    from freetoken.models.loader import safetensors_weight_map
     from freetoken.utils.hf import download_hf_weight
 
     model_path = download_hf_weight(model_path)  # resolve hub id -> local (parity w/ serial)
-    index = os.path.join(model_path, "model.safetensors.index.json")
-    if os.path.exists(index):
-        with open(index) as f:
-            weight_map = json.load(f)["weight_map"]
-    else:  # single-file / no-index checkpoint: map name -> shard from each shard's header
-        weight_map = {}
-        for shard in sorted(os.path.basename(p) for p in glob.glob(os.path.join(model_path, "*.safetensors"))):
-            with open(os.path.join(model_path, shard), "rb") as fh:
-                n = struct.unpack("<Q", fh.read(8))[0]
-                hdr = json.loads(fh.read(n))
-            for nm in hdr:
-                if nm != "__metadata__":
-                    weight_map[nm] = shard
+    weight_map = safetensors_weight_map(model_path)
     shards: dict[str, list[str]] = {}
     for name, shard in weight_map.items():
         if is_expert(name):
@@ -273,22 +262,25 @@ def load_weight(
     device: torch.device,
     *,
     include_moe_experts: bool = True,
+    include_vision: bool = True,
     mtp_path: str = "",
 ) -> Iterator[Tuple[str, torch.Tensor]]:
-    """Base stream, then — with ``--mtp file`` — the standalone draft head.
+    """Base stream, then -- with ``--mtp file`` -- the standalone draft head.
 
     With an external draft the base stream's own ``mtp.*`` tensors are dropped
     unconditionally (the binding is external; a base checkpoint that happens to
     ship a draft must not race the artifact)."""
     if not mtp_path:
-        yield from _load_weight_inner(model_path, device, include_moe_experts=include_moe_experts)
+        yield from _load_weight_inner(
+            model_path, device, include_moe_experts=include_moe_experts, include_vision=include_vision
+        )
         return
-    # The base stream must not read the checkpoint's own MTP head: the artifact owns it.
     # ``include_mtp=False`` suppresses the family's embedded-head reader (the base may
     # declare ``mtp_num_hidden_layers`` yet ship no ``mtp.*`` tensors, as the hybrid
     # checkpoints do). Any base ``mtp.*`` keys are filtered below too.
     base = _load_weight_inner(
-        model_path, device, include_moe_experts=include_moe_experts, include_mtp=False
+        model_path, device, include_moe_experts=include_moe_experts, include_mtp=False,
+        include_vision=include_vision,
     )
     for name, tensor in base:
         if name.startswith(("mtp.", "model.mtp.")):
@@ -300,9 +292,7 @@ def load_weight(
     try:
         _load_attr(_spec.module, "tp_shard_key")
     except AttributeError as exc:
-        raise ValueError(
-            f"--mtp file understuetzt dieses Modell-Familien-Modul nicht: {_spec.module}"
-        ) from exc
+        raise ValueError(f"--mtp file does not support the model family module {_spec.module}") from exc
     from freetoken.models.qwen4_exp.weight import iter_external_mtp_weights
 
     for name, tensor in iter_external_mtp_weights(mtp_path, device, _cfg, get_tp_info()):
@@ -315,6 +305,7 @@ def _load_weight_inner(
     *,
     include_moe_experts: bool = True,
     include_mtp: bool = True,
+    include_vision: bool = True,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     # FTW checkpoint: dense weights are stored post-iter_weights, so we replay them
     # model-agnostically instead of re-running the per-model reader. Which tensors exist is
@@ -322,108 +313,89 @@ def _load_weight_inner(
     # fails loudly in load_state_dict (strict missing/unexpected expert keys), so the reader
     # just yields the stored weight tensors regardless of the include_moe_experts flag.
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, iter_ftw_weights
-    from freetoken.models.config import VISION_KEY_PREFIXES, vision_load_enabled
+    from freetoken.distributed import get_tp_info
+    from freetoken.models.config import VISION_KEY_PREFIXES
 
+    # a text-only engine never built the tower, so its tensors are not even read
+    keep = None if include_vision else (lambda name: not name.startswith(VISION_KEY_PREFIXES))
     if is_ftw_checkpoint(model_path):
-        # The FTW dense shard stores whatever existed at conversion, including the vision
-        # stack. Vision is opt-in (default OFF, see vision_load_enabled): when it is off the
-        # model never builds the tower, so replaying those tensors would trip load_state_dict's
-        # strict unexpected-key check. Skip them here to match the model the engine built.
         # FTW stores dense weights un-sharded (TP-agnostic); a model module may expose
         # shard_ftw_weight(name, w, model_path, tp) to apply its TP key rules at replay.
-        skip_vision = not vision_load_enabled()
-        _cfg, _spec = _spec_for_model_path(model_path)
-        # Same strictness for the MTP draft head: the FTW carries mtp.* (converted with it
-        # forced on), but THIS serve may run without FREETOKEN_ENABLE_MTP — the model has no
-        # mtp module then, and the keys must not reach load_state_dict.
-        # (--mtp file already dropped the FTW's own mtp.* in load_weight; the external draft
-        # is yielded there, so this gate only reflects the serve's MTP config.)
-        mtp_on = bool(getattr(_cfg, "mtp_enabled", False)) and include_mtp
         try:
-            _shard_fn = _load_attr(_spec.module, "shard_ftw_weight")
-        except AttributeError:
-            _shard_fn = None
+            _cfg, _spec = _spec_for_model_path(model_path)
+        except ValueError:  # no family config beside the entries: replay them as stored
+            _cfg = _spec = None
+        # The FTW carries mtp.* (converted with it forced on), but THIS serve may run without
+        # MTP: the model has no mtp module then, and the keys must not reach load_state_dict.
+        mtp_on = bool(getattr(_cfg, "mtp_enabled", False)) and include_mtp
+        _shard_fn = _model_override(_spec, "shard_ftw_weight") if _spec is not None else None
+        # a family whose state-dict names changed after an FTW was written maps the stored names
+        _rename_fn = _model_override(_spec, "rename_ftw_weight") if _spec is not None else None
         _tp = get_tp_info()
 
         def skip(name: str) -> bool:
-            # Filtered before the read: engram tables (--include-engram, ~92 GiB each) are
-            # served in place from the shards by the engram row source, never loaded.
+            # Filtered before the read: engram tables (--include-engram) are served in place
+            # by the engram row source, never loaded.
             if ".engram.embed." in name:
                 return True
-            if skip_vision and name.startswith(VISION_KEY_PREFIXES):
+            if keep is not None and not keep(name):
                 return True
             return not mtp_on and name.startswith(("mtp.", "model.mtp."))
 
         for name, tensor in iter_ftw_weights(model_path, skip=skip):
+            if _rename_fn is not None:
+                name = _rename_fn(name)
             if _shard_fn is not None and _tp.size > 1:
                 tensor = _shard_fn(name, tensor, model_path, _tp)
             yield name, tensor
         if mtp_on:
             # a draft head stored as its own FTW kind (Hy4's DFly2), already sliced per rank
-            try:
-                _extra = _load_attr(_spec.module, "iter_ftw_extra")
-            except AttributeError:
-                _extra = None
+            _extra = _model_override(_spec, "iter_ftw_extra")
             if _extra is not None:
                 yield from _extra(model_path, _cfg, device)
         return
-
     _config, spec = _spec_for_model_path(model_path)
     iter_weights = _load_attr(spec.module, spec.iter_weights)
-    kwargs = {"include_moe_experts": include_moe_experts, "include_non_moe": True}
+    # only a family that registers an encoder is asked about the tower; the others never load one
+    kwargs = {"include_vision": include_vision} if spec.encoders else {}
     if not include_mtp:
-        # Only the qwen4_exp reader understands an external MTP head, so the flag is
-        # only ever needed (and passed) there; other families keep the plain contract.
+        # only the qwen4_exp reader understands an external MTP head; other families keep the plain contract
         kwargs["include_mtp"] = False
-    yield from iter_weights(model_path, device, **kwargs)
+    weights = iter_weights(
+        model_path,
+        device,
+        include_moe_experts=include_moe_experts,
+        include_non_moe=True,
+        **kwargs,
+    )
+    for name, tensor in weights:
+        if keep is not None and not keep(name):
+            continue
+        yield name, tensor
 
 
-def load_q4_0_moe_expert_sources(
-    model_path: str,
-    model_config,
-    *,
-    dummy: bool = False,
-    layer_sink=None,
-) -> dict:
-    """Load (or fabricate, with ``dummy=True``) packed GGUF Q4_0 expert source banks.
-    ``layer_sink`` (converter) streams each completed layer's banks; ignored for dummy."""
+def load_vision_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, torch.Tensor]]:
+    """The vision encoder tensors alone, named as load_weight names them, read by the family's encoder-only reader."""
     _config, spec = _spec_for_model_path(model_path)
-    if dummy:
-        builder = _model_override(spec, "dummy_q4_0_expert_sources")
-        assert builder is not None, "model defines no dummy_q4_0_expert_sources"
-        return builder(model_config)
-    loader = _load_attr(spec.module, "load_q4_0_expert_sources")
-    return loader(model_path, model_config, layer_sink=layer_sink)
+    reader = _model_override(spec, "iter_vision_weights")
+    if reader is None:
+        raise ValueError(f"{spec.module} has no encoder-only weight reader")
+    return reader(model_path, device)
 
 
-def dspark_expert_method(model_path: str, model_config):
-    """The model's DSpark draft expert method, or ``None`` when it ships no draft.
+def ftw_lacks_vision(model_path: str) -> bool:
+    """True for an FTW that holds no vision encoder tensors: converted by a build before the family served images."""
+    from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
+    from freetoken.models.config import VISION_KEY_PREFIXES
 
-    Dispatches to the family's ``dspark_expert_method`` hook (deepseek_v41); the draft's
-    expert count differs from the target's, so it owns a separate method/bank set."""
-    _config, spec = _spec_for_model_path(model_path)
-    fn = _model_override(spec, "dspark_expert_method")
-    if fn is None:
-        return None
-    return fn(model_config)
-
-
-def load_dspark_banks(model_path: str, model_config, **kwargs):
-    """Load the model's DSpark draft expert banks (family ``load_dspark_banks`` hook).
-
-    Raises when the family ships no draft: a checkpoint with ``mtp.*`` but no bank
-    loader would otherwise silently serve without its draft experts."""
-    _config, spec = _spec_for_model_path(model_path)
-    loader = _model_override(spec, "load_dspark_banks")
-    if loader is None:
-        raise ValueError(f"{spec.module} ships no DSpark draft expert banks")
-    return loader(model_path, model_config, **kwargs)
+    if not is_ftw_checkpoint(model_path):
+        return False
+    return not any(name.startswith(VISION_KEY_PREFIXES) for name in ftw_tensor_names(model_path, "weight"))
 
 
 __all__ = [
     "load_weight",
-    "load_q4_0_moe_expert_sources",
+    "load_vision_weight",
+    "ftw_lacks_vision",
     "iter_expert_tensors_parallel",
-    "dspark_expert_method",
-    "load_dspark_banks",
 ]

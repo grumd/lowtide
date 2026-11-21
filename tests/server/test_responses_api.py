@@ -15,6 +15,8 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _PY = os.path.join(_ROOT, "python")
 if _PY not in sys.path:
@@ -24,7 +26,13 @@ from freetoken.message.frontend import UserReply  # noqa: E402
 from freetoken.server import responses_api as RP  # noqa: E402
 from freetoken.server.responses_api import ResponsesRequest  # noqa: E402
 from freetoken.server.function_call_parser import ToolCallItem  # noqa: E402
-from freetoken.server.generation import ContentDelta, GenDone, GenResult, ToolCallsDelta  # noqa: E402
+from freetoken.server.generation import (  # noqa: E402
+    ContentDelta,
+    GenDone,
+    GenResult,
+    GenUsage,
+    ToolCallsDelta,
+)
 
 
 async def _aiter(items):
@@ -96,6 +104,33 @@ def test_convert_list_input_with_tool_roundtrip_and_tools():
     assert tool_msg["role"] == "tool" and tool_msg["tool_call_id"] == "call_1" and tool_msg["content"] == "72F"
     assert spec.template_tools[0]["function"]["name"] == "get_weather"
     assert spec.parse_tools
+
+
+def test_convert_function_call_output_image_moves_to_a_user_turn():
+    # codex's view_image returns the image as the tool output; templates render tool messages as text.
+    req = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-x",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "look"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "view_image", "arguments": '{"path": "a.png"}'},
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": [
+                        {"type": "input_text", "text": "viewed"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,aGk="},
+                    ],
+                },
+            ],
+        }
+    )
+    spec = RP.convert_responses_to_genspec(req, {})
+    assert [m["role"] for m in spec.messages] == ["user", "assistant", "tool", "user"]
+    assert spec.messages[2]["tool_call_id"] == "call_1" and spec.messages[2]["content"] == "viewed"
+    assert spec.messages[3]["content"] == [
+        {"type": "image", "freetoken_ref": {"kind": "url", "data": "data:image/png;base64,aGk="}}
+    ]
 
 
 def test_convert_reasoning_item_merges_into_assistant_turn():
@@ -279,6 +314,90 @@ def test_stream_text_events():
     assert completed["usage"]["input_tokens"] == 4
 
 
+def test_stream_timings_ride_the_completed_event_data_not_the_response():
+    req = ResponsesRequest.model_validate({"model": "gpt-x", "input": "hi", "stream": True})
+    timings = {"queue_ms": 5.0, "cache_n": 0, "prompt_n": 4, "prompt_ms": 200.0,
+               "predicted_n": 2, "predicted_ms": 100.0, "draft_n": 0, "draft_n_accepted": 0}
+    events = [ContentDelta("Hi"), GenDone("stop", 4, 2, timings=timings)]
+    state = SimpleNamespace(config=SimpleNamespace(enable_timings_report=True))
+
+    async def run():
+        out = []
+        async for frame in RP.responses_stream_generator(
+            _aiter(events), req, "resp_1", 0, state=state
+        ):
+            for line in frame.split("\n"):
+                if line.startswith("data:"):
+                    out.append(json.loads(line[len("data:"):].strip()))
+        return out
+
+    data_events = asyncio.run(run())
+    completed = data_events[-1]
+    assert completed["type"] == "response.completed"
+    # the timings sit on the event's data, not nested in the response object
+    assert completed["timings"]["prompt_per_second"] == 20.0  # 4 tokens / 0.2 s
+    assert "timings" not in completed["response"]
+    # every earlier event stays clean
+    assert all("timings" not in e for e in data_events[:-1])
+
+
+def _pt_snapshot(n: int, ms: float) -> dict:
+    return {"queue_ms": 5.0, "cache_n": 0, "prompt_n": 4, "prompt_ms": 200.0,
+            "predicted_n": n, "predicted_ms": max(ms, 0.001), "draft_n": 0, "draft_n_accepted": 0}
+
+
+@pytest.mark.parametrize("asked", [True, False])
+def test_stream_timings_per_token_rides_every_delta_event(asked):
+    payload = {"model": "gpt-x", "input": "hi", "stream": True}
+    if asked:
+        payload["timings_per_token"] = True
+    req = ResponsesRequest.model_validate(payload)
+    terminal = _pt_snapshot(3, 90.0)
+    usage = GenUsage()
+
+    async def src():
+        # mirrors generate_events: each ack stamps usage.timings before its events go out
+        usage.timings = _pt_snapshot(1, 0.001)
+        yield ContentDelta("Hel")
+        usage.timings = _pt_snapshot(2, 40.0)
+        yield ContentDelta("lo")
+        # the terminal ack, then the buffered tool-call close flushed after the loop:
+        # a stream that did not ask must not get a block on that residue
+        usage.timings = terminal
+        yield ToolCallsDelta([ToolCallItem(tool_index=0, name="get_weather", parameters='{"city": "SF"}')])
+        yield GenDone("tool_calls", 4, 3, timings=terminal)
+
+    async def run():
+        out = []
+        async for frame in RP.responses_stream_generator(
+            src(), req, "resp_1", 0, state=SimpleNamespace(config=SimpleNamespace(enable_timings_report=True)), usage=usage
+        ):
+            for line in frame.split("\n"):
+                if line.startswith("data:"):
+                    out.append(json.loads(line[len("data:"):].strip()))
+        return out
+
+    data_events = asyncio.run(run())
+    text = [e for e in data_events if e["type"] == "response.output_text.delta"]
+    argd = [e for e in data_events if e["type"] == "response.function_call_arguments.delta"]
+    assert len(text) == 2 and len(argd) == 1
+    if asked:
+        # growing per-ack snapshots on every delta, terminal value on the post-ack residue
+        assert [e["timings"]["predicted_n"] for e in text] == [1, 2]
+        assert argd[0]["timings"]["predicted_n"] == 3
+    else:
+        assert all("timings" not in e for e in text + argd)
+    completed = data_events[-1]
+    assert completed["type"] == "response.completed"
+    # the #814 terminal placement is unchanged either way
+    assert completed["timings"]["predicted_n"] == 3
+    # structural events (created/in_progress/added/done) never carry a block
+    assert all("timings" not in e for e in data_events
+               if e["type"] not in ("response.output_text.delta",
+                                    "response.function_call_arguments.delta",
+                                    "response.completed"))
+
+
 def test_stream_tool_call_events():
     req = ResponsesRequest.model_validate({"model": "gpt-x", "input": "weather?", "stream": True})
     args = '{"city": "SF"}'
@@ -317,6 +436,7 @@ class FakeState:
         self._cached_tokens = cached_tokens  # stamped on the first ack (admission reply)
         self.maintenance_state = "serving"
         self.config = SimpleNamespace(
+            mm=SimpleNamespace(text_model_only=False, disabled_encoders=frozenset()),
             reasoning_parser=None, tool_call_parser="llama3",
             served_model_name="test-model", model_path="/test",
         )
@@ -919,3 +1039,23 @@ def test_convert_reasoning_toggle_broadcasts_every_spelling():
         assert spec.chat_template_kwargs == {
             "enable_thinking": False, "thinking_mode": "disabled"
         }, parser
+
+
+def test_convert_function_call_output_text_list_stays_a_plain_tool_message():
+    req = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-x",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{}"},
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": [{"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}],
+                },
+            ],
+        }
+    )
+    spec = RP.convert_responses_to_genspec(req, {})
+    assert [m["role"] for m in spec.messages] == ["user", "assistant", "tool"]
+    assert spec.messages[2]["content"] == "ab"

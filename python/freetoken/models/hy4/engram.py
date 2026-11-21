@@ -225,7 +225,7 @@ class Hy4EngramStore:
         }
         self.multipliers = [mult[3 * i : 3 * i + 3] for i in range(len(sources))]
         self.table = _row_table(
-            source, constants, max_graph_rows=max_graph_rows, max_extend_tokens=max_extend_tokens,
+            source, constants, max_graph_rows=max_graph_rows, max_eager_tokens=max_extend_tokens,
             dtype=torch.bfloat16, page_cache=page_cache,
         )
         self._offsets = offsets

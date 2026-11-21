@@ -331,7 +331,17 @@ def test_torch_topk_env_picks_the_fallback(monkeypatch):
 # Block top-k, split + merge path (wide buffers)
 # --------------------------------------------------------------------------------------
 
-SPLIT_CHUNK = 4096  # _split_plan's chunk for every buffer these tests use
+# (columns, _split_plan's chunk). A 1M-token window scores 262,144 compressed rows, and its 32
+# splits leave more candidates than one program holds, so a reduction level runs before the merge.
+SPLIT_SHAPES = [(65536, 4096), (262144, 8192)]
+
+
+def _split_chunk(columns: int, width: int) -> int:
+    from freetoken.kernel.triton.qsa.topk import _split_plan
+
+    plan = _split_plan(columns, width)
+    assert plan is not None, f"{columns} columns must take the split path"
+    return plan.chunk
 
 
 def _policy_topk_blocks(logits, visible, width):
@@ -348,29 +358,34 @@ def _policy_topk_blocks(logits, visible, width):
     return out
 
 
-def _split_topk_case(n_blocks: int, width: int, bs: int, mode: str, seed: int):
+def _split_topk_case(n_blocks: int, chunk: int, width: int, bs: int, mode: str, seed: int):
     if mode != "boundary":
         return _topk_case(n_blocks, bs, mode, seed)
     # width - 212 columns beat the tie, so the 212 remaining winners start 100 columns below
-    # a chunk boundary and run past it into a chunk that is all tie.
+    # a chunk boundary and run past it into a chunk that is all tie. The last row cuts at the
+    # middle split boundary, which is where a reduction level divides the candidates.
     logits = torch.zeros(bs, n_blocks, device="cuda")
+    splits = n_blocks // chunk
     for row in range(bs):
-        cut = SPLIT_CHUNK * (1 + row % (n_blocks // SPLIT_CHUNK - 1))
+        cut = chunk * (splits // 2 if row == bs - 1 else 1 + row % (splits - 1))
         logits[row, : width - 212] = 2.0
         logits[row, cut - 100 :] = 1.0
     return logits, torch.full((bs,), n_blocks, dtype=torch.int32, device="cuda")
 
 
 @requires_cuda
-@pytest.mark.parametrize("n_blocks", [65536])
+@pytest.mark.parametrize("n_blocks,chunk", SPLIT_SHAPES)
 @pytest.mark.parametrize("bs", [4])
 @pytest.mark.parametrize("mode", ["random", "boundary", "ragged", "dead"])
-def test_block_topk_split_path_matches_torch_topk(n_blocks: int, bs: int, mode: str):
+def test_block_topk_split_path_matches_torch_topk(n_blocks: int, chunk: int, bs: int, mode: str):
     from freetoken.kernel.triton.qsa import qsa_block_topk, qsa_block_topk_scratch_width
 
     width = 512
     assert qsa_block_topk_scratch_width(n_blocks, width) > 0, "case must take the split path"
-    logits, visible = _split_topk_case(n_blocks, width, bs, mode, seed=n_blocks + bs + len(mode))
+    assert _split_chunk(n_blocks, width) == chunk
+    logits, visible = _split_topk_case(
+        n_blocks, chunk, width, bs, mode, seed=n_blocks + bs + len(mode)
+    )
     blocks = torch.empty(bs, width, dtype=torch.int32, device=logits.device)
     qsa_block_topk(logits, visible, blocks)
 
@@ -431,8 +446,10 @@ def test_block_topk_split_path_cost_tracks_live_blocks():
     """A wide buffer with a short row must not pay for the splits past its visible tail."""
     from freetoken.kernel.triton.qsa import qsa_block_topk, qsa_block_topk_scratch_width
 
-    # wide enough that the split work dwarfs the 20-launch floor even at boosted clocks
-    rows, columns, width = 1, 262144, 512
+    # enough rows that the live splits fill the card, so their work outweighs the launch floor
+    rows, columns, width = 8, 262144, 512
+    assert qsa_block_topk_scratch_width(columns, width) > 0, "case must take the split path"
+    chunk = _split_chunk(columns, width)
     device = torch.device("cuda")
     logits = torch.randn(rows, columns, device=device)
     visible = torch.full((rows,), columns, dtype=torch.int32, device=device)
@@ -463,8 +480,8 @@ def test_block_topk_split_path_cost_tracks_live_blocks():
             best = min(best, start.elapsed_time(stop) * 1000.0 / 20)
         return best
 
-    full, short = replay_us(columns), replay_us(SPLIT_CHUNK)
-    assert full > 2.0 * short, f"{columns} live {full:.1f}us vs {SPLIT_CHUNK} live {short:.1f}us"
+    full, short = replay_us(columns), replay_us(chunk)
+    assert full > 2.0 * short, f"{columns} live {full:.1f}us vs {chunk} live {short:.1f}us"
 
 
 @requires_cuda
@@ -484,3 +501,55 @@ def test_capture_graph_provisions_the_block_topk_scratch():
     assert backend._scratch("topk_scratch", 2, width, dtype=torch.int32).data_ptr() == (
         static.data_ptr()
     )
+
+
+@requires_cuda
+@pytest.mark.parametrize("fmt_name", ["fp8_per_token_head", "int8_per_token_head"])
+def test_sparse_attention_reads_quantized_kv(fmt_name: str):
+    from freetoken.kernel.triton.kv_rows import store_kv_rows
+    from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
+    from freetoken.kvcache.format import KV_FORMATS
+
+    torch.manual_seed(13)
+    device = torch.device("cuda")
+    fmt = KV_FORMATS[fmt_name]
+    pages, kv_heads, q_heads, dim, rows, topk = 8, 2, 32, 64, 3, 96
+    slots = pages * PAGE_SIZE
+    # rows of different magnitude, so a scale read from the wrong slot changes the result
+    gain = torch.logspace(-1, 1, slots, device=device)[:, None]
+    k = (torch.randn(slots, kv_heads * dim, device=device) * gain).to(torch.bfloat16)
+    v = (torch.randn(slots, kv_heads * dim, device=device) * gain.flip(0)).to(torch.bfloat16)
+    k_cache = torch.zeros(slots, kv_heads, dim, device=device, dtype=fmt.elem_store_dtype)
+    v_cache = torch.zeros_like(k_cache)
+    k_scale = torch.zeros(slots, kv_heads, 1, device=device, dtype=fmt.scale_store_dtype)
+    v_scale = torch.zeros_like(k_scale)
+    store_kv_rows(fmt, k, v, torch.arange(slots, device=device, dtype=torch.int32), k_cache, v_cache, k_scale, v_scale)
+
+    block_table = torch.randperm(pages, device=device).to(torch.int32).view(1, pages)
+    token_to_req = torch.zeros(rows, device=device, dtype=torch.int32)
+    indices = torch.stack([torch.randperm(slots, device=device)[:topk] for _ in range(rows)]).to(torch.int32)
+    indices[:, -5:] = -1
+    q = torch.randn(rows, q_heads, dim, device=device, dtype=torch.bfloat16)
+
+    out = qsa_sparse_paged_attention(
+        q, k_cache.view(pages, PAGE_SIZE, kv_heads, dim), v_cache.view(pages, PAGE_SIZE, kv_heads, dim),
+        indices, block_table, token_to_req, kv_format=fmt, k_scale=k_scale, v_scale=v_scale,
+    )
+
+    def dequantize(codes, scale):
+        if fmt_name == "fp8_per_token_head":
+            return codes.cpu().view(torch.float8_e4m3fn).float().to(device) * scale
+        return codes.float() * scale
+
+    k_ref, v_ref = dequantize(k_cache, k_scale), dequantize(v_cache, v_scale)
+    safe = indices.clamp_min(0).long()
+    physical = block_table[0, safe // PAGE_SIZE].long() * PAGE_SIZE + safe % PAGE_SIZE
+    group = q_heads // kv_heads
+    expected = torch.empty(rows, q_heads, dim, device=device, dtype=torch.float32)
+    for row in range(rows):
+        live = physical[row][indices[row] >= 0]
+        for head in range(q_heads):
+            keys = k_ref[live, head // group]
+            logits = (q[row, head].float() @ keys.T) * dim**-0.5
+            expected[row, head] = logits.softmax(-1) @ v_ref[live, head // group]
+    torch.testing.assert_close(out.float(), expected, atol=2e-2 * expected.abs().max().item(), rtol=2e-2)

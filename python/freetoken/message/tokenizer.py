@@ -27,7 +27,8 @@ class BatchTokenizerMsg(BaseTokenizerMsg):
 @dataclass
 class DetokenizeMsg(BaseTokenizerMsg):
     uid: int
-    next_token: int
+    # tokens committed this step, in order: one per decode step, up to k+1 per speculative verify
+    next_tokens: List[int]
     finished: bool
     finish_reason: str | None = None
     # The stop string that ended generation (if any), so the detokenizer can trim it
@@ -54,6 +55,10 @@ class DetokenizeMsg(BaseTokenizerMsg):
     mtp_enabled: bool = False
     mtp_drafted: int = 0
     mtp_accepted: int = 0
+    # Scheduler-measured per-request timings (ReqStats.finish): on the terminal reply,
+    # plus every intermediate reply when sampling_params.timings_per_token was set;
+    # None on other intermediate replies, errors and aborts.
+    timings: dict | None = None
 
 
 @dataclass
@@ -78,6 +83,8 @@ class TokenizeMsg(BaseTokenizerMsg):
     sampling_params: SamplingParams
     chat_template_kwargs: Dict[str, Any] | None = None
     tools: List[Dict[str, Any]] | None = None
+    images: List[bytes] | None = None
+    inline_system_policy: str | None = None
 
 
 @dataclass
@@ -122,6 +129,21 @@ class DecodeTuneResultMsg(BaseTokenizerMsg):
     request_id: str
     status: str  # "ok" | "rejected"
     result: Dict[str, Any] | None = None
+    error: str | None = None
+
+
+@dataclass
+class FlushCacheMsg(BaseTokenizerMsg):
+    # api server -> tokenizer worker (pure passthrough to FlushCacheBackendMsg).
+    request_id: str
+    timeout: float = 0.0
+
+
+@dataclass
+class FlushCacheResultMsg(BaseTokenizerMsg):
+    # scheduler -> detokenizer worker (passthrough to FlushCacheReply).
+    request_id: str
+    status: str  # "ok" | "busy" | "timeout" | "unsupported"
     error: str | None = None
 
 

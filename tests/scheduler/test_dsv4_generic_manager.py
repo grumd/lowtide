@@ -14,8 +14,8 @@ import pytest
 import torch
 
 from freetoken.core import Req, SamplingParams
-from freetoken.kvcache.dsv4_cost_model import dsv4_pool_sizes
-from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+from freetoken.kvcache.dsv4.v4_cost_model import dsv4_pool_sizes
+from freetoken.kvcache.dsv4.v4_pool import DSV4PagedKVCache
 from freetoken.models.deepseek_v4.args import DeepseekV4Args
 from freetoken.scheduler.cache import CacheManager
 
@@ -70,7 +70,7 @@ def _lifecycle(cm, req, total_len, finished=True):
     while req.cached_len < total_len:
         req.append_host(torch.tensor([9000 + req.cached_len % 97], dtype=torch.int32))
         req.decode_batch_idx = i + 1
-        cm.maybe_free_swa_out_of_window([req], forward_iter=i)
+        cm.maybe_free_swa_out_of_window([req])
         cm.allocate_paged([req])
         req.complete_one()
         i += 1
@@ -190,6 +190,33 @@ def test_chunk_boundaries_stay_page_aligned_under_unaligned_budget():
     cm.check_integrity()
 
 
+@pytest.mark.parametrize("replay, new_tokens, cached", [(0, 2, 256), (P, 2, 128), (P, 200, 256)])
+def test_admission_caps_the_hit_by_the_pools_prefix_replay(replay, new_tokens, cached):
+    """A pool whose model recomputes the prompt's tail (DeepSeek-V4.1's bounded decoder replay) holds
+    back ``prefix_replay_tokens`` at admission: the match ends at or before ``L - replay`` (page-aligned
+    by the radix), a hit already that far from the prompt end is untouched, and the request's
+    ``prompt_len`` is the whole prompt."""
+    from freetoken.scheduler.decode import DecodeManager
+    from freetoken.scheduler.prefill import PrefillManager
+    from freetoken.scheduler.table import TableManager
+    from freetoken.scheduler.utils import PendingReq
+
+    cm, pool, pt = _stack(num_pages=48)
+    pool.prefix_replay_tokens = replay
+    prompt = torch.arange(1, 301, dtype=torch.int32)
+    _lifecycle(cm, _req(MRR - 1, prompt, n_decode=310), total_len=310)
+    pm = PrefillManager(cm, TableManager(max_running_reqs=MRR, page_table=pt), DecodeManager(page_size=P))
+    tokens = torch.cat([prompt, torch.arange(1000, 1000 + new_tokens, dtype=torch.int32)])
+    pm.pending_list = [PendingReq(uid=1, input_ids=tokens, sampling_params=SamplingParams(max_tokens=1))]
+    batch = pm.schedule_next_batch(1024)
+    req = batch.reqs[0]
+    assert req.cached_len == cached and req.extend_len == len(tokens) - cached and req.prompt_len == len(tokens)
+    cm.allocate_paged(batch.reqs)
+    req.complete_one()
+    cm.cache_req(req, finished=True)
+    cm.check_integrity()
+
+
 def test_abort_anywhere_fuzz_conserves_and_isolates():
     """admit / extend / finish-or-abort at arbitrary points with shared prefixes + eviction
     pressure, on a deliberately small window tier. The generic conservation check (free + tree
@@ -239,7 +266,7 @@ def test_abort_anywhere_fuzz_conserves_and_isolates():
                 continue
             req.append_host(torch.tensor([rng.randint(1, 200)], dtype=torch.int32))
             req.decode_batch_idx += 1
-            cm.maybe_free_swa_out_of_window([req], forward_iter=it)
+            cm.maybe_free_swa_out_of_window([req])
             cm.allocate_paged([req])
             req.complete_one()
         elif live:                                # finish / ABORT at whatever state it is in

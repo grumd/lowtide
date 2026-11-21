@@ -3,66 +3,26 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from freetoken.layers.quantization import QuantConfig, QuantKind
 from freetoken.models.config import (
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
     ModelConfig,
     RotaryConfig,
+    mrope_layout_from_rope_params,
 )
+from freetoken.models.qwen3_vl.config import parse_vision_config
 
 
-def _quant_roles(hf_config: Any) -> tuple[str, str, str, str, tuple[int, int] | None]:
-    """``(expert, attn, dense, lm_head, weight_block_size)`` from the shared dialect layer.
-
-    The ``QuantConfig`` the engine uses is the single source of truth; this maps its
-    per-module ``QuantKind`` onto the loader/engine role strings, preserving two
-    conventions: block-fp8 quantizes *every* projection (so the dense roles report
-    ``none`` -- the fp8 reader owns them), and NVFP4 routed experts imply the shared
-    expert is native FP4 (``dense="nvfp4"``)."""
-    from freetoken.models.quant import quant_config_for, quant_kind_str
-    from freetoken.models.register import get_model_spec
-
-    spec = get_model_spec(hf_config.architectures[0])
-    qc = quant_config_for(hf_config, spec)
-
-    def kind(prefix: str) -> str:
-        try:
-            return quant_kind_str(qc, prefix)
-        except Exception:  # noqa: BLE001 -- a fused probe that mixes schemes is not an expert/attn role
-            return "none"
-
-    num_experts = int(getattr(getattr(hf_config, "text_config", hf_config), "num_experts", 0) or 0)
-    if num_experts > 0:
-        expert_kind = kind("model.layers.0.mlp.experts")
-    elif getattr(qc, "block", None) is not None:
-        # dense block-fp8: there are no routed experts, but the role still flags the fp8
-        # dense reader (a generic "Linear" group must not leak into the expert role).
-        expert_kind = "fp8_block"
-    else:
-        expert_kind = "none"
-    attn_kinds = (
-        kind("model.layers.0.self_attn.qkv_proj"),
-        kind("model.layers.0.linear_attn.in_proj_qkvz"),
-    )
-    dense_kind = kind("model.layers.0.mlp.shared_expert.gate_up_proj")
-    if dense_kind == "none":
-        dense_kind = kind("model.layers.0.mlp.gate_up_proj")
-    lm_kind = kind("lm_head")
-    block = getattr(qc, "block", None)
-
-    expert = {"fp8_block": "fp8_block", "nvfp4": "nvfp4", "fp8_tensor": "fp8"}.get(expert_kind, "none")
-    if expert == "fp8_block":
-        # block-fp8 quantizes attention/GDN/shared expert too; their reader ignores these roles.
-        return expert, "none", "none", "none", block
-    if "nvfp4" in attn_kinds:
-        attn = "nvfp4"
-    elif "fp8_tensor" in attn_kinds:
-        attn = "fp8_pertensor"
-    else:
-        attn = "none"
-    dense = "nvfp4" if expert == "nvfp4" or dense_kind == "nvfp4" else "none"
-    lm_head = "nvfp4" if lm_kind == "nvfp4" else "none"
-    return expert, attn, dense, lm_head, block
+def _expert_quant(hf_config: Any, text: Any) -> tuple[str, tuple[int, int] | None]:
+    """The routed experts' quant kind as the engine's format tag, with the scale block of block-fp8."""
+    if not (getattr(text, "num_experts", 0) or 0):
+        return "none", None
+    # the engine reads this tag for its MoE strategy decisions; every module takes its own scheme from the QuantConfig when it is built
+    scheme = QuantConfig.from_hf(hf_config).scheme_for_name("model.language_model.layers.0.mlp.experts.0.gate_proj")
+    if scheme is None:
+        return "none", None
+    return str(scheme.kind), scheme.weight.group if scheme.kind is QuantKind.FP8_BLOCK else None
 
 
 def _layer_types(text: Any) -> list[str]:
@@ -106,7 +66,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
 
-    expert_quant, attn_quant, dense_quant, lm_head_quant, weight_block_size = _quant_roles(hf_config)
+    expert_quant, weight_block_size = _expert_quant(hf_config, text)
 
     # Dense variants (e.g. Qwen3.6-27B) report num_experts==0: route the decoder MLP through
     # the dense Qwen3_5DenseMLP instead of the MoE block.
@@ -128,12 +88,20 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else ()
     )
 
+    # 3-axis rope only with vision; text-only serving keeps the 1-D partial rope and the decode-graph layout
+    vision_config = parse_vision_config(hf_config)
     full_rotary = RotaryConfig(
         head_dim=head_dim,
         rotary_dim=rotary_dim,
         max_position=text.max_position_embeddings,
         base=rope_theta,
         scaling=rope_scaling,
+        mrope_section=(
+            list(rope_params["mrope_section"])
+            if vision_config is not None and "mrope_section" in rope_params
+            else None
+        ),
+        mrope_layout=mrope_layout_from_rope_params(rope_params),
     )
     full_group = FullAttentionGroupConfig(
         name="full",
@@ -181,14 +149,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
         use_qk_norm=True,
         model_type=getattr(hf_config, "model_type", "qwen3_5_moe"),
         architectures=getattr(hf_config, "architectures", ["Qwen3_5MoeForConditionalGeneration"]),
-        vision_config=None,  # text-only milestone
+        vision_config=vision_config,
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,
         weight_block_size=weight_block_size,
-        attn_quant=attn_quant,
-        dense_quant=dense_quant,
-        lm_head_quant=lm_head_quant,
         mtp_enabled=mtp_enabled,
         mtp_num_layers=mtp_num_layers,
     )

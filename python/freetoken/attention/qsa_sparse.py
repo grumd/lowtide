@@ -97,6 +97,10 @@ class QSASparseMetadata(BaseAttnMetadata):
     positions:        torch.Tensor | None = None  # [T] int32, logical query positions
     # --kv-tier prefill: (source pages, staged block table, staging buffer, page count)
     tier_plan:        tuple | None = None
+    # mrope only, built once per forward: row r of the caches is token r's [cos | sin] (queries) or its group start's (keys)
+    rope_rows:        torch.Tensor | None = None  # [T] int32 arange
+    q_rope_cache:     torch.Tensor | None = None  # [T, rotary_dim] float32
+    k_rope_cache:     torch.Tensor | None = None  # [T, rotary_dim] float32
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -138,6 +142,13 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._idx_slot = {lid: i for i, lid in enumerate(group.layer_ids)}
         self.rotary_config = group.rotary_config
         self._index_cos_sin: torch.Tensor | None = None
+        self._section_table: torch.Tensor | None = None
+        if group.rotary_config.mrope_section is not None:
+            from freetoken.layers.rotary import build_section_table
+
+            self._section_table = build_section_table(
+                tuple(group.rotary_config.mrope_section), group.rotary_config.mrope_layout
+            ).to(self.device)
 
         self.tiered = bool(getattr(self.kvcache, "tiered", False))
         if self.tiered:
@@ -176,6 +187,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         # MTP-verify staging (fixed prefill extend; separate addressing layout)
         self._graph_verify: dict[str, torch.Tensor] = {}
         self.capture_bs: List[int] = []
+        self._capture_rows_per_req = 1
 
     @staticmethod
     def _qsa_group(config: ModelConfig):
@@ -198,24 +210,29 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
     def _index_rope_cache(self) -> torch.Tensor:
         """cos/sin table of the indexer rope: same rotary_dim and frequencies as the main
-        attention, ``head_size`` 128 instead of 256, so it is a separate get_rope instance.
+        attention with ``head_size`` 128 instead of 256, so the attention's own table.
 
         The table itself (not RotaryEmbedding.forward) because the indexer's norm+rope is one
         fused kernel and the compressed keys rope at their group's position, not the query's."""
         if self._index_cos_sin is None:
-            from freetoken.layers.rotary import get_rope
+            from freetoken.layers.rotary import rope_cos_sin_table
 
             rotary = self.rotary_config
             with torch.device(self.device):
-                rope = get_rope(
-                    head_dim=self.index_head_dim,
-                    rotary_dim=rotary.rotary_dim,
-                    max_position=rotary.max_position,
-                    base=rotary.base,
-                    rope_scaling=tuple(rotary.scaling.items()) if rotary.scaling else None,
+                self._index_cos_sin = rope_cos_sin_table(
+                    self.index_head_dim,
+                    rotary.rotary_dim,
+                    rotary.max_position,
+                    rotary.base,
+                    tuple(rotary.scaling.items()) if rotary.scaling else None,
                 )
-            self._index_cos_sin = rope._cos_sin_cache.to(self.device)
         return self._index_cos_sin
+
+    def _index_rope_rows(self, positions: torch.Tensor) -> torch.Tensor:
+        """Per-token indexer cos/sin rows for [3, n] mrope positions."""
+        from freetoken.layers.rotary import mrope_cos_sin_rows
+
+        return mrope_cos_sin_rows(self._index_rope_cache(), positions, self._section_table)
 
     # ----- metadata -----------------------------------------------------------------------
     def prepare_metadata(self, batch: Batch) -> None:
@@ -270,7 +287,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md.block_table = self._graph["block_table"][:bs]
         md.seq_lens = self._graph["kvlen"][:bs]
         md.ring_slots = self._graph["table_idx"][:bs]
-        md.token_to_req = self._graph["token_to_req"][:bs]
+        md.token_to_req = self._graph["token_to_req"][: bs * self._capture_rows_per_req]
         md.cu_seqlens = self._graph["cu_seqlens"][: bs + 1]
 
     def _snapshot_decode(self, md: QSASparseMetadata, batch: Batch) -> None:
@@ -336,6 +353,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.block_table,
             md.token_to_req,
             torch.empty_like(q),
+            kv_format=self.kvcache.kv_format,
+            k_scale=self.kvcache.k_scale(layer_id),
+            v_scale=self.kvcache.v_scale(layer_id),
         )
 
     # ----- KV tiering -----------------------------------------------------------------------
@@ -555,6 +575,17 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md.positions = batch.positions
         out_loc = batch.out_loc.to(torch.int64)
         positions = batch.positions.to(torch.int64)
+        if self._section_table is not None:
+            rope_positions = batch.get_attn_positions()
+            if rope_positions.dim() == 1:
+                rope_positions = rope_positions.unsqueeze(0).expand(3, -1)
+            rope_positions = rope_positions.to(torch.int32)
+            self.kvcache.rope_positions.index_copy_(0, out_loc, rope_positions.t().contiguous())
+            # groups are ratio-aligned within a page, so the group start is the slot rounded down
+            first_pos = self.kvcache.rope_positions.index_select(0, out_loc - out_loc % self.ratio).t()
+            md.rope_rows = torch.arange(out_loc.numel(), dtype=torch.int32, device=self.device)
+            md.q_rope_cache = self._index_rope_rows(rope_positions)
+            md.k_rope_cache = self._index_rope_rows(first_pos)
         rows = torch.arange(out_loc.numel(), device=self.device)
         req = md.token_to_req.to(torch.int64)
         slots = md.ring_slots.to(torch.int64).index_select(0, req)
@@ -595,10 +626,14 @@ class QSASparseAttnBackend(BaseAttnBackend):
             pooled,
             first,
         )
+        if md.k_rope_cache is None:
+            rope_positions, rope_cache = first, self._index_rope_cache()
+        else:
+            rope_positions, rope_cache = md.rope_rows, md.k_rope_cache
         qsa_index_norm_rope(
             pooled,
-            first,
-            self._index_rope_cache(),
+            rope_positions,
+            rope_cache,
             index.k_norm_weight,
             index.eps,
             self.kvcache.cmp_k_cache(slot),
@@ -621,10 +656,14 @@ class QSASparseAttnBackend(BaseAttnBackend):
         q_index = self._scratch(
             "q_index", rows, self.index_heads, self.index_head_dim, dtype=self.dtype
         )
+        if md.q_rope_cache is None:
+            rope_positions, rope_cache = positions, self._index_rope_cache()
+        else:
+            rope_positions, rope_cache = md.rope_rows, md.q_rope_cache
         qsa_index_norm_rope(
             index.q.view(-1, self.index_head_dim),
-            positions,
-            self._index_rope_cache(),
+            rope_positions,
+            rope_cache,
             index.q_norm_weight,
             index.eps,
             q_index.view(-1, self.index_head_dim),
@@ -711,13 +750,15 @@ class QSASparseAttnBackend(BaseAttnBackend):
         return torch.empty((rows, *shape), dtype=dtype, device=self.device)
 
     # ----- CUDA graph (decode) --------------------------------------------------------------
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
         self.capture_bs = sorted(bs_list)
+        self._capture_rows_per_req = rows_per_req
         max_bs = max(bs_list)
+        rows = max_bs * rows_per_req
         width = get_global_ctx().page_table.shape[1]
         pages = -(-width // self.page_size)
         columns = pages * self.cmp_page_size
-        chunk = max(1, min(max_bs, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1)))
+        chunk = max(1, min(rows, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1)))
         topk_scratch = self._topk_scratch_width(columns)
 
         def empty(*shape: int, dtype: torch.dtype) -> torch.Tensor:
@@ -727,15 +768,15 @@ class QSASparseAttnBackend(BaseAttnBackend):
             "block_table": torch.zeros((max_bs, pages), dtype=torch.int32, device=self.device),
             "kvlen": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
             "table_idx": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
-            "token_to_req": torch.arange(max_bs, dtype=torch.int32, device=self.device),
-            "cu_seqlens": torch.arange(max_bs + 1, dtype=torch.int32, device=self.device),
+            "token_to_req": torch.arange(max_bs, dtype=torch.int32, device=self.device).repeat_interleave(rows_per_req),
+            "cu_seqlens": torch.arange(max_bs + 1, dtype=torch.int32, device=self.device) * rows_per_req,
             "logits": empty(chunk, columns, dtype=torch.float32),
-            "visible": empty(max_bs, dtype=torch.int32),
-            "blocks": empty(max_bs, self.block_topk, dtype=torch.int32),
-            "indices": empty(max_bs, self.select_width, dtype=torch.int32),
-            "pooled": empty(max_bs, self.index_head_dim, dtype=self.dtype),
-            "first_pos": empty(max_bs, dtype=torch.int32),
-            "q_index": empty(max_bs, self.index_heads, self.index_head_dim, dtype=self.dtype),
+            "visible": empty(rows, dtype=torch.int32),
+            "blocks": empty(rows, self.block_topk, dtype=torch.int32),
+            "indices": empty(rows, self.select_width, dtype=torch.int32),
+            "pooled": empty(rows, self.index_head_dim, dtype=self.dtype),
+            "first_pos": empty(rows, dtype=torch.int32),
+            "q_index": empty(rows, self.index_heads, self.index_head_dim, dtype=self.dtype),
         }
         if topk_scratch:
             self._graph["topk_scratch"] = empty(chunk, topk_scratch, dtype=torch.int32)
@@ -755,7 +796,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
     def prepare_for_replay(self, batch: Batch) -> None:
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata)
-        assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
+        assert batch.active_table_idx is not None, "graph batch is missing its page-table rows"
         self._stage_decode(md, batch.padded_size, batch.active_table_idx.to(torch.int64))
 
     def reset_capture(self) -> None:

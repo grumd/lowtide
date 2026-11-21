@@ -1,6 +1,7 @@
 """What each checkpoint's quant config resolves to: the dialect, the method behind every layer, and agreement with the stored tensors.
 
-Rows need the checkpoint's config.json locally (/mnt/nvme/models or the HF cache); absent ones skip.
+Rows need the checkpoint's config.json locally (/mnt/nvme/models or the HF cache); absent ones skip. The
+stored-tensor scan also reads $FREETOKEN_TEST_MODELS_ROOT.
 """
 
 from __future__ import annotations
@@ -20,19 +21,20 @@ import pytest
 import torch
 
 from freetoken.distributed.info import set_tp_info, try_get_tp_info
-from freetoken.engine.config import EngineConfig, checkpoint_quant_config
+from freetoken.engine.config import EngineConfig
 from freetoken.layers import set_rope_device
 from freetoken.layers.quantization import (
     CompressedTensorsConfig,
     Fp8BlockConfig,
-    KernelSelectionError,
     ModelOptConfig,
     Mxfp4Config,
     NoQuantConfig,
     QuantConfig,
     QuantKind,
 )
+from freetoken.layers.quantization.embedding import Df11EmbeddingMethod, UnquantizedEmbeddingMethod
 from freetoken.layers.quantization.linear import (
+    Df11LinearMethod,
     Fp8BlockLinearMethod,
     Fp8TensorLinearMethod,
     Mxfp8LinearMethod,
@@ -42,10 +44,14 @@ from freetoken.layers.quantization.linear import (
 from freetoken.layers.quantization.moe import Fp8BlockMoEMethod, Mxfp4MoEMethod, Nvfp4MoEMethod, UnquantizedMoEMethod
 from freetoken.models import create_model
 from freetoken.models.gpt_oss.moe import GptOssMoELayer, GptOssOffloadMoELayer
-from freetoken.models.register import get_model_spec
+from freetoken.models.register import checkpoint_quant_config, get_model_spec
+from freetoken.third_party import gguf
+from freetoken.utils.hf import sidecar_quantization_config
 from freetoken.utils.torch_utils import torch_dtype
 
 MODELS = "/mnt/nvme/models"
+# the stored-tensor scan takes every checkpoint under this root (the case table above matches by name)
+SCAN_ROOT = os.environ.get("FREETOKEN_TEST_MODELS_ROOT", MODELS)
 HF_CACHE = os.path.expanduser("~/.cache/huggingface/hub")
 
 BF16, FP8B, FP8T, MXFP8, NVFP4 = UnquantizedLinearMethod, Fp8BlockLinearMethod, Fp8TensorLinearMethod, Mxfp8LinearMethod, Nvfp4LinearMethod
@@ -66,11 +72,14 @@ def op_at(model, path: str):
     return op
 
 
-def build_meta_model(path: str, strategy: str):
+def build_meta_model(path: str, strategy: str, online: str | None = None, online_modules: tuple[str, ...] = ()):
     if try_get_tp_info() is None:
         set_tp_info(0, 1)
     set_rope_device(torch.device("cpu"))
-    config = EngineConfig(model_path=path, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy=strategy)
+    config = EngineConfig(
+        model_path=path, tp_info=try_get_tp_info(), dtype=torch.bfloat16, moe_strategy=strategy,
+        online_quant=online, online_quant_modules=online_modules,
+    )
     from freetoken.engine.engine import _decode_target
 
     object.__setattr__(config.model_config, "moe_strategy", strategy)
@@ -118,14 +127,8 @@ class Case:
     skip_if: Callable[[], bool] | None = None
     env: dict[str, str] = field(default_factory=dict)
     check: Callable[[Any, dict], None] | None = None  # family extras beyond the method table
-
-
-def _installed(module: str) -> bool:
-    try:
-        __import__(module)
-        return True
-    except ImportError:
-        return False
+    online: str | None = None  # --online-quant
+    online_modules: tuple[str, ...] = ()  # --online-quant-modules
 
 
 def _qwen35_fp8(model, idx):
@@ -161,13 +164,18 @@ def _dsv4(model, idx):
     assert "model.head.weight" in keys and not any(".ffn.experts." in k for k in keys)
 
 
+def _banked_experts(model, idx):
+    experts = op_at(model, f"model.layers.{idx['lin']}.mlp.experts")
+    assert not experts.state_dict()
+
+
 def _gpt_oss(cls):
     def check(model, idx):
         experts = op_at(model, "model.layers.0.mlp.experts")
         assert type(experts) is cls
         assert experts.interleaved and experts.alpha == pytest.approx(1.702) and experts.limit == 7.0
         if cls is GptOssMoELayer:
-            assert experts.gate_up_proj_blocks.dtype is torch.uint8 and experts.gate_up_proj_blocks.dim() == 4
+            assert not experts.state_dict()
 
     return check
 
@@ -197,13 +205,48 @@ CASES = [
         "model.layers.{lin}.mlp.shared_expert.down_proj": NVFP4, "model.layers.{lin}.mlp.experts": Nvfp4MoEMethod,
         "lm_head": NVFP4,
     }, check=_qwen35_nvfp4),
-    # resident NVFP4 experts have no kernel without vLLM's Marlin
-    Case("Qwen3.6-35B-A3B-NVFP4", ModelOptConfig, {}, strategy="fused", raises=KernelSelectionError,
-         skip_if=lambda: not _installed("flashinfer") or _installed("vllm")),
+    # resident NVFP4 experts load through the expert-bank loader, not the state dict
+    Case("Qwen3.6-35B-A3B-NVFP4", ModelOptConfig, {"model.layers.{lin}.mlp.experts": (Nvfp4MoEMethod, "triton")}, strategy="fused", check=_banked_experts),
     Case("Qwen3.8-27B-NVFP4", ModelOptConfig, {
         "model.layers.{lin}.linear_attn.in_proj_qkvz": FP8T, "model.layers.{full}.self_attn.o_proj": FP8T,
         "model.layers.{lin}.mlp.gate_up_proj": NVFP4, "model.layers.{lin}.mlp.down_proj": NVFP4, "lm_head": NVFP4,
     }, strategy="auto"),
+    # llm-compressor exports of the dense 27B: every Linear NVFP4, GDN in_proj included (sakamakismile); channel-fp8 attention / GDN / lm_head over NVFP4 MLPs (unsloth)
+    Case("sakamakismile/Qwen3.6-27B-NVFP4", CompressedTensorsConfig, {
+        "model.layers.{lin}.linear_attn.in_proj_qkvz": NVFP4, "model.layers.{lin}.linear_attn.in_proj_ba": NVFP4,
+        "model.layers.{lin}.linear_attn.out_proj": NVFP4, "model.layers.{full}.self_attn.qkv_proj": NVFP4,
+        "model.layers.{lin}.mlp.gate_up_proj": NVFP4, "model.layers.{lin}.mlp.down_proj": NVFP4, "lm_head": BF16,
+    }, strategy="auto", check=_qwen35_fp8),
+    Case("unsloth/Qwen3.8-27B-NVFP4", CompressedTensorsConfig, {
+        "model.layers.{lin}.linear_attn.in_proj_qkvz": FP8T, "model.layers.{lin}.linear_attn.in_proj_ba": BF16,
+        "model.layers.{lin}.linear_attn.out_proj": FP8T, "model.layers.{full}.self_attn.o_proj": FP8T,
+        "model.layers.{lin}.mlp.gate_up_proj": NVFP4, "model.layers.{lin}.mlp.down_proj": NVFP4, "lm_head": FP8T,
+    }, strategy="auto", check=_qwen35_fp8),
+    # llm-compressor exports of the 35B MoE: NVFP4 everywhere but the GDN and the routers (RedHatAI); channel-fp8 attention / GDN / lm_head with NVFP4 experts and shared expert (unsloth)
+    Case("RedHatAI/Qwen3.6-35B-A3B-NVFP4", CompressedTensorsConfig, {
+        "model.layers.{lin}.linear_attn.in_proj": BF16, "model.layers.{lin}.linear_attn.out_proj": BF16,
+        "model.layers.{full}.self_attn.qkv_proj": NVFP4, "model.layers.{full}.self_attn.o_proj": NVFP4,
+        "model.layers.{lin}.mlp.shared_expert.gate_up_proj": NVFP4, "model.layers.{lin}.mlp.experts": Nvfp4MoEMethod,
+        "model.layers.{lin}.mlp.gate": BF16, "lm_head": BF16,
+    }, check=_no_split),
+    # static per-tensor fp8 attention / GDN / shared expert with NVFP4 experts; the ignore list names every ``experts.N`` container
+    Case("primitive-ai/Ornith-1.5-35B-A3B-mixed-NVFP4-FP8", CompressedTensorsConfig, {
+        "model.layers.{lin}.linear_attn.in_proj_qkvz": FP8T, "model.layers.{lin}.linear_attn.in_proj_ba": BF16,
+        "model.layers.{full}.self_attn.qkv_proj": FP8T, "model.layers.{lin}.mlp.shared_expert.gate_up_proj": FP8T,
+        "model.layers.{lin}.mlp.experts": Nvfp4MoEMethod, "model.layers.{lin}.mlp.gate": BF16, "lm_head": BF16,
+    }, check=_qwen35_fp8),
+    # block-fp8 attention / GDN / shared expert with NVFP4 experts, shipped as one model.safetensors without an index
+    Case("kyaky/Qwen3.6-35B-A3B-Uncensored-NVFP4", CompressedTensorsConfig, {
+        "model.layers.{lin}.linear_attn.in_proj_qkvz": FP8B, "model.layers.{lin}.linear_attn.in_proj_ba": BF16,
+        "model.layers.{full}.self_attn.qkv_proj": FP8B, "model.layers.{lin}.mlp.shared_expert.gate_up_proj": FP8B,
+        "model.layers.{lin}.mlp.experts": Nvfp4MoEMethod, "model.layers.{lin}.mlp.gate": BF16, "lm_head": BF16,
+    }, check=_qwen35_fp8),
+    Case("unsloth/Qwen3.6-35B-A3B-NVFP4-Fast", CompressedTensorsConfig, {
+        "model.layers.{lin}.linear_attn.in_proj_qkvz": FP8T, "model.layers.{lin}.linear_attn.in_proj_ba": BF16,
+        "model.layers.{lin}.linear_attn.out_proj": FP8T, "model.layers.{full}.self_attn.qkv_proj": FP8T,
+        "model.layers.{lin}.mlp.shared_expert.gate_up_proj": NVFP4, "model.layers.{lin}.mlp.experts": Nvfp4MoEMethod,
+        "model.layers.{lin}.mlp.gate": BF16, "lm_head": FP8T,
+    }, check=_qwen35_fp8),
     Case("Qwen3.6-27B", NoQuantConfig, {
         "model.layers.{lin}.linear_attn.in_proj": BF16, "model.layers.{lin}.mlp.gate_up_proj": BF16, "lm_head": BF16,
     }, strategy="auto", check=_no_split),
@@ -222,7 +265,8 @@ CASES = [
         "model.layers.{lin}.mlp.down_proj": FP8B, "lm_head": BF16,
     }, strategy="auto") for name in ("Qwen/Qwen3.8-27B-FP8", "Qwen/Qwen3.6-27B-FP8")],
     Case("RedHatAI/Muse-Glimmer-30B-NVFP4", CompressedTensorsConfig, {
-        "model.layers.0.self_attn.qkvg_proj": NVFP4, "model.layers.0.self_attn.o_proj": NVFP4,
+        "model.layers.0.self_attn.qkv_proj": NVFP4, "model.layers.0.self_attn.gate_proj": NVFP4,
+        "model.layers.0.self_attn.o_proj": NVFP4,
         "model.layers.0.mlp.gate_up_proj": NVFP4, "model.layers.0.mlp.down_proj": NVFP4, "lm_head": BF16,
     }, strategy="auto"),
     Case("nvidia/Gemma-4-31B-IT-NVFP4", ModelOptConfig, {
@@ -232,6 +276,11 @@ CASES = [
     Case("google/gemma-4-12B-it", NoQuantConfig, {
         "model.layers.0.feed_forward.shared_mlp.gate_up_proj": BF16, "model.layers.0.self_attn.qkv_proj": BF16,
     }, strategy="auto", check=_gemma_tied_head),
+    # online df11 leaves the table tied to the LM head bf16 and converts the rest
+    Case("google/gemma-4-12B-it", NoQuantConfig, {
+        "model.embed_tokens": UnquantizedEmbeddingMethod, "model.layers.0.self_attn.qkv_proj": Df11LinearMethod,
+        "model.layers.0.feed_forward.shared_mlp.gate_up_proj": Df11LinearMethod,
+    }, strategy="auto", online="df11"),
     Case("Qwen/Qwen3-4B", NoQuantConfig, {
         "model.layers.0.self_attn.qkv_proj": BF16, "model.layers.0.self_attn.o_proj": BF16,
         "model.layers.0.mlp.gate_up_proj": BF16, "model.layers.0.mlp.down_proj": BF16,
@@ -256,6 +305,11 @@ CASES = [
         "model.hyper_connection_mixer.input_mix_weight_down": BF16,
         "model.layers.{ple}.ple.key_proj": BF16, "model.layers.{ple}.ple.value_proj": BF16,
     }, check=_no_split),
+    # the vision tower streams its blocks in one shared layout, so online df11 leaves it bf16
+    Case("RadixArk/Qwen3.8-Flash-Next-NVFP4", ModelOptConfig, {
+        "visual.blocks.0.attn.qkv": BF16, "visual.blocks.0.mlp.linear_fc1": BF16,
+        "model.layers.{full}.self_attn.qkv_proj": Df11LinearMethod, "model.layers.{lin}.mlp.experts": Nvfp4MoEMethod, "lm_head": BF16,
+    }, online="df11"),
     Case("deepseek-ai/DeepSeek-V4-Flash-0731", Fp8BlockConfig, {
         **{f"model.layers.2.{p}": (FP8B, "dsv4") for p in (
             "attn.wq_a", "attn.wq_b", "attn.wkv", "attn.wo_b", "attn.indexer.wq_b",
@@ -265,6 +319,11 @@ CASES = [
             "attn.compressor.wkv", "attn.compressor.wgate", "attn.indexer.weights_proj", "attn.indexer.compressor.wkv")},
         "model.head": (BF16, "torch"), "model.layers.2.ffn.experts": (Mxfp4MoEMethod, "triton"),
     }, check=_dsv4),
+    # online df11 leaves the compressors bf16: their forward reads the weight directly
+    Case("deepseek-ai/DeepSeek-V4-Flash-0731", Fp8BlockConfig, {
+        "model.embed": Df11EmbeddingMethod, "model.layers.2.attn.indexer.weights_proj": Df11LinearMethod,
+        "model.layers.2.attn.compressor.wkv": BF16, "model.layers.2.attn.compressor.wgate": BF16, "model.head": BF16,
+    }, online="df11"),
     Case("nvidia/MiniMax-M2.5-NVFP4", ModelOptConfig, {
         "model.layers.3.block_sparse_moe.experts": Nvfp4MoEMethod, "model.layers.3.self_attn.qkv_proj": BF16,
         "model.layers.3.self_attn.o_proj": BF16, "model.layers.3.block_sparse_moe.gate": BF16, "lm_head": BF16,
@@ -303,6 +362,17 @@ CASES = [
         "model.layers.{moe}.mlp.experts": Nvfp4MoEMethod, "model.layers.{moe}.mlp.shared_experts.gate_proj": NVFP4,
         "model.layers.{moe}.mlp.shared_experts.down_proj": NVFP4, "model.layers.{moe}.mlp.gate": BF16, "lm_head": BF16,
     }),
+    # online df11 takes only the layers the checkpoint leaves bf16, and never the LM head
+    Case("nvidia/GLM-4.7-NVFP4", ModelOptConfig, {
+        "model.embed_tokens": Df11EmbeddingMethod, "model.layers.{dense}.self_attn.q_proj": Df11LinearMethod,
+        "model.layers.{moe}.self_attn.o_proj": Df11LinearMethod, "model.layers.{dense}.mlp.gate_proj": NVFP4,
+        "model.layers.{moe}.mlp.shared_experts.down_proj": NVFP4, "model.layers.{moe}.mlp.experts": Nvfp4MoEMethod,
+        "model.layers.{moe}.mlp.gate": BF16, "lm_head": BF16,
+    }, online="df11"),
+    Case("nvidia/GLM-4.7-NVFP4", ModelOptConfig, {
+        "model.embed_tokens": UnquantizedEmbeddingMethod, "model.layers.{moe}.self_attn.q_proj": Df11LinearMethod,
+        "model.layers.{moe}.mlp.shared_experts.down_proj": NVFP4, "lm_head": BF16,
+    }, online="df11", online_modules=("model.layers.*.self_attn",)),
     Case("nvidia/GLM-5.3-NVFP4", ModelOptConfig, {
         "model.layers.{moe}.mlp.experts": Nvfp4MoEMethod, "model.layers.{moe}.mlp.gate": BF16,
         "model.layers.{moe}.mlp.shared_experts.gate_proj": BF16, "model.layers.{moe}.self_attn.o_proj": BF16, "lm_head": BF16,
@@ -316,11 +386,13 @@ CASES = [
     # hybrid decodes on the CPU executor too, so the expert kernel must have a CPU format
     Case("Qwen3.6-35B-A3B-NVFP4", ModelOptConfig, {"model.layers.{lin}.mlp.experts": (Nvfp4MoEMethod, "triton")}, strategy="hybrid"),
     Case("Qwen3.6-35B-A3B", NoQuantConfig, {"model.layers.{lin}.mlp.experts": (UnquantizedMoEMethod, "fused")}, strategy="hybrid"),
-    Case("Qwen3.6-35B-A3B-FP8", Fp8BlockConfig, {}, strategy="hybrid", raises=KernelSelectionError),
+    Case("Qwen3.6-35B-A3B-FP8", Fp8BlockConfig, {"model.layers.{lin}.mlp.experts": (Fp8BlockMoEMethod, "triton")}, strategy="hybrid"),
 ]
 
 
-@pytest.mark.parametrize("case", CASES, ids=[f"{c.name.split('/')[-1]}:{c.strategy}" for c in CASES])
+@pytest.mark.parametrize(
+    "case", CASES, ids=[f"{c.name.split('/')[-1]}:{c.strategy}" + "".join(f":{x}" for x in (c.online, *c.online_modules) if x) for c in CASES]
+)
 def test_probed_layers_get_the_method_their_config_says(case: Case, monkeypatch):
     path = model_dir(case.name)
     if path is None:
@@ -331,9 +403,9 @@ def test_probed_layers_get_the_method_their_config_says(case: Case, monkeypatch)
         monkeypatch.setenv(key, value)
     if case.raises is not None:
         with pytest.raises(case.raises):
-            build_meta_model(path, case.strategy)
+            build_meta_model(path, case.strategy, case.online, case.online_modules)
         return
-    model, model_config = build_meta_model(path, case.strategy)
+    model, model_config = build_meta_model(path, case.strategy, case.online, case.online_modules)
     assert type(model_config.quant) is case.dialect
     idx = _layer_indices(model)
     for template, expected in case.methods.items():
@@ -355,24 +427,128 @@ def test_probed_layers_get_the_method_their_config_says(case: Case, monkeypatch)
 # --------------------------------------------------------------------------- config without local weights
 
 
-def test_hub_ids_fetch_the_modelopt_sidecar(tmp_path, monkeypatch):
-    """An old ModelOpt export keeps its quantization config only in hf_quant_config.json."""
-    from huggingface_hub.utils import EntryNotFoundError
+def test_the_modelopt_sidecar_is_folded_into_the_hf_config(tmp_path):
+    """An old ModelOpt export keeps its quantization config only in hf_quant_config.json; the config loader folds it in, so every reader of the config sees it."""
+    from freetoken.utils import cached_load_hf_config
 
-    sidecar = tmp_path / "hf_quant_config.json"
-    sidecar.write_text(json.dumps({"producer": {"name": "modelopt", "version": "0.29.0"}, "quantization": {"quant_algo": "FP8", "exclude_modules": ["lm_head"]}}))
-
-    def fake_download(repo_id, filename, **_):
-        assert repo_id == "org/old-modelopt-fp8"
-        if filename == "hf_quant_config.json":
-            return str(sidecar)
-        raise EntryNotFoundError(f"no {filename}")
-
-    monkeypatch.setattr("freetoken.utils.hf.hf_hub_download", fake_download)
-    quant = checkpoint_quant_config("org/old-modelopt-fp8", SimpleNamespace(architectures=["Qwen3MoeForCausalLM"]), get_model_spec("Qwen3MoeForCausalLM"))
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_moe", "architectures": ["Qwen3MoeForCausalLM"]}))
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps({"producer": {"name": "modelopt", "version": "0.29.0"}, "quantization": {"quant_algo": "FP8", "exclude_modules": ["lm_head"]}}))
+    hf = cached_load_hf_config(str(tmp_path))
+    assert hf.quantization_config == {"quant_method": "modelopt", "quant_algo": "FP8", "exclude_modules": ["lm_head"]}
+    quant = checkpoint_quant_config(str(tmp_path), hf, get_model_spec("Qwen3MoeForCausalLM"))
     assert type(quant) is ModelOptConfig
     assert quant.scheme_for("model.layers.0.self_attn.q_proj").kind is QuantKind.FP8_TENSOR
     assert quant.scheme_for("lm_head") is None
+
+
+def test_compressed_tensors_ignore_names_the_module_alone():
+    """llm-compressor lists every skipped module, containers included: an ignored ``linear_attn`` must not shield the quantized projections under it (unsloth/Qwen3.6-35B-A3B-NVFP4-Fast)."""
+    q = {
+        "quant_method": "compressed-tensors", "format": "mixed-precision",
+        "config_groups": {"group_0": {
+            "targets": [r"re:.*linear_attn\.(in_proj_qkv|in_proj_z|out_proj)$"],
+            "weights": {"num_bits": 8, "type": "float", "strategy": "channel"}, "input_activations": {"dynamic": True},
+        }},
+        "ignore": ["model.language_model.layers.0.linear_attn", "model.language_model.layers.0.linear_attn.in_proj_b"],
+    }
+    quant = QuantConfig.from_hf(SimpleNamespace(quantization_config=q))
+    assert quant.scheme_for("model.language_model.layers.0.linear_attn.in_proj_qkv").kind is QuantKind.FP8_TENSOR
+    assert quant.scheme_for("model.language_model.layers.0.linear_attn.in_proj_b") is None
+    assert quant.scheme_for("model.language_model.layers.0.linear_attn") is None
+
+
+_NVFP4_GROUP = {"targets": ["Linear"], "weights": {"num_bits": 4, "type": "float", "group_size": 16}}
+
+
+@pytest.mark.parametrize("extra, has_input_scale", [
+    ({"config_groups": {"group_0": {**_NVFP4_GROUP, "input_activations": None}}}, False),
+    ({"config_groups": {"group_0": {**_NVFP4_GROUP, "input_activations": {"num_bits": 4, "type": "float", "group_size": 16}}}}, True),
+    ({}, True),
+    ({"with_input_scale": False}, False),
+    ({"config_groups": {"group_0": {**_NVFP4_GROUP, "input_activations": None}}, "with_input_scale": True}, True),
+], ids=["no input_activations", "input_activations", "no config_groups", "with_input_scale false", "with_input_scale true wins"])
+def test_modelopt_nvfp4_reads_the_activation_quantizer_from_config_groups(extra, has_input_scale):
+    """A ModelOpt export can say ``NVFP4`` with no activation quantizer: every config group then has ``input_activations`` null (vLLM #54427); an explicit ``with_input_scale`` wins."""
+    q = {"quant_method": "modelopt", "quant_algo": "NVFP4", **extra}
+    scheme = QuantConfig.from_hf(SimpleNamespace(quantization_config=q)).scheme_for("model.layers.0.mlp.down_proj")
+    assert scheme.kind is QuantKind.NVFP4 and scheme.has("input_scale") is has_input_scale
+
+
+def test_fp8_dialect_reads_the_block_size_and_the_nested_expert_dtype():
+    """DeepSeek-V4.1 keeps the ``fp8`` dialect with 32x32 blocks and puts ``expert_dtype`` inside quantization_config."""
+    from freetoken.layers.quantization.scheme import fp8_block_size
+
+    q = {"quant_method": "fp8", "activation_scheme": "dynamic", "weight_block_size": [32, 32], "scale_fmt": "ue8m0", "expert_dtype": "fp4"}
+    quant = QuantConfig.from_hf(SimpleNamespace(quantization_config=q))
+    assert type(quant) is Fp8BlockConfig and quant.block == 32
+    dense = quant.scheme_for("layers.3.attn.wq_a")
+    assert dense.kind is QuantKind.FP8_BLOCK and fp8_block_size(dense) == 32 and dense.weight.scale == "e8m0"
+    assert quant.storage(dense)["weight_scale_inv"].name == "scale"
+    assert quant.scheme_for("layers.3.ffn.experts.7.w1").kind is QuantKind.MXFP4
+    # the V4 128-block export still resolves to the 128 scheme
+    q128 = {"quant_method": "fp8", "activation_scheme": "dynamic", "weight_block_size": [128, 128], "scale_fmt": "ue8m0"}
+    assert fp8_block_size(QuantConfig.from_hf(SimpleNamespace(quantization_config=q128)).scheme_for("layers.3.attn.wq_a")) == 128
+    for bad in ([64, 64], [32, 128], [128]):
+        with pytest.raises(NotImplementedError):
+            QuantConfig.from_hf(SimpleNamespace(quantization_config={**q, "weight_block_size": bad}))
+
+
+def test_every_dialect_names_the_tensors_behind_its_schemes():
+    from freetoken.layers.quantization.registry import dialects
+
+    for cls in dialects():
+        for scheme in getattr(cls, "SCHEMES", {}).values():
+            assert set(cls.STORAGE[scheme.kind]) >= scheme.roles, f"{cls.__name__} does not name every tensor of {scheme}"
+
+
+@pytest.mark.parametrize("make_scheme", [
+    lambda s: None,
+    lambda s: s.fp8_tensor_scheme("fp32", per_row=True, input_scale=True),
+    lambda s: s.mxfp8_scheme(),
+    lambda s: s.nvfp4_scheme(input_scale=True),
+    lambda s: s.gguf_scheme([gguf.GGMLQuantizationType.Q5_K]),
+    lambda s: s.gguf_scheme([gguf.GGMLQuantizationType.NVFP4], scaled=True),
+], ids=["bf16", "fp8_tensor", "mxfp8", "nvfp4", "gguf_q5k", "gguf_nvfp4"])
+def test_lm_head_keeps_the_requested_rows(make_scheme):
+    """Per-row tensors of the kept head are the full head's rows in the requested order, repeated up to a multiple of 128 rows; global scales are copied and ggml's padding rows are zero."""
+    from freetoken.layers.base import iter_ops
+    from freetoken.layers.embedding import ParallelLMHead
+    from freetoken.layers.quantization import scheme as schemes
+
+    class OneScheme(NoQuantConfig):
+        def scheme_for(self, prefix):
+            return make_scheme(schemes)
+
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
+    torch.manual_seed(0)
+    quant = OneScheme()
+    with torch_dtype(torch.bfloat16):
+        head = ParallelLMHead(1024, 2304, bias=True, quant_config=quant, prefix="lm_head")
+    full = {name: torch.randint(1, 200, t.shape).to(t.dtype) for name, t in head.state_dict().items()}
+    for name, t in full.items():
+        setattr(head, name, t)
+    ids = torch.randperm(1024)[:100]
+    head.keep_rows(ids, quant)
+    kept, kept_ids = head.kept_rows
+    assert kept_ids.numel() == 128 and torch.equal(kept_ids[:100], ids) and set(kept_ids.tolist()) == set(ids.tolist())
+    # finalize_quant finds the kept head through iter_ops
+    assert any(op is kept for op in iter_ops(head))
+    assert set(kept.state_dict()) == set(full)
+    for name, t in kept.state_dict().items():
+        assert t.dtype == full[name].dtype
+        if t.dim() == 0:
+            assert torch.equal(t.float(), full[name].float())
+        else:
+            assert torch.equal(t[:128].float(), full[name][kept_ids].float())
+            assert not t[128:].float().any()
+
+
+def test_compressed_tensors_target_classes_other_than_linear_fail_closed():
+    q = {"quant_method": "compressed-tensors", "config_groups": {"group_0": {
+        "targets": ["Embedding"], "weights": {"num_bits": 8, "type": "float", "strategy": "channel"}, "input_activations": {"dynamic": True}}}}
+    with pytest.raises(NotImplementedError, match="Embedding"):
+        QuantConfig.from_hf(SimpleNamespace(quantization_config=q))
 
 
 def test_unsupported_dialects_fail_closed(tmp_path):
@@ -449,7 +625,7 @@ def _weight_map(p: Path) -> dict[str, str] | None:
 
 
 def _candidate_dirs() -> list[Path]:
-    roots = glob.glob(os.path.join(HF_CACHE, "models--*/snapshots/*/")) + glob.glob(os.path.join(MODELS, "*/"))
+    roots = glob.glob(os.path.join(HF_CACHE, "models--*/snapshots/*/")) + glob.glob(os.path.join(SCAN_ROOT, "*/"))
     return [Path(d) for d in roots if (Path(d) / "config.json").exists() and _weight_map(Path(d)) is not None]
 
 
@@ -505,9 +681,11 @@ def _expected_kinds(suffixes: set[str], tensors: dict[str, dict], module: str) -
         if tensors:
             if dtype("weight") == "U8":
                 return {QuantKind.MXFP4}
+            if dtype("weight_scale") == "U8":
+                return {QuantKind.MXFP8}
             sh = shape("weight_scale") or []
             return {QuantKind.FP8_BLOCK} if len(sh) == 2 and sh[0] > 1 and sh[1] > 1 else {QuantKind.FP8_TENSOR}
-        return {QuantKind.FP8_TENSOR, QuantKind.FP8_BLOCK, QuantKind.MXFP4}
+        return {QuantKind.FP8_TENSOR, QuantKind.FP8_BLOCK, QuantKind.MXFP4, QuantKind.MXFP8}
     return {QuantKind.NONE}
 
 
@@ -536,12 +714,13 @@ def test_scheme_for_agrees_with_the_stored_tensors(ckpt: Path):
         with pytest.raises(NotImplementedError):
             QuantConfig.from_hf(cfg)
         return
-    hfq = json.load(open(ckpt / "hf_quant_config.json")) if (ckpt / "hf_quant_config.json").exists() else None
+    if not quant:
+        cfg["quantization_config"] = sidecar_quantization_config(str(ckpt))
     try:
         spec = get_model_spec((cfg.get("architectures") or [""])[0])
     except Exception:
         spec = None
-    qc = QuantConfig.from_hf(cfg, hf_quant_config=hfq, unquantized=spec.unquantized_modules if spec else ())
+    qc = QuantConfig.from_hf(cfg, unquantized=spec.unquantized_modules if spec else ())
     weight_map = _weight_map(ckpt)
     tensors = _tensor_info(ckpt, weight_map)
     mismatches, checked = [], 0

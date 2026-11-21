@@ -14,8 +14,9 @@ fp8 resident projections (block scales on a 128-grid) stay TP=1.
 
 Routed experts go to the offload cache from their NVFP4 or block-fp8 pieces; every
 other projection loads as stored (bf16, or fp8 codes with their block scales) with keys
-renamed ``model.language_model.X`` -> ``model.X``. ``model.visual.*`` and the trailing
-MTP layer are never read.
+renamed ``model.language_model.X`` -> ``model.X``. The vision tower loads as stored under
+``model.visual.X`` -> ``visual.X`` when an encoder is built; the trailing MTP layer is
+never read.
 
 Load-time fusions (must mirror the module split orders):
 
@@ -273,12 +274,19 @@ def _iter_dsa_layer(
         yield f"{dst}.indexer.{part}", reader.get(f"{src}.indexer.{part}").to(dtype)
 
 
+def _iter_vision(reader, weight_map: dict) -> Iterator[tuple[str, torch.Tensor]]:
+    for name in weight_map:
+        if name.startswith("model.visual."):
+            yield "visual." + name[len("model.visual.") :], reader.get(name).to(torch.bfloat16)
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     assert not include_moe_experts, (
         "GLM-5.3 routed experts only serve from the offload cache; they are loaded from their expert pieces."
@@ -361,11 +369,25 @@ def iter_weights(
             )
         else:
             yield "lm_head.weight", reader.get("lm_head.weight").to(torch.bfloat16)
+        if include_vision:
+            yield from _iter_vision(reader, weight_map)
     finally:
         reader.close()
 
 
-def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
+def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The vision tower alone, named as iter_weights names it."""
+    folder = download_hf_weight(model_path)
+    with open(os.path.join(folder, "model.safetensors.index.json")) as f:
+        weight_map = json.load(f)["weight_map"]
+    reader = _ShardReader(folder, weight_map, device)
+    try:
+        yield from _iter_vision(reader, weight_map)
+    finally:
+        reader.close()
+
+
+def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers=None, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
     """Block-fp8 routed experts, one piece per expert: ``{gate, up, down}`` fp8 codes and their ``_scale`` companions; other kinds use the generic readers."""
     if kind is not QuantKind.FP8_BLOCK:
         return None
@@ -375,13 +397,14 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
     from freetoken.moe.expert_pieces import per_expert_pieces
 
     suffix = {"weight": "", "weight_scale_inv": "_scale"}
+    keep = None if layers is None else set(layers)
 
     def locate(raw_name: str):
         m = _FP8_EXPERT_RE.match(raw_name)
         if m is None:
             return None
         bank = _layer_to_bank(int(m["layer"]), config)
-        if bank is None:
+        if bank is None or (keep is not None and bank not in keep):
             return None
         return bank, int(m["expert"]), m["proj"] + suffix[m["kind"]]
 
@@ -399,8 +422,11 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
             weight_map = json.load(f)["weight_map"]
         reader = _ShardReader(folder, weight_map, torch.device("cpu"))
         try:
-            layers = range(config.first_k_dense_replace, config.num_layers)
-            for layer in tqdm(layers, desc="Loading GLM-5.3 fp8 experts (serial)", disable=not get_tp_info().is_primary()):
+            ckpt_layers = [
+                layer for layer in range(config.first_k_dense_replace, config.num_layers)
+                if keep is None or _layer_to_bank(layer, config) in keep
+            ]
+            for layer in tqdm(ckpt_layers, desc="Loading GLM-5.3 fp8 experts (serial)", disable=not get_tp_info().is_primary()):
                 for e in range(config.num_experts):
                     base = f"{_CKPT}.layers.{layer}.mlp.experts.{e}"
                     for proj in ("gate", "up", "down"):

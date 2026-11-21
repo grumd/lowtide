@@ -453,7 +453,7 @@ def _pool_from_config(monkeypatch):
 def test_elastic_vram_is_on_exactly_where_it_is_supported(_pool_from_config):
     from freetoken.engine.engine import _elastic_vram
     from freetoken.kvcache.bsa_pool import BSAKVCache
-    from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+    from freetoken.kvcache.dsv4.v4_pool import DSV4PagedKVCache
     from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
     from freetoken.kvcache.mha_pool import MHAKVCache
     from freetoken.kvcache.qsa_pool import QSAKVCache

@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List
 
 import torch
 
+from freetoken.core import ReqStats
+
 if TYPE_CHECKING:
     from freetoken.core import SamplingParams
 
-    from .mm import MMInputs
     from .prefill import ChunkedReq
 
 
@@ -18,8 +19,12 @@ class PendingReq:
     input_ids: torch.Tensor
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
-    mm: MMInputs | None = None
-    error: str | None = None  # set when admission failed for good; the request is dropped
+    mm_items: list | None = None
+    mrope_positions_full: torch.Tensor | None = None
+    mrope_delta: int = 0
+    # timing/draft counters; add_one_req stamps enqueued_at on it, and every chunk
+    # Req built from this pending request shares the same instance
+    stats: ReqStats = field(default_factory=ReqStats)
 
     @property
     def input_len(self) -> int:
@@ -34,14 +39,3 @@ class PendingReq:
 class ScheduleResult:
     reqs: List[PendingReq]
     output_indices: List[torch.Tensor]
-
-
-def cache_key(req, n: int) -> torch.Tensor:
-    """The radix-tree key for the first ``n`` tokens of ``req`` (prompt and generated)."""
-    mm = getattr(req, "mm", None)
-    if mm is None:
-        return req.input_ids[:n]
-    key = mm.key
-    if n <= key.numel():
-        return key[:n]
-    return torch.cat([key, req.input_ids[key.numel() : n]])

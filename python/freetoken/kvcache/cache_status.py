@@ -3,20 +3,21 @@ from __future__ import annotations
 from typing import Any, Dict
 
 
+def window_pool_spec(config):
+    from . import resolve_pool_class
+
+    return resolve_pool_class(config.model_config).window_spec(config)
+
+
 def _supports_swa_ratio(config) -> bool:
-    """Whether ``swa_full_tokens_ratio`` sizes a separate window pool for this model -- DSV4
-    (always) or a radix-SWA model (Gemma). Gates the ratio in telemetry and rebuild."""
-    mc = config.model_config
-    if mc.dsv4_args is not None:
-        return True
-    return mc.has_swa_attention and config.cache_type == "swa_radix"
+    return window_pool_spec(config) is not None
 
 
 def compute_cache_unit_bytes(engine: "Engine") -> Dict[str, int]:
     """Per-unit VRAM byte cost of each runtime cache, measured from the real allocated pool
     tensors so the desktop cache panel can show a true VRAM delta per slider step:
 
-      kv_bytes_per_token   -- total paged-KV bytes (across every attention layer) for one token
+      kv_bytes_per_token   -- total paged-KV bytes (across every attention layer) for one token, plus the speculative draft's KV on the same slot
       moe_bytes_per_expert -- bytes of one MoE expert-cache (offload bank) slot
       mamba_bytes_per_slot -- bytes of one SSM/GDN recurrent-state slot (all linear layers)
 
@@ -33,12 +34,18 @@ def compute_cache_unit_bytes(engine: "Engine") -> Dict[str, int]:
         if pool is None:
             return 0, 0
         kv, swa = pool.unit_bytes()
-        return int(kv), int(swa)
+        # the draft KV pool grows with num_pages too, and the rebuild check counts it
+        spec = getattr(engine, "spec", None)
+        draft = spec.budget(engine.config)[1] if spec is not None else 0
+        return int(kv) + int(draft), int(swa)
 
     def _moe() -> int:
         banks = getattr(engine.moe_offload_cache, "bank_caches", None)
         if not banks:
             return 0
+        if getattr(engine.moe_offload_cache, "_raw_banks", False):
+            # pools of several bank layouts share byte segments: report the mean slot size
+            return int(sum(t.numel() for t in banks.values()) // engine.moe_offload_cache.cache_size)
         # Each bank cache is (cache_size, *row_shape); one slot's bytes = row bytes summed over
         # the format's banks (== cache_budget.expert_bytes_per_slot on the source rows).
         return int(sum(t[0].numel() * t.element_size() for t in banks.values()))
@@ -120,21 +127,8 @@ def compute_cache_floors(engine: "Engine") -> Dict[str, int]:
         return int(_linear_pool_min_slots(config) - 1)
 
     def _swa() -> int:
-        # Window-pool floor in tokens (matches the pool's own page unit x count):
-        #   DSV4      -- the working-set floor pages _dsv4_pool_sizes clamps n_win_pages to, x P.
-        #   radix-SWA -- the concurrent working set (+1 slot-0 sentinel) _swa_paged_num_tokens
-        #                floors to.
-        # 0 for models without a window pool.
-        from .dsv4_cost_model import _dsv4_window_floor_pages
-        from .hybrid_swa_pool import _swa_pool_floor
-
-        mc = config.model_config
-        if mc.dsv4_args is not None:
-            P = mc.dsv4_args.window_size
-            return int(_dsv4_window_floor_pages(config, P) * P)
-        if not (mc.has_swa_attention and config.cache_type == "swa_radix"):
-            return 0
-        return int(_swa_pool_floor(config) + 1)
+        spec = window_pool_spec(config)
+        return spec.page_size * spec.min_pages if spec is not None else 0
 
     for key, fn in (("kv_tokens", _kv), ("moe_experts", _moe), ("mamba_slots", _mamba),
                     ("swa_tokens", _swa)):
@@ -162,19 +156,10 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
         pools["num_pages"] = int(elastic.pages if elastic is not None else engine.num_pages or 0)
         if config is not None:
             pools["page_size"] = int(config.page_size or 0)
-            # Window pool: its own page unit (swa_page_size -- DSV4 windows are P-token pages,
-            # radix-SWA is token-granular page_size 1) and the concrete current size in that unit
-            # (num_swa_pages, usable count). Same source as the scheduler's _current_cache_geometry.
-            # Both 0 for models without a window pool. Lets a client denominate the swa control.
-            mc = config.model_config
-            if mc.dsv4_args is not None:
-                pools["swa_page_size"] = int(mc.dsv4_args.window_size or 0)
-                sizes = getattr(engine.kv_cache, "sizes", None)  # usable = physical minus dummy
-                if sizes is not None:
-                    pools["num_swa_pages"] = max(0, int(sizes.n_win_pages) - 1)
-            elif mc.has_swa_attention and config.cache_type == "swa_radix":
-                pools["swa_page_size"] = 1  # usable = pool tokens minus the slot-0 sentinel
-                pools["num_swa_pages"] = max(0, int(getattr(engine.kv_cache, "swa_num_tokens", 0) or 0) - 1)
+            spec = window_pool_spec(config)
+            if spec is not None:
+                pools["swa_page_size"] = spec.page_size
+                pools["num_swa_pages"] = max(0, int(engine.kv_cache.window_pages))
         moe = engine.moe_offload_cache
         if moe is not None:
             pools["moe_cache_size"] = int(getattr(moe, "active_slots", None) or moe.cache_size or 0)

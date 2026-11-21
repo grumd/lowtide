@@ -12,10 +12,22 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from freetoken.moe.expert_banks import _tp_slice_ftw_sources
 from freetoken.moe.host_banks import HostBank, _LIVE_BUFFERS
+
+
+@pytest.fixture(autouse=True)
+def _module_tp():
+    """set_tp_info is a process global: undo each test's _set_tp (the loops below restore only
+    around the slice, after _set_tp already ran)."""
+    import freetoken.distributed.info as info
+
+    saved = info._TP_INFO
+    yield
+    info._TP_INFO = saved
 
 
 def _restore_tp():

@@ -16,7 +16,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from freetoken.layers import BaseOP, LinearReplicated
+from freetoken.layers import BaseOP, LinearReplicated, iter_moe_layers
 from freetoken.models.config import ModelConfig
 from freetoken.models.qwen4_exp.config import parse_config
 from freetoken.models.qwen4_exp.hc import GatedResidual
@@ -30,12 +30,17 @@ def _config(num_layers: int = 4) -> ModelConfig:
 
 
 def _fill(op, gen: torch.Generator, scale: float = 0.05) -> None:
-    """Random floats / zeroed ints for every state-dict tensor of an op tree."""
+    """Random floats / zeroed ints for every state-dict tensor of an op tree, and random expert banks for its resident MoE layers."""
     for tensor in op.state_dict().values():
         if tensor.is_floating_point():
             tensor.normal_(0.0, scale, generator=gen)
         else:
             tensor.zero_()
+    for layer in iter_moe_layers(op):
+        layer._expert_banks = {
+            role: torch.randn((layer.num_experts, *spec.shape), generator=gen, device=gen.device, dtype=spec.dtype) * scale
+            for role, spec in layer.quant_method.layout().items()
+        }
 
 
 def _group_norm(x, weight, eps, groups):
@@ -462,7 +467,9 @@ def test_qsa_layer_matches_hf_dense():
     x = (torch.randn(seq_len, config.hidden_size, device=device, dtype=dtype) * 0.5)
     positions = torch.arange(seq_len, device=device, dtype=torch.int64)
     req = SimpleNamespace(extend_len=seq_len, cached_len=0, table_idx=1)
-    batch = SimpleNamespace(padded_reqs=[req], reqs=[req], positions=positions)
+    batch = SimpleNamespace(
+        padded_reqs=[req], reqs=[req], positions=positions, get_attn_positions=lambda: positions
+    )
 
     backend = TorchDenseQSAReference(config, num_slots=4, max_len=64, device=device, dtype=dtype)
     _fresh_ctx(attn_backend=backend)
@@ -748,10 +755,11 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
     last = torch.tensor(
         [sum(len(p) for p in prompts[: i + 1]) - 1 for i in range(len(prompts))], device=device
     )
+    positions = torch.cat([torch.arange(len(p)) for p in prompts]).to(device)
     batch = SimpleNamespace(
         padded_reqs=reqs, reqs=reqs, size=len(reqs), is_prefill=True, is_decode=False,
         input_ids=torch.tensor(flat, dtype=torch.int64, device=device),
-        positions=torch.cat([torch.arange(len(p)) for p in prompts]).to(device),
+        positions=positions, get_attn_positions=lambda: positions, mm_embeds=None, features=None,
         attn_metadata=SimpleNamespace(get_last_indices=lambda bs: last[:bs]),
     )
     with ctx.forward_batch(batch):
@@ -763,10 +771,11 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
         r.cached_len = len(p)
         r.extend_len = 1
         r.input_ids = torch.cat([r.input_ids, torch.tensor([14], dtype=torch.int64)])
+    decode_positions = torch.tensor([len(p) for p in prompts], dtype=torch.int64, device=device)
     decode = SimpleNamespace(
         padded_reqs=reqs, reqs=reqs, size=len(reqs), is_prefill=False, is_decode=True,
         input_ids=torch.tensor([14] * len(reqs), dtype=torch.int64, device=device),
-        positions=torch.tensor([len(p) for p in prompts], dtype=torch.int64, device=device),
+        positions=decode_positions, get_attn_positions=lambda: decode_positions, mm_embeds=None, features=None,
         attn_metadata=None,
     )
     with ctx.forward_batch(decode):

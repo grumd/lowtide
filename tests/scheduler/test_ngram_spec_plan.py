@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from freetoken.core import ReqStats
 from freetoken.scheduler.ngram_spec import DraftPolicy, NgramSpecManager, SuffixDrafter
 
 
@@ -268,8 +269,8 @@ def test_publish_commits_a_pool_free_model():
     sched._gpu_mem_bytes = lambda: 0
     buf = torch.arange(64, dtype=torch.int32)
     r = _Req(uid=1, table_idx=0, linear_slot_idx=None, _ids_buf=buf, input_ids=buf[:14], cached_len=10,
-             device_len=14, sampling_params=SimpleNamespace(ignore_eos=False, stop_strs=None),
-             output_budget_exhausted=False, toolcall_anchor_len=None)
+             device_len=14, sampling_params=SimpleNamespace(ignore_eos=False, stop_strs=None, timings_per_token=False),
+             output_budget_exhausted=False, toolcall_anchor_len=None, stats=ReqStats(), prompt_len=10)
     r.append_host = lambda t: setattr(r, "input_ids", buf[: r.input_ids.numel() + 1])
     m._publish([r], [10], 3, [[11, 12, 50]], [3], [2], [13])
     assert commits == [(None, [3])] and rolled == [13] and r.cached_len == 13
@@ -479,8 +480,8 @@ def test_publish_keeps_the_drafter_state_of_the_last_committed_row():
     for uid, slot in ((1, 2), (2, 3)):
         buf = torch.arange(64, dtype=torch.int32)
         r = _Req(uid=uid, table_idx=slot, linear_slot_idx=None, _ids_buf=buf, input_ids=buf[:14], cached_len=10,
-                 device_len=14, sampling_params=SimpleNamespace(ignore_eos=False, stop_strs=None),
-                 output_budget_exhausted=False, toolcall_anchor_len=None)
+                 device_len=14, sampling_params=SimpleNamespace(ignore_eos=False, stop_strs=None, timings_per_token=False),
+                 output_budget_exhausted=False, toolcall_anchor_len=None, stats=ReqStats(), prompt_len=10)
         r.append_host = (lambda r, buf: lambda t: setattr(r, "input_ids", buf[: r.input_ids.numel() + 1]))(r, buf)
         reqs.append(r)
     m._publish(reqs, [10, 10], 3, [[11, 12, 50], [11, 40, 41]], [3, 3], [2, 1], [13, 12], [True, True])

@@ -5,7 +5,6 @@ import time
 from typing import TYPE_CHECKING, Callable, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
-from freetoken.attention.linear import build_fla_metadata
 from freetoken.core import Batch, Req
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
@@ -20,6 +19,8 @@ from freetoken.message import (
     DetokenizeMsg,
     ErrorReplyMsg,
     ExitMsg,
+    FlushCacheBackendMsg,
+    FlushCacheResultMsg,
     PromptAdmittedMsg,
     UserMsg,
 )
@@ -34,14 +35,15 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
+from .mm import cut_image_spans, plan_mm_batch
 from .mtp import MTPManager
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
 from .table import TableManager
-from .mm import MMImage, MMInputs, image_digests, mm_cache_key, nonce_digest
 
 if TYPE_CHECKING:
     from freetoken.engine import BatchSamplingArgs, ForwardOutput
+    from freetoken.engine.spec_protocol import SpecRuntime
 
 
 logger = init_logger(__name__)
@@ -58,7 +60,7 @@ class ForwardInput(NamedTuple):
     batch: Batch
     sample_args: BatchSamplingArgs
     input_tuple: Indice2D  # (token_mapping, positions)
-    write_tuple: Indice2D  # (req_mapping, seq_lens or -1)
+    write_tuple: Indice2D | None  # (req_mapping, seq_lens or -1); None on verify, whose drain writes the pending token
 
 
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
@@ -99,6 +101,7 @@ class Scheduler(SchedulerIOMixin):
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
+        self.spec: SpecRuntime | None = self.engine.spec
         # ONE cache manager for every model (ShadowRadix layering): the shared page table is the
         # virtual full-token coordinate; model-specific tiers ride the plug-ins -- DSV4's
         # window/cmp/idx shadows via swa_pool, Gemma's swa via swa_pool, GDN state via
@@ -121,15 +124,22 @@ class Scheduler(SchedulerIOMixin):
                          2 * config.max_running_req)
             ),
             host_pool=self.engine.host_prefix_pool,
+            radix_lookahead=self.spec is not None and self.spec.radix_lookahead,
         )
-        self.decode_manager = DecodeManager(config.page_size)
+        token_headroom = config.decode_rows_per_req - 1
+        self.decode_manager = DecodeManager(config.page_size, token_headroom=token_headroom)
+        self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager,
-            embed_images=self._embed_images,
+            self.cache_manager,
+            self.table_manager,
+            self.decode_manager,
+            encoder_cache=self.engine.encoder_cache,
+            keep_images_whole=self._bidirectional_mm,
+            token_headroom=token_headroom,
         )
-        # Speculative decoding (no-op unless the served model ships an enabled draft head;
-        # asserts non-overlap mode when active). qwen4-exp uses the EAGLE-style MTPManager
-        # (residual streams); DeepSeek-V4.1 uses the DSparkManager (aux-hidden block draft).
+        # Our speculative decoding (no-op unless the served model mounts a draft head, or
+        # --ngram-spec): qwen4-exp / Qwen3.5 MTP (MTPManager, residual streams) or n-gram /
+        # Hy4 DFly2 verify rounds. Exclusive with the spec/ runtime (self.spec).
         self.mtp = self._make_spec_manager()
 
         # some alias for easy access
@@ -143,7 +153,6 @@ class Scheduler(SchedulerIOMixin):
         # tombstone so an abort-before-admission request can never be resurrected after its
         # terminal accounting acknowledgement has already been published.
         self._abort_tombstones: dict[int, None] = {}
-        self._forward_iter = 0  # global forward counter; drives the SWA proactive-eviction cadence
         # The launched-but-not-yet-drained batch (overlap): set at the top of each overlap_loop
         # iteration so the abort handler can tell whether a request's forward is still in flight
         # (mark it, defer the free to _process_last_data) or not (free immediately). Stays None
@@ -154,6 +163,8 @@ class Scheduler(SchedulerIOMixin):
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
         # CPU-assisted decode changes (calibration) waiting for the same idle point
         self._pending_tunes: list[DecodeTuneBackendMsg] = []
+        # A /v1/cache/flush waiting for the idle safe point, with its time.monotonic() deadline.
+        self._pending_flush: Tuple[FlushCacheBackendMsg, float] | None = None
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -171,6 +182,8 @@ class Scheduler(SchedulerIOMixin):
         # sliding-window cache chunks long prompts and frees out-of-window pages between chunks
         # instead of OOMing _alloc_window on a prompt longer than the window pool.
         self._set_prefill_budget()
+        self._model_is_mrope = config.model_config.model_is_mrope
+        self._warned_cut_image = False
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
@@ -344,7 +357,7 @@ class Scheduler(SchedulerIOMixin):
         request that became ineligible (near its output budget, or its streams were cleared)
         must be let through to a plain decode -- a stale ``_deferred`` entry would filter it
         out of every decode batch and starve it forever (the classic chain hang)."""
-        # chaining is the MTPManager's round shape; the no-op and DSpark managers keep their own
+        # chaining is the MTPManager's round shape; the no-op and n-gram managers keep their own
         if ENV.MTP_CHAIN and mtp.enabled and isinstance(mtp, MTPManager):
             mtp._deferred = {
                 r for r in self.decode_manager.running_reqs if mtp.eligible(r)
@@ -368,6 +381,7 @@ class Scheduler(SchedulerIOMixin):
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to drain toward + execute
             or bool(self._pending_tunes)
+            or self._pending_flush is not None  # a deferred flush to run at idle or time out
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -384,6 +398,7 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._execute_pending_tunes()
+        self._check_pending_flush()
 
         mtp = getattr(self, "mtp", None) or _NOOP_MTP
         # A previous PREFILL batch must be drained before the round: its prefix commit
@@ -491,16 +506,13 @@ class Scheduler(SchedulerIOMixin):
         return ongoing_data
 
     def _make_spec_manager(self):
-        """Pick the model's speculative-decode manager: qwen4-exp MTP (residual streams),
-        DeepSeek-V4.1 DSpark (aux-hidden block draft), --ngram-spec prompt lookup, or a no-op."""
-        from .dspark import DSparkManager
-
+        """Pick the model's speculative-decode manager: MTP (residual streams), --ngram-spec
+        prompt lookup / Hy4's DFly2 drafter, or a no-op. The spec/ runtime replaces all of them."""
+        if self.spec is not None:
+            return _NOOP_MTP
         model = self.engine.model
         if getattr(model, "mtp", None) is not None:
             return MTPManager(self)
-        getter = getattr(model, "dspark_draft", None)
-        if callable(getter) and getter() is not None:
-            return DSparkManager(self)
         dfly = getattr(model, "dfly_drafter", None)
         if ENV.NGRAM_SPEC or (callable(dfly) and dfly() is not None):
             # Hy4's DFly2 drafter feeds the same verify rounds as the prompt lookup
@@ -522,6 +534,7 @@ class Scheduler(SchedulerIOMixin):
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to execute at idle
             or bool(self._pending_tunes)
+            or self._pending_flush is not None  # a deferred flush to run at idle or time out
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -538,6 +551,7 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._execute_pending_tunes()
+        self._check_pending_flush()
         # MTP speculative round: processes the pending tokens of eligible (greedy)
         # decode requests BEFORE plain decode scheduling -- rounds replace decode steps
         # entirely (the verify handles the pending token; no plain step in between).
@@ -555,20 +569,10 @@ class Scheduler(SchedulerIOMixin):
         if _sched_timing:
             _t2 = _time.perf_counter()
         ongoing_data = None
-        note_serial = None
-        _serial_t0 = None
         if forward_input is not None:
             # already inside engine_stream_ctx (run_forever); restore on the engine stream
             self._restore_linear_states(forward_input.batch)
             mtp = getattr(self, "mtp", None) or _NOOP_MTP
-            # Time a plain DECODE step for the speculative managers' cost feedback (DSpark
-            # controller): the serial cost is the wall time of a request's own decode step.
-            if mtp.enabled and getattr(forward_input.batch, "is_decode", False):
-                note_serial = getattr(mtp, "note_serial", None)
-                if note_serial is not None:
-                    import time as _time
-
-                    _serial_t0 = _time.perf_counter()
             # Snapshot the extend ranges BEFORE the forward: complete_one (inside
             # forward_batch) advances cached_len/device_len, so the just-forwarded
             # extend is not derivable from the req afterwards.
@@ -577,20 +581,11 @@ class Scheduler(SchedulerIOMixin):
                 if mtp.enabled and forward_input.batch.is_prefill
                 else None
             )
-            note_decode = getattr(mtp, "note_decode", None) if mtp.enabled else None
-            pre_pos = (
-                [r.device_len - 1 for r in forward_input.batch.reqs]
-                if note_decode is not None and getattr(forward_input.batch, "is_decode", False)
-                else None
-            )
             ongoing_data = (forward_input, self._forward(forward_input))
             if pre_lens is not None:
                 # Build the MTP block's own KV for the freshly forwarded extends while
                 # the streams are at hand; the drain then publishes as usual.
                 mtp.draft_prefill(forward_input.batch, pre_lens)
-            if pre_pos is not None:
-                # the serially decoded positions join the speculative draft's context
-                note_decode(forward_input.batch, pre_pos)
 
         if _sched_timing:
             _t3 = _time.perf_counter()
@@ -613,10 +608,6 @@ class Scheduler(SchedulerIOMixin):
                     f"fwd={1000 * _st['fwd'] / it:.1f}ms "
                     f"drain={1000 * _st['drain'] / it:.1f}ms"
                 )
-        if note_serial is not None and _serial_t0 is not None:
-            import time as _time
-
-            note_serial((_time.perf_counter() - _serial_t0) * 1e3, forward_input.batch.reqs)
         self._flush_abort_acks()
 
     @torch.inference_mode()
@@ -637,10 +628,10 @@ class Scheduler(SchedulerIOMixin):
                 data = self.overlap_loop(data)
 
     def _overlap_enabled(self) -> bool:
-        """The overlap loop, unless the env forces the drain-safe loop or the speculative
-        manager has no split round (DSpark runs its whole round inside normal_loop)."""
+        """The overlap loop, unless the env forces the drain-safe loop, the spec/ runtime is on
+        (its verify batches drain before the next step), or our manager has no split round."""
         mtp = getattr(self, "mtp", None) or _NOOP_MTP
-        return not ENV.DISABLE_OVERLAP_SCHEDULING and mtp.overlaps
+        return not ENV.DISABLE_OVERLAP_SCHEDULING and self.spec is None and mtp.overlaps
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
@@ -658,96 +649,73 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return deferred_finish
 
-        batch, out = last_data[0].batch, last_data[1]
-        next_tokens_cpu, copy_done = out.next_tokens_cpu, out.copy_done_event
+        batch, output = last_data[0].batch, last_data[1]
+        next_tokens_cpu, copy_done = output.next_tokens_cpu, output.copy_done_event
         copy_done.synchronize()
+        # tokens are on the host from here: the per-request timings' token stamps
+        now = time.perf_counter()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
+        generated = None
         with self.cache_manager.lazy_free_region():
-            for i, req in enumerate(batch.reqs):
-                if isinstance(req, ChunkedReq):
-                    # Don't cache intermediate chunks; the full prompt is cached once when the
-                    # final chunk is processed. Caching here snapshots a handle the next chunk
-                    # already copied (overlap), so cache_req double-frees the prior chunk.
+            if batch.phase == "verify":
+                generated = self._drain_verify(batch, output, reply, new_finished_reqs)
+            else:
+                for i, req in enumerate(batch.reqs):
+                    if isinstance(req, ChunkedReq):
+                        # Don't cache intermediate chunks; the full prompt is cached once when the
+                        # final chunk is processed. Caching here snapshots a handle the next chunk
+                        # already copied (overlap), so cache_req double-frees the prior chunk.
+                        if req.aborted:
+                            # Aborted mid-chunked-prefill while this chunk was in flight: the abort
+                            # popped the pending continuation (no next chunk launches), and this
+                            # drain point frees the chunk's pages/slots exactly once.
+                            self._free_req_resources(req)
+                        continue
                     if req.aborted:
-                        # Aborted mid-chunked-prefill while this chunk was in flight: the abort
-                        # popped the pending continuation (no next chunk launches), and this
-                        # drain point frees the chunk's pages/slots exactly once.
-                        self._free_req_resources(req)
-                    continue
-                if req.aborted:
-                    # Aborted while this final-chunk prefill / decode step was in flight: free
-                    # here (the forward is drained) and finish the request. No DetokenizeMsg --
-                    # the abort ack flushed after this method stays the uid's terminal reply.
-                    self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
-                    new_finished_reqs.add(req)
-                    continue
-                if req in self.finished_reqs:
-                    # Overlap scheduling launched one more decode step for a request that
-                    # already terminated (filter_reqs keeps it while output budget remains,
-                    # and the next batch is scheduled before this drain runs). Its resources
-                    # are freed below/already; shipping this token would append past the
-                    # client's terminal reply.
-                    continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
-                    )
-                )
-
-                # NOTE: overlap scheduling may make the request freed twice, skip second free
-                if finished and req not in self.finished_reqs:
-                    self.decode_manager.remove_req(req)
-                    if defer_finish_reqs is not None and req in defer_finish_reqs:
-                        # MTP overlap: the request is in this iteration's in-flight verify.
-                        # Defer the free to finish_round, which rolls the verify's tail back
-                        # first; freeing here would double-free its verify pages/GDN slots.
-                        deferred_finish.add(req)
-                    else:
+                        # Aborted while this final-chunk prefill / decode step was in flight: free
+                        # here (the forward is drained) and finish the request. No DetokenizeMsg --
+                        # the abort ack flushed after this method stays the uid's terminal reply.
+                        self.decode_manager.remove_req(req)
                         self._free_req_resources(req)
                         new_finished_reqs.add(req)
-                elif batch.is_prefill and req.table_idx != -1:
-                    # for prefill, non-chunk req, cache the prefix.
-                    # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
-                    # the generic manager inserts the prefix into its radix/naive cache.
-                    # table_idx == -1 is defense-in-depth: aborts mark in-flight requests
-                    # instead of freeing them (handled above), so a freed request should
-                    # never reach this commit -- but if a future path frees one early, skip
-                    # rather than re-read the freed page-table row (and on hybrid, deref the
-                    # None'd GDN ping-pong slots).
-                    self.cache_manager.cache_req(req, finished=False)
+                        continue
+                    if req in self.finished_reqs:
+                        # Overlap scheduling launched one more decode step for a request that
+                        # already terminated (filter_reqs keeps it while output budget remains,
+                        # and the next batch is scheduled before this drain runs). Its resources
+                        # are freed below/already; shipping this token would append past the
+                        # client's terminal reply.
+                        continue
+                    msg, _ = self._commit_tokens(req, next_tokens_cpu[i : i + 1])
+                    req.stats.stamp_token(now)
+                    reply.append(msg)
+                    # a timings_per_token request gets the snapshot on every reply, growing
+                    if msg.finished or req.sampling_params.timings_per_token:
+                        msg.timings = req.stats.finish(req.input_ids.numel() - req.prompt_len)
+                    finished = msg.finished
+
+                    # NOTE: overlap scheduling may make the request freed twice, skip second free
+                    if finished and req not in self.finished_reqs:
+                        self.decode_manager.remove_req(req)
+                        if defer_finish_reqs is not None and req in defer_finish_reqs:
+                            # MTP overlap: the request is in this iteration's in-flight verify.
+                            # Defer the free to finish_round, which rolls the verify's tail back
+                            # first; freeing here would double-free its verify pages/GDN slots.
+                            deferred_finish.add(req)
+                        else:
+                            self._free_req_resources(req)
+                            new_finished_reqs.add(req)
+                    elif batch.is_prefill and req.table_idx != -1:
+                        # for prefill, non-chunk req, cache the prefix.
+                        # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
+                        # the generic manager inserts the prefix into its radix/naive cache.
+                        # table_idx == -1 is defense-in-depth: aborts mark in-flight requests
+                        # instead of freeing them (handled above), so a freed request should
+                        # never reach this commit -- but if a future path frees one early, skip
+                        # rather than re-read the freed page-table row (and on hybrid, deref the
+                        # None'd GDN ping-pong slots).
+                        self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
@@ -781,9 +749,83 @@ class Scheduler(SchedulerIOMixin):
             page_size=self.config.page_size,
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
+            generated=generated,
         )
         self.send_result(reply)
         return deferred_finish
+
+    def _drain_verify(self, batch: Batch, output, reply: List[DetokenizeMsg], new_finished_reqs: Set[Req]) -> int:
+        """Commit each request's accepted tokens, return the slots its rejected rows took, then the target state; returns the tokens committed."""
+        k = self.config.decode_rows_per_req - 1
+        counts, finished = [], []
+        now = time.perf_counter()
+        for i, req in enumerate(batch.reqs):
+            # spec forces normal_loop, which frees an aborted request between steps; overlap would need rollback_tail here and must not donate the GDN slot the verify rolled
+            assert not req.aborted, "a verify batch drained an aborted request"
+            cached = req.cached_len
+            emitted = int(output.emitted_cpu[i])
+            msg, n = self._commit_tokens(req, output.next_tokens_cpu[i, : emitted + 1])
+            # k drafts were proposed; the step hands _commit_tokens the emitted accepted
+            # drafts plus the target's own token, so when a stop lands on a draft every
+            # committed token is an accepted draft: count min(n, emitted), with n already
+            # post stop-truncation. Never exceeds predicted_n - 1: the request's first
+            # committed token came from prefill, outside every verify step.
+            req.stats.stamp_token(now)
+            req.stats.draft_n += k
+            req.stats.draft_n_accepted += min(n, emitted)
+            reply.append(msg)
+            # a timings_per_token request gets the snapshot on every reply, growing
+            if msg.finished or req.sampling_params.timings_per_token:
+                msg.timings = req.stats.finish(req.input_ids.numel() - req.prompt_len)
+            req.commit_pending(n)
+            self.cache_manager.rollback_tail(req, req.cached_len, cached + k + 1)
+            counts.append(n)
+            if msg.finished:
+                finished.append(req)
+        # before any finish free: the hybrid finish donates the live GDN slot the commit writes
+        self.engine.commit_verify(batch.reqs, counts, output.next_tokens_gpu)
+        # the last committed token is pending at cached_len, like a decode step's sampled token
+        table, pos, last = torch.tensor(
+            [(r.table_idx, r.cached_len, n - 1) for r, n in zip(batch.reqs, counts)],
+            dtype=torch.int64, pin_memory=self.device.type == "cuda",
+        ).to(self.device, non_blocking=True).unbind(1)
+        self.token_pool[table, pos] = output.next_tokens_gpu.gather(1, last.unsqueeze(1)).squeeze(1).to(self.token_pool.dtype)
+        for req in finished:
+            self.decode_manager.remove_req(req)
+            self._free_req_resources(req)
+            new_finished_reqs.add(req)
+        return sum(counts)
+
+    def _commit_tokens(self, req: Req, tokens: torch.Tensor) -> Tuple[DetokenizeMsg, int]:
+        """Append sampled tokens in order until one finishes the request; returns the reply and how many tokens were committed."""
+        params = req.sampling_params
+        committed: List[int] = []
+        finished, finish_reason, matched_stop = False, None, None
+        for j in range(tokens.numel()):
+            req.append_host(tokens[j : j + 1])
+            token = int(tokens[j].item())
+            committed.append(token)
+            # EOS / stop-string -> "stop", output budget exhausted -> "length";
+            # EOS and stop strings win over length.
+            # Overlap can advance device_len one token ahead of this host reply.
+            hit_length = req.input_ids.numel() >= req.max_device_len
+            hit_eos = not params.ignore_eos and token in self.eos_token_ids
+            matched_stop = self._match_stop_str(req) if not hit_eos and params.stop_strs else None
+            if hit_length or hit_eos or matched_stop is not None:
+                finished = True
+                finish_reason = "stop" if (hit_eos or matched_stop is not None) else "length"
+                break
+            if token == self.toolcall_anchor_id and req.toolcall_anchor_len is None:
+                req.toolcall_anchor_len = req.input_ids.numel()
+        msg = DetokenizeMsg(
+            uid=req.uid,
+            next_tokens=committed,
+            finished=finished,
+            finish_reason=finish_reason,
+            matched_stop=matched_stop,
+            stop_strs=params.stop_strs or None,
+        )
+        return msg, len(committed)
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -842,57 +884,6 @@ class Scheduler(SchedulerIOMixin):
             return 0
         return torch.cuda.memory_reserved(self.device)
 
-    def _run_tower(self, images: List[MMImage]) -> torch.Tensor:
-        """``images``' soft tokens concatenated, on the engine device, in one vision batch."""
-        t0 = time.perf_counter()
-        out = self.engine.encode_images(
-            torch.cat([img.pixel_values for img in images]),
-            torch.cat([img.grid_thw for img in images]),
-        )
-        n = sum(img.count for img in images)
-        if out.shape[0] != n:
-            raise RuntimeError(f"the vision tower produced {out.shape[0]} soft tokens for "
-                               f"{n} image placeholders")
-        logger.info_rank0(f"vision: encoded {len(images)} image(s), {n} soft tokens in "
-                          f"{(time.perf_counter() - t0) * 1e3:.0f} ms")
-        return out
-
-    def _encode_images(self, images: List[MMImage]) -> torch.Tensor:
-        """Vision soft tokens for ``images``, concatenated, on this rank's GPU.
-
-        With a host-resident tower (``--vision-on-cpu``) only the primary rank owns the
-        weights: it encodes on the CPU and hands the result to the sibling ranks over the
-        CPU group. One host copy instead of one per rank, one ViT run instead of one per
-        rank, and -- the reason it is not just an optimisation -- every rank scatters
-        bit-identical features, which two independent host GEMM runs need not produce.
-        A rank that skipped the hand-off would schedule a batch its siblings never see.
-        bf16 -> fp32 is exact and keeps the collective on a dtype gloo knows."""
-        engine = self.engine
-        if engine.vision_device.type != "cpu" or self.config.tp_info.size == 1:
-            return self._run_tower(images)
-        group = self.tp_cpu_group
-        payload = None
-        if self.config.tp_info.is_primary():
-            try:
-                emb = self._run_tower(images)
-            except Exception:
-                # the siblings are parked on this broadcast; tell them to abort the request
-                # too, then let it surface as the usual request error
-                group.broadcast(torch.zeros(3, dtype=torch.int64), root=0).wait()
-                raise
-            payload = emb.detach().to(dtype=torch.float32, device="cpu").contiguous()
-            shape = torch.tensor([payload.shape[0], payload.shape[1], 1], dtype=torch.int64)
-        else:
-            shape = torch.zeros(3, dtype=torch.int64)
-        group.broadcast(shape, root=0).wait()
-        rows, cols, ok = (int(v) for v in shape.tolist())
-        if not ok:
-            raise RuntimeError("vision encoding failed on the primary rank")
-        if payload is None:
-            payload = torch.empty((rows, cols), dtype=torch.float32)
-        group.broadcast(payload, root=0).wait()
-        return payload.to(dtype=engine.dtype, device=engine.device)
-
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
             for msg in msg.data:
@@ -906,6 +897,17 @@ class Scheduler(SchedulerIOMixin):
                 tombstones.pop(msg.uid, None)
                 logger.debug_rank0(
                     "Dropping request %d because its abort arrived before admission", msg.uid
+                )
+                return
+            if msg.mm_items and self.engine.encoder_cache is None:
+                # no encoder runtime: fail loudly instead of decoding unexpanded placeholders
+                self.send_result(
+                    [
+                        ErrorReplyMsg(
+                            uid=msg.uid,
+                            error="image input is not supported by this server",
+                        )
+                    ]
                 )
                 return
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
@@ -939,18 +941,7 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
-            # Image input: only key the images here. The vision tower runs at admission, for
-            # the images past the prefix-cache hit (see _embed_images).
-            mm = None
-            if msg.pixel_values is not None or msg.mm_embeds is not None:
-                mm, error = self._build_mm(msg)
-                if error is not None:
-                    logger.warning_rank0(f"request {msg.uid} rejected: {error}")
-                    self.send_result(
-                        [ErrorReplyMsg(uid=msg.uid, error=error, code="invalid_request_error")]
-                    )
-                    return
-            self.prefill_manager.add_one_req(msg, mm)
+            self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
             tombstones = getattr(self, "_abort_tombstones", None)
@@ -964,6 +955,15 @@ class Scheduler(SchedulerIOMixin):
                 tombstones.pop(next(iter(tombstones)))
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
+            if (
+                req_to_free is not None
+                and req_to_free.mm_items
+                and self.engine.encoder_cache is not None
+            ):
+                # drop the aborted request's claims; entries it held alone die here
+                self.engine.encoder_cache.release(
+                    msg.uid, [item.hash for item in req_to_free.mm_items]
+                )
             if req_to_free is not None:
                 # SGLang-style abort: never free resources under an in-flight forward. If the
                 # request is in the launched-but-not-drained batch (overlap), only mark it;
@@ -1010,6 +1010,8 @@ class Scheduler(SchedulerIOMixin):
                 self._pending_rebuild = msg
         elif isinstance(msg, DecodeTuneBackendMsg):
             self._pending_tunes.append(msg)
+        elif isinstance(msg, FlushCacheBackendMsg):
+            self._handle_flush(msg)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
@@ -1033,6 +1035,8 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        if self.spec is not None:
+            self.spec.release(req)
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
@@ -1151,6 +1155,43 @@ class Scheduler(SchedulerIOMixin):
         self._log_cache_geometry("Cache rebuilt")
         self._reply_rebuild(msg.request_id, "ok")
 
+    def _handle_flush(self, msg: FlushCacheBackendMsg) -> None:
+        # Same idle/timeout contract as sglang's /flush_cache. Even timeout=0 waits for this iteration's safe point.
+        if self.config.tp_info.size > 1:
+            # each rank checks the deadline on its own clock, so a deferred flush could run on only some ranks
+            self._reply_flush(msg.request_id, "unsupported", "cache flush unsupported under TP > 1")
+        elif self._pending_flush is not None:
+            self._reply_flush(msg.request_id, "busy", "another cache flush is already waiting")
+        else:
+            self._pending_flush = (msg, time.monotonic() + msg.timeout)
+
+    def _check_pending_flush(self) -> None:
+        """Run the pending flush once the scheduler is fully idle, or fail it at its deadline."""
+        if self._pending_flush is None:
+            return
+        msg, deadline = self._pending_flush
+        if self._last_data is None and not (
+            self.prefill_manager.runnable or self.decode_manager.runnable
+        ):
+            self._pending_flush = None
+            freed = self.cache_manager.flush()
+            self.cache_manager.check_integrity()
+            logger.info_rank0(f"Cache flushed: {freed} prefix-cache tokens freed")
+            self._reply_flush(msg.request_id, "ok")
+        elif time.monotonic() >= deadline:
+            self._pending_flush = None
+            error = (
+                "scheduler is not idle: "
+                f"{len(self.prefill_manager.pending_list)} queued, "
+                f"{len(self.decode_manager.running_reqs)} running"
+                + (", last batch still in flight" if self._last_data is not None else "")
+            )
+            logger.warning_rank0(f"Cache not flushed, {error}")
+            self._reply_flush(msg.request_id, "timeout" if msg.timeout > 0 else "busy", error)
+
+    def _reply_flush(self, request_id: str, status: str, error: str | None = None) -> None:
+        self.send_result([FlushCacheResultMsg(request_id=request_id, status=status, error=error)])
+
     def _current_cache_geometry(self) -> dict:
         """The pools' current (serving) sizes as rebuild_cache kwargs — the rollback snapshot and
         the single source for _reply_rebuild's readout. None for a pool this model lacks
@@ -1158,17 +1199,10 @@ class Scheduler(SchedulerIOMixin):
         the CONCRETE current window (usable pages) so a rollback restores it byte-for-byte,
         whether it was pinned or ratio-derived."""
         eng = self.engine
-        config = self.config
-        mc = config.model_config
-        num_swa_pages = None
-        if getattr(mc, "dsv4_args", None) is not None:
-            sizes = getattr(eng.kv_cache, "sizes", None)
-            if sizes is not None:  # usable window pages = physical n_win_pages minus the dummy page
-                num_swa_pages = max(0, sizes.n_win_pages - 1)
-        elif getattr(mc, "has_swa_attention", False) and (
-            getattr(config, "cache_type", None) == "swa_radix"
-        ):  # usable window tokens = pool tokens minus the slot-0 sentinel
-            num_swa_pages = max(0, int(getattr(eng.kv_cache, "swa_num_tokens", 0) or 0) - 1)
+        from freetoken.kvcache.cache_status import window_pool_spec
+
+        spec = window_pool_spec(self.config)
+        num_swa_pages = eng.kv_cache.window_pages if spec is not None else None
         return dict(
             num_pages=eng.elastic.pages if eng.elastic is not None else eng.num_pages,
             moe_cache_size=eng.moe_offload_cache.active_slots if eng.moe_offload_cache is not None else None,
@@ -1212,14 +1246,14 @@ class Scheduler(SchedulerIOMixin):
             logger.warning(f"could not log cache geometry: {e!r}")
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        if self.spec is not None and batch.is_decode:
+            batch.phase, batch.rows_per_req = "verify", self.config.decode_rows_per_req
         self.engine.graph_runner.pad_batch(batch)
-        self._forward_iter += 1
-        if batch.is_decode:
+        if not batch.is_prefill:
             # Free each decoding request's now-out-of-window SWA slots BEFORE the alloc below,
             # so they can back the new token -- this is what bounds the per-request swa
             # footprint during decode. (no-op unless the model is SWA / paged swa pool.)
-            self.cache_manager.maybe_free_swa_out_of_window(
-                batch.reqs, forward_iter=self._forward_iter)
+            self.cache_manager.maybe_free_swa_out_of_window(batch.reqs)
             for req in batch.reqs:
                 req.decode_batch_idx += 1
         else:
@@ -1227,115 +1261,55 @@ class Scheduler(SchedulerIOMixin):
             # this chunk, so a chunked prompt longer than the swa pool never accumulates its
             # whole swa footprint (which would exhaust alloc_swa). No-op unless SWA/paged.
             self.cache_manager.free_swa_out_of_window_extend(batch.reqs)
+        # before the widening below, so the penalty check reads each request's real remain_len
+        sample_args = self.engine.sampler.prepare(batch)
+        # widened after the window free above, whose threshold reads device_len
+        if batch.phase == "verify":
+            for req in batch.reqs:
+                req.widen_pending(batch.rows_per_req - 1)
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table.
         self.cache_manager.allocate_paged(batch.reqs)
+        if batch.phase == "verify":
+            # the drafts run on the GPU while the host builds this batch's metadata below
+            self.spec.propose_into(batch.reqs, self.token_pool)
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
+        if self._model_is_mrope:
+            batch.mrope_positions = _make_mrope_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
-        write_mapping = _make_write_tuple(batch, self.device)
+        write_mapping = None if batch.phase == "verify" else _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
-        if self.engine.linear_state_pool is not None:
-            if batch.is_decode:
-                # GPU GDN-state slot (one per padded request) for the decode gather/scatter;
-                # lands in the CUDA-graph input buffer via copy_from. Gate on the cache mode,
-                # NOT on whether any padded req has a linear_slot_idx -- the persistent dummy
-                # req always carries one (= padding_slot), so that test is True even for naive
-                # and would collapse all real naive reqs onto the padding slot. Hybrid: build
-                # per padded req from Req.linear_slot_idx (dummy -> padding_slot). Naive: keep
-                # the old keying = input_mapping's table_idx column (already staged, no H2D).
-                if self.cache_manager.is_hybrid:
-                    pool = self.engine.linear_state_pool
-                    slots = [r.linear_slot_idx if r.linear_slot_idx is not None
-                             else pool.padding_slot for r in batch.padded_reqs]
-                    batch.linear_table_idx = torch.tensor(
-                        slots, dtype=torch.int32, device="cpu", pin_memory=True
-                    ).to(self.device, non_blocking=True)
-                else:
-                    batch.linear_table_idx = input_mapping[0].to(torch.int32)
-            # Per-forward GDN metadata (cu_seqlens / cache_indices / continuation flags),
-            # built once here instead of rebuilt in each of the 30 GDN layers. For decode
-            # under CUDA graph the persistent cu_seqlens buffer is supplied by set_batch.
-            batch.fla_metadata = build_fla_metadata(batch, self.device)
-        if batch.is_decode:
+        if self.engine.linear_backend is not None:
+            self.engine.linear_backend.prepare_metadata(batch)
+        if not batch.is_prefill:
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
-            batch.active_table_idx = input_mapping[0].view(-1)
+            batch.active_table_idx = input_mapping[0][:: batch.rows_per_req].view(-1)
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
-            sample_args=self.engine.sampler.prepare(batch),
+            sample_args=sample_args,
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
 
-    def _build_mm(self, msg: UserMsg) -> Tuple[MMInputs | None, str | None]:
-        """Split an image request into per-image placeholder spans and content digests and
-        build its prefix-cache key; returns the error to send instead when they disagree."""
-        tok = self.config.model_config.image_token_id
-        if tok is None:
-            return None, "this model does not accept image inputs"
-        positions = (msg.input_ids == tok).nonzero().view(-1)
-        n_tokens = positions.numel()
-        images: List[MMImage] = []
-        if msg.pixel_values is not None:
-            grid = msg.image_grid_thw
-            split = None if grid is None else image_digests(msg.pixel_values, grid, n_tokens)
-            if split is None:
-                return None, (f"prompt has {n_tokens} image placeholder tokens, which do not "
-                              f"match the image patch grids")
-            first = 0
-            for (digest, row, count), thw in zip(split, grid):
-                rows = int(thw.prod())
-                images.append(MMImage(digest, first, count,
-                                      pixel_values=msg.pixel_values[row : row + rows],
-                                      grid_thw=thw.view(1, -1)))
-                first += count
-        else:
-            # precomputed soft tokens (offline path): no content to key on, so a key no other
-            # request shares. Every rank sees the same messages in the same order.
-            emb = msg.mm_embeds.reshape(-1, msg.mm_embeds.shape[-1])
-            if emb.shape[0] != n_tokens:
-                return None, (f"prompt has {n_tokens} image placeholder tokens but "
-                              f"{emb.shape[0]} soft tokens were given")
-            self._mm_nonce = getattr(self, "_mm_nonce", 0) + 1
-            images.append(MMImage(nonce_digest(self._mm_nonce), 0, n_tokens, embeds=emb))
-        key = mm_cache_key(msg.input_ids, positions, [(i.digest, i.count) for i in images])
-        return MMInputs(images, positions, key), None
-
-    def _embed_images(self, images: List[MMImage]) -> str | None:
-        """Give ``images`` their soft tokens on this rank's device, at admission. Called on
-        every rank in the same order, so the vision-on-cpu hand-off lines up. Returns the
-        error to fail the request with instead of raising."""
-        try:
-            flat = self._encode_images(images)
-        except Exception as exc:  # noqa: BLE001 -- a request error, never a scheduler crash
-            logger.warning_rank0(f"image encoding failed: {exc!r}")
-            return f"image encoding failed: {exc}"
-        for img, rows in zip(images, torch.split(flat, [i.count for i in images])):
-            img.embeds = rows
-        return None
-
     def _gather_multimodal(self, batch: Batch) -> None:
-        """Concatenate, in request order, the vision soft tokens of the image placeholders
-        each request forwards in this chunk, so the model can scatter them at image-token
-        positions. A chunk boundary may fall anywhere, even inside an image."""
-        parts = []
-        for req in batch.reqs:
-            mm = req.mm
-            if mm is None:
-                continue
-            for img in mm.images:
-                lo, hi = mm.span(img, req.cached_len, req.device_len)
-                if lo == hi:
-                    continue
-                assert img.embeds is not None, "image forwarded without soft tokens"
-                parts.append(img.embeds[lo:hi])
-                if hi == img.count:
-                    img.embeds = None  # fully forwarded: free the VRAM
-        if parts:
-            batch.mm_embeds = torch.cat(parts, dim=0)
+        """Plan the chunk's encoder jobs, gather rows and scatter rows over the batch; the engine runs them before the LM forward."""
+        jobs, plan, rows, block_ends = plan_mm_batch(batch.padded_reqs, self.engine.encoder_cache)
+        if plan:
+            batch.mm_encoder_jobs = jobs
+            batch.mm_gather_plan = plan
+            batch.mm_rows = torch.tensor(rows, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
+            batch.mm_block_ends = torch.tensor(block_ends, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        if self._bidirectional_mm and not self._warned_cut_image and (cut := cut_image_spans(batch.padded_reqs)):
+            # only a bidirectional image span loses context when cut, and only an image longer than the chunk still gets cut
+            lo, hi = cut[0]
+            self._warned_cut_image = True
+            logger.warning_rank0(
+                f"an image of {hi - lo} tokens does not fit one prefill chunk (--max-extend-tokens {self.prefill_budget}, or the sliding-window pool's share of it): its earlier rows attend within the first part only"
+            )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         elastic = getattr(getattr(self, "engine", None), "elastic", None)
@@ -1346,13 +1320,6 @@ class Scheduler(SchedulerIOMixin):
             elastic.release_prefill()
         # TODO: support other policies: e.g. DECODE first
         batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
-        failed = getattr(self.prefill_manager, "failed", None)
-        if failed:
-            self.send_result([
-                ErrorReplyMsg(uid=uid, error=error, code="invalid_request_error")
-                for uid, error in failed
-            ])
-            failed.clear()
         batch = batch or self.decode_manager.schedule_next_batch()
         if batch is None:
             return None
@@ -1364,15 +1331,6 @@ class Scheduler(SchedulerIOMixin):
             # pending tokens out of a plain decode step, which under CUDA-graph
             # replay would clear their streams and knock them out of MTP for good.
             batch.reqs = [r for r in batch.reqs if r not in self.mtp._deferred]
-            if not batch.reqs:
-                return None
-        advanced = getattr(mtp, "_spec_iter", None)
-        if getattr(batch, "is_decode", False) and advanced:
-            # A speculative round already advanced these requests this iteration and left
-            # their bonus token pending for the NEXT round's verify: a plain step here would
-            # process it outside the round (a redundant decode per round, and a DSpark draft
-            # context that misses that position).
-            batch.reqs = [r for r in batch.reqs if r.table_idx not in advanced]
             if not batch.reqs:
                 return None
         forward_input = self._prepare_batch(batch)
@@ -1415,6 +1373,8 @@ class Scheduler(SchedulerIOMixin):
                 # n-gram rounds never cross a boundary and snapshot on entry themselves
                 boundaries=batch.is_decode and (not mtp.enabled or getattr(mtp, "is_ngram", False)),
             )
+        if batch.phase == "verify":
+            return self.spec.verify_step(batch, sample_args)
         forward_output = self.engine.forward_batch(batch, sample_args)
         keep = getattr(mtp, "keep_draft_state", None) if mtp.enabled else None
         if keep is not None:
@@ -1429,6 +1389,28 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+
+def _make_mrope_positions(batch: Batch, device: torch.device) -> torch.Tensor:
+    """[3, N] rope rows: an image request's prompt tokens use their precomputed columns, everything else is sequence index + per-request delta."""
+    needed = sum(r.extend_len for r in batch.padded_reqs)
+    host = torch.empty((3, needed), dtype=torch.int32, pin_memory=True)
+    offset = 0
+    for req in batch.padded_reqs:
+        length = req.extend_len
+        out = host[:, offset : offset + length]
+        full = req.mrope_positions_full
+        if full is not None and req.device_len <= full.shape[1]:
+            out.copy_(full[:, req.cached_len : req.device_len])
+        else:
+            row = torch.arange(
+                req.cached_len + req.mrope_delta,
+                req.device_len + req.mrope_delta,
+                dtype=torch.int32,
+            )
+            out.copy_(row.unsqueeze(0).expand(3, -1))
+        offset += length
+    return host.to(device, non_blocking=True)
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:

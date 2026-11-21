@@ -8,7 +8,7 @@ import torch
 from freetoken.distributed import DistributedInfo, set_tp_info
 from freetoken.models.qwen4_exp.attention import Qwen4ExpAttention
 from freetoken.layers.quantization import NoQuantConfig
-from freetoken.models.qwen4_exp.gdn import Qwen4ExpGatedDeltaNet
+from freetoken.layers.linear_attn import GatedDeltaNet as Qwen4ExpGatedDeltaNet
 from freetoken.models.qwen4_exp.weight import tp_shard_key
 
 
@@ -156,7 +156,8 @@ class TestConstructionShapes:
                 num_qo_heads=8, num_kv_heads=2, head_dim=64, hidden_size=64, rms_norm_eps=1e-5,
                 quant=NoQuantConfig(),
                 rotary_config=SimpleNamespace(
-                    rotary_dim=64, max_position=4096, base=10000.0, scaling={}
+                    rotary_dim=64, max_position=4096, base=10000.0, scaling={},
+                    mrope_section=None, mrope_layout=None,
                 ),
                 qwen4_args=SimpleNamespace(
                     hidden_size=64, index_n_heads=4, index_kv_heads=1, index_head_dim=8
@@ -195,7 +196,8 @@ class TestConstructionShapes:
             SimpleNamespace(
                 num_qo_heads=8, num_kv_heads=2, head_dim=64, hidden_size=64, rms_norm_eps=1e-5,
                 quant=NoQuantConfig(),
-                rotary_config=SimpleNamespace(rotary_dim=64, max_position=4096, base=10000.0, scaling={}),
+                rotary_config=SimpleNamespace(rotary_dim=64, max_position=4096, base=10000.0, scaling={},
+                                              mrope_section=None, mrope_layout=None),
                 qwen4_args=SimpleNamespace(hidden_size=64, index_n_heads=4, index_kv_heads=1, index_head_dim=8),
             ), 0)
         cfg64 = _Cfg()

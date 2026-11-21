@@ -2,8 +2,7 @@
 
 Greedy acceptance is pure tensor math and a regression there silently corrupts spec output,
 so it is unit-tested on CPU. The sampled rejection path needs the GPU sampling kernels
-(``probs_from_logits``); its residual helper is shared with DSpark and covered in
-``test_dspark_accept.py``.
+(``probs_from_logits``).
 """
 
 from __future__ import annotations

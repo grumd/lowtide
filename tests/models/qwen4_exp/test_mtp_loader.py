@@ -115,7 +115,7 @@ class TestExternalBaseStream:
 
         seen: dict[str, bool] = {}
 
-        def fake_inner(model_path, device, *, include_moe_experts=True, include_mtp=True):
+        def fake_inner(model_path, device, *, include_moe_experts=True, include_mtp=True, include_vision=True):
             seen["include_mtp"] = include_mtp
             yield "model.layers.0.x", torch.zeros(1)
             # A checkpoint that DID ship its own head: these must still be dropped.

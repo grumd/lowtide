@@ -24,7 +24,9 @@ from . import request_ring
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
 from freetoken.tokenizer.effort import requests_thinking_off
+from freetoken.mm.media import collect_image_refs, fetch_image_bytes, image_reject_reason
 from freetoken.tokenizer.tokenize import resolve_thinking_mode
+from freetoken.tokenizer.inline_system import InlineSystemError
 
 try:
     # Chat templates render through jinja2 (a transformers dependency): a TemplateError means
@@ -43,12 +45,14 @@ from .reasoning_parser import (
 )
 
 
-class GenerationError(Exception):
+class GenerationError(ValueError):
     """A request failed before producing output (surfaced via ``UserReply.error`` — e.g. a
     chat template the tokenizer cannot render, or a prompt that exceeds the KV budget). Each
     adapter turns this into its own wire-level error instead of hanging on a reply that never
     arrives. ``code`` carries the stable class (``UserReply.error_code``) when the failure has
-    one, so an adapter can emit it as OpenAI's error ``code`` and clients need not parse prose."""
+    one, so an adapter can emit it as OpenAI's error ``code`` and clients need not parse prose.
+
+    Subclasses ValueError so every adapter's invalid-request handler maps it to a 400."""
 
     def __init__(self, message: str, code: str | None = None):
         super().__init__(message)
@@ -112,9 +116,20 @@ class GenDone:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    timings: dict[str, Any] | None = None
 
 
 GenEvent = ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta | GenDone
+
+
+@dataclass
+class GenUsage:
+    """Token counts of a streaming generation so far. generate_events() updates it from each engine reply before it yields that reply's events. `timings` carries that reply's raw scheduler snapshot (the terminal one on requests that did not ask for per-token timings); streamers attach it per chunk only for requests that did."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cached_tokens: int = 0
+    timings: dict[str, Any] | None = None
 
 
 @dataclass
@@ -127,6 +142,47 @@ class GenResult:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    timings: dict[str, Any] | None = None
+
+
+def timings_block(state: Any, timings: dict[str, Any] | None) -> dict[str, Any] | None:
+    """llama.cpp's per-request timings object (server_slot_stats::to_json, b10408+) as
+    frontends like llama-swap read it, plus queue_ms as a FreeToken extension. The spans
+    and counts are measured in the scheduler (ReqStats) and arrive on the terminal ack
+    (on every ack of a timings_per_token request):
+    queue_ms covers waiting-queue admission to the first prefill chunk, prompt_ms the
+    first chunk to the first sampled token on the host, predicted_ms the first to the
+    last committed token. prompt_n counts only the evaluated tokens and the decode rates
+    divide by predicted_n - 1 steps (the first token rides the last prompt batch),
+    matching llama.cpp's arithmetic. Values are not rounded. Off unless
+    --enable-timings-report: usage.prompt_tokens - prompt_n would otherwise still
+    reveal the prefix-cache hit that --enable-cache-report hides."""
+    if timings is None:
+        return None
+    config = getattr(state, "config", None) if state is not None else None
+    if not getattr(config, "enable_timings_report", False):
+        return None
+    prompt_n = timings["prompt_n"]
+    predicted_n = timings["predicted_n"]
+    prompt_ms = timings["prompt_ms"]
+    predicted_ms = timings["predicted_ms"]
+    gen_steps = max(predicted_n - 1, 0)
+    block: dict[str, Any] = {
+        "cache_n": timings["cache_n"],
+        "prompt_n": prompt_n,
+        "prompt_ms": prompt_ms,
+        "prompt_per_token_ms": prompt_ms / prompt_n if prompt_n > 0 else 0.0,
+        "prompt_per_second": 1e3 / prompt_ms * prompt_n if prompt_ms > 0 else 0.0,
+        "predicted_n": predicted_n,
+        "predicted_ms": predicted_ms,
+        "predicted_per_token_ms": predicted_ms / gen_steps if gen_steps > 0 else 0.0,
+        "predicted_per_second": 1e3 / predicted_ms * gen_steps if predicted_ms > 0 else 0.0,
+        "queue_ms": timings["queue_ms"],
+    }
+    if timings.get("draft_n", 0) > 0:
+        block["draft_n"] = timings["draft_n"]
+        block["draft_n_accepted"] = timings["draft_n_accepted"]
+    return block
 
 
 @dataclass
@@ -140,6 +196,7 @@ class GenSpec:
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
+    inline_system_policy: str | None = None
 
     @property
     def parse_tools(self) -> bool:
@@ -164,6 +221,10 @@ def resolve_sampling(
     ignore_eos: bool,
     model_sampling: dict[str, Any],
     stop: str | list[str] | None = None,
+    default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+    timings_per_token: bool = False,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults."""
@@ -185,19 +246,21 @@ def resolve_sampling(
         raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
     return SamplingParams(
         ignore_eos=ignore_eos,
-        max_tokens=DEFAULT_MAX_OUTPUT_TOKENS if max_tokens is None else max_tokens,
+        max_tokens=default_max_tokens if max_tokens is None else max_tokens,
         temperature=pick(temperature, "temperature", 0.0),
         top_k=pick(top_k, "top_k", -1),
         top_p=pick(top_p, "top_p", 1.0),
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
+        timings_per_token=timings_per_token,
     )
 
 
 def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Normalize OpenAI-shaped message dicts for the chat template: flatten text-only
-    content to a string (keeping text+image part lists intact for vision), and decode
-    tool-call arguments from JSON. Raises ValueError on an unsupported content part.
-    Shared by all adapters."""
+    """Normalize OpenAI-shaped message dicts for the chat template: flatten text
+    content parts to a string and decode tool-call arguments from JSON. Raises
+    ValueError on a non-text content part (text-only server). Shared by all adapters."""
     return [_render_message(m) for m in messages]
 
 
@@ -237,34 +300,41 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     return m
 
 
-def _flatten_text_parts(parts: list[Any]) -> Any:
-    """Collapse content parts for the chat template. Text-only stays a string; when image
-    parts are present the list is kept (text + ``image_url``) so the template emits the
-    vision markers, and the tokenizer worker can pull the images out (see tokenizer.vision)."""
-    has_image = any(
-        isinstance(p, dict) and p.get("type") in ("image_url", "image") for p in parts
-    )
-    if not has_image:
-        texts: list[str] = []
-        for part in parts:
-            ptype = part.get("type") if isinstance(part, dict) else None
-            if ptype == "text":
-                texts.append((part.get("text") if isinstance(part, dict) else None) or "")
-            else:
-                raise ValueError(f"Unsupported content part type for text-only server: {ptype}")
-        return "".join(texts)
-    out: list[Any] = []
+def _flatten_text_parts(parts: list[Any]) -> str | list[dict[str, Any]]:
+    """Plain string for text-only parts; a template-ready part list with {"type": "image"} entries (source kept under freetoken_ref) when images are present."""
+    out: list[dict[str, Any]] = []
+    has_image = False
     for part in parts:
-        if not isinstance(part, dict):
-            continue
-        ptype = part.get("type")
+        ptype = part.get("type") if isinstance(part, dict) else None
         if ptype == "text":
             out.append({"type": "text", "text": part.get("text") or ""})
-        elif ptype in ("image_url", "image"):
+        elif ptype in ("image_url", "input_image"):
+            url = part.get("image_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            url = url or part.get("url")
+            if not url:
+                raise ValueError("image content part carries no url")
+            out.append({"type": "image", "freetoken_ref": {"kind": "url", "data": url}})
+            has_image = True
+        elif ptype == "image" and isinstance(part.get("freetoken_ref"), dict):
             out.append(part)
+            has_image = True
         else:
             raise ValueError(f"Unsupported content part type: {ptype}")
+    if not has_image:
+        return "".join(p["text"] for p in out)
     return out
+
+
+async def _resolve_images(refs: list[dict[str, Any]], state: Any) -> list[bytes]:
+    """Gate and fetch a request's images; every failure is a GenerationError."""
+    if reason := image_reject_reason(state.config):
+        raise GenerationError(reason)
+    try:
+        return await fetch_image_bytes(refs, state.config)
+    except ValueError as exc:
+        raise GenerationError(str(exc)) from exc
 
 
 def split_tool_lists(
@@ -287,6 +357,8 @@ def split_tool_lists(
 async def submit_generation(spec: GenSpec, state: Any) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
     calls this — it takes the neutral spec, not a wire request type."""
+    refs = collect_image_refs(spec.messages)
+    images = await _resolve_images(refs, state) if refs else None
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(
@@ -295,6 +367,8 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             sampling_params=spec.sampling_params,
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
+            images=images,
+            inline_system_policy=spec.inline_system_policy,
         )
     )
     return uid
@@ -305,6 +379,8 @@ async def count_prompt_tokens(
     tools: list[dict[str, Any]] | None,
     chat_template_kwargs: dict[str, Any],
     state: Any,
+    *,
+    inline_system_policy: str | None = None,
 ) -> int:
     """Token count of an already-converted (messages, tools, chat_template_kwargs) prompt,
     using the frontend's own tokenizer (``state.frontend_tokenizer()``) so the count equals the
@@ -318,19 +394,25 @@ async def count_prompt_tokens(
     class the generation path maps to a 400. A tokenizer *initialization* failure (missing
     template, load error) propagates as its original exception, a server fault. Load + tokenize
     run in a worker thread so the event loop is never blocked."""
+    refs = collect_image_refs(messages)
+    images = await _resolve_images(refs, state) if refs else None
     msg = TokenizeMsg(
         uid=0,
         text=messages,
         sampling_params=SamplingParams(),
         chat_template_kwargs=chat_template_kwargs,
         tools=tools,
+        images=images,
+        inline_system_policy=inline_system_policy,
     )
     manager = await asyncio.to_thread(state.frontend_tokenizer)  # init failure -> server fault
     try:
-        input_ids = (await asyncio.to_thread(manager.tokenize, [msg]))[0]
+        (user_msg,) = await asyncio.to_thread(manager.tokenize, [msg])
+    except InlineSystemError as exc:
+        raise GenerationError(str(exc)) from exc
     except _TemplateError as exc:
         raise GenerationError(str(exc)) from exc
-    return int(input_ids.numel())
+    return int(user_msg.input_ids.numel())
 
 
 async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
@@ -351,6 +433,7 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
         sampling_params=SamplingParams(),
         chat_template_kwargs=spec.chat_template_kwargs,
         tools=spec.template_tools,
+        inline_system_policy=spec.inline_system_policy,
     )
     try:
         manager = await asyncio.to_thread(build)
@@ -363,18 +446,10 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
     return None
 
 
-def _make_reasoning_parser(
-    spec: GenSpec, state: Any, force_override: bool | None = None
-) -> ReasoningParser | None:
+def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
     """Build a reasoning parser for this generation, or None if the server has no
     reasoning parser configured. ``force_reasoning`` matches the encode-side
-    thinking mode so chat-mode content is never mislabeled as reasoning.
-
-    ``force_override`` (set only by :func:`_make_reasoning_parser_async` for the
-    dsv4 protocol) wins over the mode resolution: a chat template that
-    unconditionally opens the think block starts generation inside the reasoning
-    block in every mode, so mode-based attribution would mislabel all reasoning
-    as content."""
+    thinking mode so chat-mode content is never mislabeled as reasoning."""
     parser_name = getattr(state.config, "reasoning_parser", None)
     if parser_name == "qwen3":
         # The qwen3 chat template opens an implicit <think> (thinking on) unless
@@ -399,61 +474,25 @@ def _make_reasoning_parser(
         # Hy4's template opens <think:opensource> at the generation prompt unless thinking is
         # off (reasoning_effort no_think, which TokenizeManager maps the off toggles to)
         force_reasoning = not requests_thinking_off(spec.chat_template_kwargs)
+    elif parser_name in ("flint", "ricursive"):
+        # These families open their own optional think block, including when tools are present.
+        force_reasoning = False
     elif parser_name == "minimax_m3":
         # M3's template pre-opens <mm:think> only in thinking_mode "enabled" (the
         # model then emits just the closing tag); "adaptive" (default) leaves the
         # model to open the tag itself and "disabled" pre-closes it.
         force_reasoning = (spec.chat_template_kwargs or {}).get("thinking_mode") == "enabled"
     else:
-        # deepseekv32 (and family-unknown names) land here. The default mirrors
-        # the native dsv4 encoder's contract: chat mode renders the generation
-        # prompt without  geom and the model opens the block itself, so leading
-        # text stays content. A Jinja template that ignores the toggle kwargs
-        # breaks that contract in the other direction — it opens  geom on every
-        # render (probe: not toggleable, default "on", e.g. the thinking-only
-        # DeepSeek-V4.1-Flash) — and _make_reasoning_parser_async then passes
-        # force_override=True so leading output is attributed to reasoning.
-        if force_override is not None:
-            force_reasoning = force_override
-        else:
-            force_reasoning = (
-                resolve_thinking_mode(spec.chat_template_kwargs, spec.template_tools) == "thinking"
-            )
+        force_reasoning = (
+            resolve_thinking_mode(spec.chat_template_kwargs, spec.template_tools) == "thinking"
+        )
     return build_reasoning_parser(state.config, force_reasoning)
 
 
-async def _thinking_profile(state: Any):
-    """The checkpoint's probed thinking profile (``tokenizer/effort.py``), or
-    None when it is unavailable. Built off-thread — the frontend tokenizer and
-    the profile are cached, so the cost is paid once per server lifetime."""
-    build = getattr(state, "frontend_tokenizer", None)
-    if build is None:
-        return None
-    try:
-        manager = await asyncio.to_thread(build)
-        return await asyncio.to_thread(manager.thinking_profile)
-    except Exception:  # noqa: BLE001 -- a probe failure must not break generation
-        return None
-
-
-async def _make_reasoning_parser_async(spec: GenSpec, state: Any) -> ReasoningParser | None:
-    """Async variant of :func:`_make_reasoning_parser` that consults the
-    checkpoint's thinking profile. For the dsv4 protocol a template-path
-    checkpoint that always opens  geom (probe: not toggleable, default "on")
-    must attribute leading output to reasoning in every mode; native-encoder
-    checkpoints are toggleable and keep the resolve_thinking_mode contract."""
-    force_override = None
-    if getattr(state.config, "reasoning_parser", None) == "deepseekv32":
-        profile = await _thinking_profile(state)
-        if profile is not None and not profile.toggleable and profile.default_state == "on":
-            force_override = True
-    return _make_reasoning_parser(spec, state, force_override)
-
-
-async def _split_reasoning(text: str, spec: GenSpec, state: Any) -> tuple[str, str]:
+def _split_reasoning(text: str, spec: GenSpec, state: Any) -> tuple[str, str]:
     """Return ``(reasoning, content)``. A no-op (``("", text)``) when no reasoning
     parser is configured, preserving the original behavior for other models."""
-    parser = await _make_reasoning_parser_async(spec, state)
+    parser = _make_reasoning_parser(spec, state)
     if parser is None:
         return "", text
     return parser.parse_non_stream(text)
@@ -568,7 +607,7 @@ def _record_generation(
 
 
 async def generate_events(
-    uid: int, spec: GenSpec, state: Any, *, source: str | None = None
+    uid: int, spec: GenSpec, state: Any, *, source: str | None = None, usage: GenUsage | None = None
 ) -> AsyncIterator[GenEvent]:
     """Wraps `_generate_events_impl` to log the request with its totals, read off the terminal
     `GenDone`. The `finally` still records the row on a mid-stream disconnect — but with 0 tokens
@@ -579,7 +618,9 @@ async def generate_events(
     first_token_at: float | None = None
     error: str | None = None
     try:
-        async for ev in _generate_events_impl(uid, spec, state):
+        async for ev in _generate_events_impl(
+            uid, spec, state, usage if usage is not None else GenUsage()
+        ):
             if isinstance(ev, GenDone):
                 prompt_tokens = ev.prompt_tokens
                 completion_tokens = ev.completion_tokens
@@ -620,7 +661,9 @@ async def generate_full(
         )
 
 
-async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIterator[GenEvent]:
+async def _generate_events_impl(
+    uid: int, spec: GenSpec, state: Any, usage: GenUsage
+) -> AsyncIterator[GenEvent]:
     """Protocol-neutral streaming generation. Yields semantic events (reasoning /
     content / tool-call deltas) terminated by exactly one GenDone. Produces no wire
     format — the OpenAI/Anthropic/Responses streamers format these into their own.
@@ -632,12 +675,9 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     carry the output ordinal (0, 1, ...) in tool_index. Formats whose detector
     cannot parse incrementally (supports_streaming=False) keep the previous
     buffer-everything-then-parse-at-the-end behavior."""
-    prompt_tokens = 0
-    completion_tokens = 0
-    cached_tokens = 0
     pending = ""
     parse_tools = spec.parse_tools
-    reasoning_parser = await _make_reasoning_parser_async(spec, state)
+    reasoning_parser = _make_reasoning_parser(spec, state)
     specials = _leaked_special_tokens(state)
 
     tool_parser: FunctionCallParser | None = None
@@ -724,12 +764,16 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
 
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
+    timings: dict[str, Any] | None = None
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
-        prompt_tokens += ack.prompt_tokens_delta
-        completion_tokens += ack.completion_tokens_delta
-        cached_tokens += ack.cached_tokens
+        usage.prompt_tokens += ack.prompt_tokens_delta
+        usage.completion_tokens += ack.completion_tokens_delta
+        usage.cached_tokens += ack.cached_tokens
+        if getattr(ack, "timings", None) is not None:
+            timings = ack.timings
+            usage.timings = timings
         content_delta = ack.incremental_output
         if reasoning_parser is not None and content_delta:
             reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)
@@ -810,8 +854,9 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
             yield ContentDelta(strip_special_tokens(pending, specials))
 
     yield GenDone(
-        finish_reason, prompt_tokens, completion_tokens,
-        matched_stop=engine_matched_stop, cached_tokens=cached_tokens,
+        finish_reason, usage.prompt_tokens, usage.completion_tokens,
+        matched_stop=engine_matched_stop, cached_tokens=usage.cached_tokens,
+        timings=timings,
     )
 
 
@@ -822,6 +867,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
+    timings: dict[str, Any] | None = None
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
     async for ack in state.wait_for_ack(uid):
@@ -830,13 +876,15 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        if getattr(ack, "timings", None) is not None:
+            timings = ack.timings
         full_content += ack.incremental_output
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
             break
 
-    reasoning_text, content_text = await _split_reasoning(full_content, spec, state)
+    reasoning_text, content_text = _split_reasoning(full_content, spec, state)
     # Engine reason ("stop"/"length"); a tool call overrides it, but a truncation (length) wins.
     finish_reason = engine_finish_reason or "stop"
     tool_calls: list[ToolCallItem] = []
@@ -856,4 +904,5 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         completion_tokens=completion_tokens,
         matched_stop=engine_matched_stop,
         cached_tokens=cached_tokens,
+        timings=timings,
     )

@@ -26,7 +26,8 @@ def _cuda_at_least(major: int, minor: int) -> bool:
     return tuple(int(x) for x in cuda.split(".")[:2]) >= (major, minor)
 
 BATCH_API = pytest.mark.skipif(
-    not _cuda_at_least(13, 0), reason="the cudaMemcpyBatchAsync binding needs CUDA >= 13.0"
+    torch.version.hip is None and not _cuda_at_least(13, 0),
+    reason="the cudaMemcpyBatchAsync binding needs CUDA >= 13.0",
 )
 
 NUM_LAYERS, E, CACHE_SIZE = 3, 8, 24  # hit region = slots [16, 24)
@@ -95,6 +96,32 @@ def test_batch_memcpy_probe_passes_while_the_stream_is_busy():
         torch.cuda.synchronize()
         torch.cuda._sleep(100_000_000)  # ~60 ms of spin that the zero-fill queues behind
         _probe(fn)
+
+
+@CUDA
+@JIT
+@BATCH_API
+def test_batch_memcpy_probe_waits_for_current_stream():
+    from freetoken.kernel.batch_memcpy import load_batch_memcpy
+
+    # Compile and initialize the binding before queuing work so JIT cannot drain it.
+    load_batch_memcpy()
+    # Warm probe-sized allocations and the stream pool to avoid first-use syncs.
+    for _ in range(4):
+        block = torch.zeros(16, dtype=torch.uint8, device="cuda")
+        del block
+        pinned = torch.arange(16, dtype=torch.uint8).pin_memory()
+        del pinned
+    streams = [torch.cuda.Stream() for _ in range(40)]
+    torch.cuda.synchronize()
+    del streams
+
+    try:
+        torch.cuda._sleep(1_500_000_000)
+        assert not torch.cuda.current_stream().query(), "backlog drained before the probe ran"
+        load_batch_memcpy()
+    finally:
+        torch.cuda.synchronize()
 
 
 @CUDA

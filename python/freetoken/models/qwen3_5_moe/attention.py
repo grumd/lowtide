@@ -6,7 +6,7 @@ import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import (
     BaseOP,
-    GemmaRMSNorm,
+    GemmaPlusOneRMSNorm,
     LinearColParallelMerged,
     LinearReplicated,
     LinearRowParallel,
@@ -59,10 +59,8 @@ class Qwen3_5Attention(BaseOP):
             config.hidden_size, self._qkv_split, has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
         )
-        # Qwen3.5 uses Gemma-style (1+weight) RMSNorm; the weight loader bakes the +1
-        # into the stored weight (GemmaRMSNorm scales by the raw weight).
-        self.q_norm = GemmaRMSNorm(head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(head_dim, eps=config.rms_norm_eps)
+        self.q_norm = GemmaPlusOneRMSNorm(head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaPlusOneRMSNorm(head_dim, eps=config.rms_norm_eps)
         self.rotary = get_rope(
             head_dim=head_dim,
             rotary_dim=config.rotary_config.rotary_dim,
@@ -73,6 +71,12 @@ class Qwen3_5Attention(BaseOP):
                 if config.rotary_config.scaling
                 else None
             ),
+            mrope_section=(
+                tuple(config.rotary_config.mrope_section)
+                if config.rotary_config.mrope_section is not None
+                else None
+            ),
+            mrope_layout=config.rotary_config.mrope_layout,
         )
         self.o_proj = (
             LinearRowParallel(
@@ -90,7 +94,7 @@ class Qwen3_5Attention(BaseOP):
         """Returns (q, k, v, gate): q [N, local_q, head_dim] post qk-norm+rope,
         k [N, local_kv*head_dim] post norm+rope, v [N, local_kv*head_dim],
         gate [N, local_q*head_dim]."""
-        positions = get_global_ctx().batch.positions
+        positions = get_global_ctx().batch.get_attn_positions()
         qkv = self.qkv_proj.forward(x)
         qg, k, v = torch.split(qkv, self._qkv_split_local, dim=-1)
         qg = qg.view(-1, self.local_q, self.head_dim * 2)

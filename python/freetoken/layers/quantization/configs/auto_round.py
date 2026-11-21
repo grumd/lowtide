@@ -4,8 +4,8 @@ import re
 from typing import Any, ClassVar
 
 from ..registry import register_dialect
-from ..scheme import QuantScheme, wna16_scheme
-from .base import QuantConfig
+from ..scheme import QuantKind, QuantScheme, wna16_scheme
+from .base import QuantConfig, Stored
 
 
 @register_dialect
@@ -22,6 +22,9 @@ class AutoRoundConfig(QuantConfig):
     dialect = "auto-round"
 
     SCHEME: ClassVar[QuantScheme] = wna16_scheme()
+    STORAGE: ClassVar[dict[QuantKind, dict[str, str | Stored]]] = {
+        QuantKind.W4A16: {"weight": "qweight", "weight_zero": "qzeros", "weight_scale": "scales"},
+    }
 
     def __init__(self, q: dict[str, Any], hf_config: Any = None, *, name_map=None, unquantized=()):
         super().__init__(name_map, unquantized)

@@ -1,32 +1,18 @@
-"""DeepSeek-V4.1-Flash family (Phase 1 skeleton — the DSV4.1 plan).
+"""DeepSeek-V4.1-Flash: Causal Encoder-Decoder MoE with Compressed Sparse Attention 2.
 
-Registry exports (the names the ModelSpec resolves): DeepseekV41ForCausalLM,
-parse_config, iter_weights.
+40 layers (20 encoder + 20 decoder), every layer a sliding window (128) plus -- from layer 2 -- global
+sparse attention over cross-layer-shared compressed KV in packed fp4 (Full / Reindex / Reuse
+modes, a hierarchical candidate pool in the decoder), single-pass mHC residual streams, Engram n-gram
+memory at layers 1 and 14 streamed from disk, one shared + 384 routed MXFP4 experts per layer served
+from the offload cache. Images use the DeepSeek ViT; DSpark speculative decoding is not served.
 """
 
-from .args import DeepseekV41Args, load_args
 from .config import parse_config
-from .model import Block, DeepseekV41ForCausalLM, Transformer
-from .weight import (
-    dspark_expert_method,
-    iter_dspark_expert_pieces,
-    iter_expert_pieces,
-    iter_weights,
-    load_dspark_banks,
-    shard_ftw_weight,
-)
+from .gguf import iter_gguf_weights, parse_gguf_config, to_gguf
+from .model import DeepseekV41ForCausalLM
+from .weight import ftw_check_source, ftw_side_files, iter_expert_pieces, iter_weights, iter_vision_weights
 
 __all__ = [
-    "Block",
-    "DeepseekV41Args",
-    "DeepseekV41ForCausalLM",
-    "Transformer",
-    "dspark_expert_method",
-    "iter_dspark_expert_pieces",
-    "iter_expert_pieces",
-    "iter_weights",
-    "load_args",
-    "load_dspark_banks",
-    "shard_ftw_weight",
-    "parse_config",
+    "DeepseekV41ForCausalLM", "parse_config", "iter_weights", "iter_vision_weights", "iter_expert_pieces", "ftw_side_files",
+    "ftw_check_source", "iter_gguf_weights", "parse_gguf_config", "to_gguf",
 ]

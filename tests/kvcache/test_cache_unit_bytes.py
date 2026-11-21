@@ -16,7 +16,7 @@ from freetoken.kvcache.cache_status import (
     compute_cache_status_meta,
     compute_cache_unit_bytes,
 )
-from freetoken.kvcache.dsv4_cost_model import _dsv4_window_floor_pages
+from freetoken.kvcache.dsv4.v4_cost_model import _dsv4_window_floor_pages
 
 
 def _init_tp() -> None:
@@ -48,6 +48,13 @@ def test_kv_bytes_per_token_from_mha_buffer():
     assert ub["kv_bytes_per_token"] == 2 * layers * kv_heads * head_dim * itemsize
     assert ub["moe_bytes_per_expert"] == 0
     assert ub["mamba_bytes_per_slot"] == 0
+
+
+def test_kv_bytes_per_token_counts_the_draft_kv():
+    eng = _mha_engine()
+    plain = compute_cache_unit_bytes(eng)["kv_bytes_per_token"]
+    eng.spec = SimpleNamespace(budget=lambda config: (1 << 20, 768))
+    assert compute_cache_unit_bytes(eng)["kv_bytes_per_token"] == plain + 768
 
 
 def test_kv_and_swa_bytes_per_token_from_hybrid_pools():
@@ -204,7 +211,7 @@ def test_floors_dsv4_reports_real_window_floor():
             dsv4_args=SimpleNamespace(window_size=P), has_swa_attention=False
         ),
     )
-    from freetoken.kvcache.dsv4_paged_pool import DSV4PagedKVCache
+    from freetoken.kvcache.dsv4.v4_pool import DSV4PagedKVCache
 
     eng = SimpleNamespace(config=cfg, moe_offload_cache=None, linear_state_pool=None)
     eng.kv_cache = object.__new__(DSV4PagedKVCache)  # min_kv_tokens is a classmethod
@@ -213,7 +220,7 @@ def test_floors_dsv4_reports_real_window_floor():
     assert floors["kv_tokens"] > 0
     # The window (swa) floor is reported too, in tokens (window pages x P) -- not the bogus 0 the
     # radix-only branch used to give for DSV4.
-    assert floors["swa_tokens"] == _dsv4_window_floor_pages(cfg, P) * P
+    assert floors["swa_tokens"] == (_dsv4_window_floor_pages(cfg, P) - 1) * P
 
 
 def test_floors_missing_config_all_zero():

@@ -51,6 +51,11 @@ class UserReply(BaseFrontendMsg):
     mtp_enabled: bool = False
     mtp_drafted: int = 0
     mtp_accepted: int = 0
+    # Scheduler-measured per-request timings (queue/prompt/predicted spans, cache/prompt/
+    # predicted counts, draft counters), passthrough of DetokenizeMsg.timings: present on
+    # the terminal reply of a served request, and on every reply when the request asked
+    # for per-token timings; None otherwise.
+    timings: dict | None = None
     # Set (with finished=True) when a request failed before producing output — e.g. a chat
     # template that the tokenizer cannot render, or a prompt that exceeds the KV budget the
     # scheduler can serve. Carries a human-readable reason. Without this, such a request would
@@ -82,4 +87,12 @@ class DecodeTuneReply(BaseFrontendMsg):
     request_id: str
     status: str  # "ok" | "rejected"
     result: Dict[str, Any] | None = None
+    error: str | None = None
+
+
+@dataclass
+class FlushCacheReply(BaseFrontendMsg):
+    # detokenizer worker -> api server: result of a /v1/cache/flush request.
+    request_id: str
+    status: str  # "ok" | "busy" | "timeout" | "unsupported" | "failed"
     error: str | None = None

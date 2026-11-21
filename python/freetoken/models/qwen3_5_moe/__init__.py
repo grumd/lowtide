@@ -1,6 +1,14 @@
 from .config import parse_config
-from .model import Qwen3_5MoEForCausalLM
+from .gguf import gguf_mm_config, iter_gguf_weights, parse_gguf_config, to_gguf
+from .model import (
+    Qwen3_5ForCausalLM,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeForConditionalGeneration,
+)
 from .weight import (
+    iter_expert_pieces,
+    iter_vision_weights,
     iter_weights,
     iter_weights_parallel,
     nvfp4_expert_spec,
@@ -9,11 +17,19 @@ from .weight import (
 )
 
 __all__ = [
-    "Qwen3_5MoEForCausalLM",
+    "Qwen3_5ForCausalLM",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForCausalLM",
+    "Qwen3_5MoeForConditionalGeneration",
     "parse_config",
+    "iter_vision_weights",
     "iter_weights",
     "iter_weights_parallel",
     "nvfp4_expert_spec",
     "tp_shard_key",
     "shard_ftw_weight",
+    "gguf_mm_config",
+    "iter_gguf_weights",
+    "parse_gguf_config",
+    "to_gguf",
 ]

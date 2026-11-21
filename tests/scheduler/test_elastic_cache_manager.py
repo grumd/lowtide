@@ -180,7 +180,7 @@ def test_an_aborted_long_prompt_hands_its_workspace_back_before_anything_else_ru
     sched.stream = SimpleNamespace(wait_stream=lambda s: None)
     sched.prefill_manager = SimpleNamespace(runnable=True)
     sched.decode_manager = SimpleNamespace(runnable=False, running_reqs=[])
-    sched._pending_rebuild, sched._pending_tunes = None, []
+    sched._pending_rebuild, sched._pending_tunes, sched._pending_flush = None, [], None
     sched.receive_msg = lambda blocking: ["abort"]
     sched._process_one_msg = lambda msg: setattr(sched.prefill_manager, "runnable", False)
     sched.mtp = SimpleNamespace(enabled=False, is_ngram=ngram, run_round=lambda: events.append("round"))

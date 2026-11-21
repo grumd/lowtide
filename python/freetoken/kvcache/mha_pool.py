@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Callable, List, Sequence, Tuple
+from typing import Callable, ClassVar, List, Sequence, Tuple
 
 import torch
 from freetoken.distributed import get_tp_info
 from freetoken.utils import div_even
 
 from .base import BaseKVCachePool
+from .format import NONE, ROW_SCALE_FORMATS, KVFormat
 
 # Elastic VRAM installs an allocator around pool construction:
 # ``alloc(role, shape, dtype, intervals)`` returns the tensor for one page-scaled tier, where
@@ -66,6 +67,7 @@ class MHAKVCache(BaseKVCachePool):
 
     # every page-scaled tier goes through alloc_tier, so the engine may back pages on demand
     ELASTIC_VRAM = True
+    kv_formats: ClassVar[frozenset[str]] = ROW_SCALE_FORMATS
 
     def __init__(
         self,
@@ -77,10 +79,14 @@ class MHAKVCache(BaseKVCachePool):
         dtype: torch.dtype,
         device: torch.device,
         layer_ids: Sequence[int] | None = None,
+        kv_format: KVFormat = NONE,
     ) -> None:
         tp_info = get_tp_info()
         local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
         self._num_layers = num_layers
+        self.kv_format = kv_format
+        self._dtype = dtype
+        self._head_dim = head_dim
         if layer_ids is None:
             num_storage_layers = num_layers
             self._layer_map: list[int] | None = None
@@ -98,55 +104,68 @@ class MHAKVCache(BaseKVCachePool):
             self._layer_map = layer_map
             self._num_layers = map_size
         self.elastic = _TIER_ALLOC is not None
-        page_bytes = page_size * local_kv_heads * head_dim * dtype.itemsize
+        self._device = device
+        self._alloc(num_storage_layers, num_pages, page_size, local_kv_heads)
+
+    def _alloc(self, num_storage_layers: int, num_pages: int, page_size: int, local_kv_heads: int) -> None:
+        fmt = self.kv_format
+        elem_dim = fmt.elem_dim(self._head_dim)
+        dtype = fmt.elem_tensor_dtype(self._dtype)
+        page_bytes = page_size * local_kv_heads * elem_dim * dtype.itemsize
         self._kv_buffer = self._alloc_kv_buffer(
-            (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
+            (2, num_storage_layers, num_pages, page_size, local_kv_heads, elem_dim),
             dtype,
-            device,
+            self._device,
             # the last page of every (k/v, layer) run is the dummy page padded rows point at
             paged_run_intervals(2 * num_storage_layers, num_pages * page_bytes, page_bytes, page_bytes),
+            # zeros: an unwritten e4m3 code can be NaN
+            zero=fmt.quantized,
         )
+        self._scale_buffer = None
+        if fmt.scale_dtype is not None:
+            scale_dim = fmt.scale_dim(self._head_dim)
+            scale_page = page_size * local_kv_heads * scale_dim * fmt.scale_store_dtype.itemsize
+            self._scale_buffer = alloc_tier(
+                "kv_scale",
+                (2, num_storage_layers, num_pages * page_size, local_kv_heads, scale_dim),
+                fmt.scale_store_dtype,
+                self._device,
+                paged_run_intervals(2 * num_storage_layers, num_pages * scale_page, scale_page, scale_page),
+                zero=True,
+            )
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
-        self._device = device
-        self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
+        self._storage_shape = (num_pages * page_size, local_kv_heads, elem_dim)
 
-    def _alloc_kv_buffer(self, shape, dtype, device, intervals) -> torch.Tensor:
-        return alloc_tier("kv", shape, dtype, device, intervals)
+    def _alloc_kv_buffer(self, shape, dtype, device, intervals, *, zero: bool = False) -> torch.Tensor:
+        return alloc_tier("kv", shape, dtype, device, intervals, zero=zero)
 
     def rebuild(self, num_pages: int) -> None:
         """Reallocate the KV buffer for ``num_pages`` pages IN PLACE.
 
-        Geometry (storage layers, page_size, kv heads, head_dim) is taken from the
-        existing buffer; only the page count changes. Views and ``_storage_shape`` are
+        Storage layers, page_size and kv heads are taken from the existing buffer and
+        head_dim from the pool; only the page count changes. Views and ``_storage_shape`` are
         refreshed. Object identity is preserved so cached backend references stay valid.
         """
         if self.elastic:
             raise RuntimeError("an elastic KV pool resizes by remapping pages, not rebuild")
-        _, num_storage_layers, _old_pages, page_size, local_kv_heads, head_dim = self._kv_buffer.shape
-        dtype = self._kv_buffer.dtype
+        _, num_storage_layers, _old_pages, page_size, local_kv_heads, _elem_dim = self._kv_buffer.shape
         device = self._device
         self._k_buffer = None
         self._v_buffer = None
         self._kv_buffer = None
+        self._scale_buffer = None
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             torch.cuda.empty_cache()
-        self._kv_buffer = torch.empty(
-            (2, num_storage_layers, num_pages, page_size, local_kv_heads, head_dim),
-            device=device,
-            dtype=dtype,
-        )
-        self._k_buffer = self._kv_buffer[0]
-        self._v_buffer = self._kv_buffer[1]
-        self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
+        self._alloc(num_storage_layers, num_pages, page_size, local_kv_heads)
 
     @classmethod
     def kv_cost(cls, config) -> tuple[int, int, int, int]:
         from .base import spec_kv_bytes_per_token
 
         per_token = sum(
-            spec_kv_bytes_per_token(spec, config)
+            spec_kv_bytes_per_token(spec, config, getattr(config, "kv_format", NONE))
             for spec in config.model_config.kv_cache_group_specs()
             if not spec.is_swa
         )
@@ -160,7 +179,10 @@ class MHAKVCache(BaseKVCachePool):
     def unit_bytes(self) -> tuple[int, int]:
         buf = self._kv_buffer
         tokens = int(buf.shape[2]) * int(buf.shape[3])
-        return int(buf.numel() * buf.element_size()) // tokens, 0
+        total = int(buf.numel() * buf.element_size())
+        if self._scale_buffer is not None:
+            total += int(self._scale_buffer.numel() * self._scale_buffer.element_size())
+        return total // tokens, 0
 
     def _dense(self, layer_id: int) -> int:
         if self._layer_map is None:
@@ -173,13 +195,23 @@ class MHAKVCache(BaseKVCachePool):
     def page_views(self) -> List[torch.Tensor]:
         """Every page-scaled tier viewed with the page on dim 0, so gathering or scattering by
         page index moves all of a page's bytes (elastic compaction, the prefix RAM tier)."""
-        return [self._kv_buffer.permute(2, 0, 1, 3, 4, 5)]
+        views = [self._kv_buffer.permute(2, 0, 1, 3, 4, 5)]
+        if self._scale_buffer is not None:
+            pages, page_size = self._kv_buffer.shape[2], self._kv_buffer.shape[3]
+            views.append(self._scale_buffer.unflatten(2, (pages, page_size)).permute(2, 0, 1, 3, 4, 5))
+        return views
 
     def k_cache(self, index: int) -> torch.Tensor:
         return self._k_buffer[self._dense(index)]
 
     def v_cache(self, index: int) -> torch.Tensor:
         return self._v_buffer[self._dense(index)]
+
+    def k_scale(self, index: int) -> torch.Tensor | None:
+        return None if self._scale_buffer is None else self._scale_buffer[0, self._dense(index)]
+
+    def v_scale(self, index: int) -> torch.Tensor | None:
+        return None if self._scale_buffer is None else self._scale_buffer[1, self._dense(index)]
 
     def store_kv(
         self,
@@ -188,12 +220,20 @@ class MHAKVCache(BaseKVCachePool):
         out_loc: torch.Tensor,
         layer_id: int,
     ) -> None:
+        dense = self._dense(layer_id)
+        k_cache = self._k_buffer[dense].view(self._storage_shape)
+        v_cache = self._v_buffer[dense].view(self._storage_shape)
+        if self.kv_format.quantized:
+            from freetoken.kernel.triton.kv_rows import store_kv_rows
+
+            store_kv_rows(self.kv_format, k, v, out_loc, k_cache, v_cache, self.k_scale(layer_id), self.v_scale(layer_id))
+            return
+
         from freetoken.kernel import store_cache
 
-        dense = self._dense(layer_id)
         store_cache(
-            k_cache=self._k_buffer[dense].view(self._storage_shape),
-            v_cache=self._v_buffer[dense].view(self._storage_shape),
+            k_cache=k_cache,
+            v_cache=v_cache,
             indices=out_loc,
             k=k,
             v=v,
@@ -205,7 +245,7 @@ class MHAKVCache(BaseKVCachePool):
 
     @property
     def dtype(self) -> torch.dtype:
-        return self._kv_buffer.dtype
+        return self._dtype
 
     @property
     def num_layers(self) -> int:

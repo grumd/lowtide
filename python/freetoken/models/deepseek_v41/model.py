@@ -1,426 +1,298 @@
-"""DeepSeek-V4.1-Flash model (Phase 3 — DSV4-style driver, the DSV4.1 plan).
+"""DeepSeek-V4.1-Flash model (engine-native port of ``inference/model.py``).
 
-mHC delayed-pre residual streams (Phase-1 math, checkpoint-named weights), the
-CSA2 attention driver (Phase 3a: window + shared compressed caches, static
-candidate selection) and the offloaded-MXFP4 MoE, wired onto the DSV4 paged
-engine exactly like DeepSeek-V4-Flash's model: ragged batched prefill with
-per-request compressor carry, decode with the layer-invariant window context
-and device-bounded candidate counts, CUDA-graph-safe.
+    embed -> hc_mult residual streams -> [Engram at 1, 14] -> 40 blocks (single-pass mHC around
+    DSV41 attention and MoE) -> collapse with the last block's pre gates -> norm -> head
+
+Single-pass mHC (``layers/mhc.py``): each sublayer boundary applies the PREVIOUS sublayer's post /
+comb to the streams, predicts this sublayer's (pre, post, comb) from the updated streams, and mixes
+the sublayer input with the pre gates the previous sublayer predicted. The chain state
+``(y, residual, post, comb, pre)`` threads through the layer loop; layer 0's attention starts it
+with a one-hot pre on stream 0 and no pending post.
+
+Causal Encoder-Decoder: the decoder's kv source (layer 20) compresses ITS INPUT -- the final encoder
+hidden state -- into the global KV every decoder layer reads. Under Decoder SWA Bounded Replay the
+decoder layers run on each request's last ``window_size`` prompt tokens only (their sliding window
+truncated at the start of that window, see the backend; a prefix hit stops before it, so those tokens
+are always prefilled); layer 20 still publishes global KV for every prompt token.
+``--swa-decoder-replay exact`` runs the decoder on every token (the reference numerics).
+
+KV addressing is the attention backend's; pool buffers are read off the live pool per access, so a
+runtime cache rebuild needs no unbind. Decode is batched and CUDA-graph safe (the DSV4 precedent).
 """
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, List, NamedTuple
+
 import torch
-
+from freetoken.attention.dsv41_sparse import DSV41AttnMetadata, PrefillSegment
 from freetoken.core import get_global_ctx
-from freetoken.models.deepseek_v4.ops import get_freqs_cis
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, RMSNorm, VocabParallelEmbedding
-from freetoken.models.blocks import BaseLLMModel
-
-from contextlib import contextmanager
+from freetoken.layers.mhc import mhc_fused_post_pre_single_pass, mhc_mix_input, mhc_post
+from freetoken.models.blocks import BaseLLMModel, embed_input_ids
 
 from .args import DeepseekV41Args
-from .attention import Attention
-from .dspark import DSparkDraft
-from .engram import Engram
-from .hc import hc_add, hc_collapse, hc_mixes, hc_split
+from .attention import DSV41Attention, DecodeStepContext
+from .engram import EngramLayer
 from .moe import MoE
 
+if TYPE_CHECKING:
+    from freetoken.models.config import ModelConfig
 
-def _decode_ngram_ids(hist: list, t: int, p: int) -> list[int]:
-    """The decode 4-gram in the reference's NEWEST-first hash order.
-
-    ``t`` is the pending token at position ``p-1`` (``hist[p-1]``); the lookback is
-    ``[p-2, p-3, p-4]``. Missing positions past the sequence start use the engram pad
-    RAW id 2 (matches the prefill ``Engram.forward``'s ``blocked``/pad slots; see
-    ``inference/engram.py:171``).
-    """
-    return [
-        int(t),
-        int(hist[p - 2]) if p >= 2 else 2,
-        int(hist[p - 3]) if p >= 3 else 2,
-        int(hist[p - 4]) if p >= 4 else 2,
-    ]
+POST_MULT = 2.0  # post gates are 2 * sigmoid (reference hc_split_sinkhorn)
 
 
-class _DSparkAuxCapture:
-    """Accumulates the target aux hidden the DSpark draft fuses via ``main_proj``.
+class Streams(NamedTuple):
+    """The single-pass mHC chain state between sublayers: the last sublayer output ``y`` with its
+    not-yet-applied ``post`` / ``comb``, the residual streams ``[T, hc, dim]`` they apply to, and
+    the ``pre`` gates ``[T, hc]`` the next sublayer mixes its input with."""
 
-    Reference (vLLM ``DeepseekV4Model.forward``): after target layer ``L`` the
-    post-block HC stream is collapsed by mean over its copies; the per-layer
-    ``[T, hidden]`` results are concatenated in ``dspark_target_layer_ids`` order ->
-    ``[T, hidden * len(ids)]``. For v4.1 the ids are the attention INPUTS of layers
-    ``L``, i.e. captured after layer ``L-1`` (see PR #56214)."""
+    y: torch.Tensor | None
+    residual: torch.Tensor
+    post: torch.Tensor | None
+    comb: torch.Tensor | None
+    pre: torch.Tensor
 
-    def __init__(self, target_layer_ids):
-        self.target_layer_ids = tuple(int(i) for i in target_layer_ids)
-        self._parts: list[tuple[int, torch.Tensor]] = []
-
-    def reset(self) -> None:
-        self._parts = []
-
-    def note(self, layer_id: int, streams: torch.Tensor) -> None:
-        """Capture layer ``layer_id``'s post-block HC stream if it feeds a target layer."""
-        target = layer_id + 1
-        if target in self.target_layer_ids:
-            self._parts.append((target, streams.mean(dim=1)))
-
-    def concat(self) -> torch.Tensor | None:
-        if not self._parts:
-            return None
-        by_id = dict(self._parts)
-        return torch.cat([by_id[t] for t in self.target_layer_ids], dim=-1)
+    def materialize(self) -> torch.Tensor:
+        """The streams with the pending post applied."""
+        if self.post is None:
+            return self.residual
+        return mhc_post(self.y, self.residual, self.post, self.comb)
 
 
 class Block(BaseOP):
-    """Decoder block: delayed-pre mHC around the attention and MoE sublayers."""
-
-    def __init__(
-        self,
-        layer_id: int,
-        args: DeepseekV41Args,
-        model_config,
-        *,
-        strategy: str = "offload",
-        decode_target: str = "gpu",
-        quant_config=None,
-        prefix: str = "",
-    ):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
+        args: DeepseekV41Args = config.dsv41_args
         self.layer_id = layer_id
+        self.role = args.roles[layer_id]
         self.norm_eps = args.norm_eps
-        self.dim = args.hidden_size
-        self.attn = Attention(model_config, layer_id, args, quant_config=quant_config, prefix=f"{prefix}.attn")
-        self.ffn = MoE(
-            layer_id,
-            args,
-            strategy=strategy,
-            decode_target=decode_target,
-            quant_config=quant_config,
-            prefix=f"{prefix}.ffn",
-        )
-        self.attn_norm = RMSNorm(args.hidden_size, self.norm_eps)
-        self.ffn_norm = RMSNorm(args.hidden_size, self.norm_eps)
-        # Engram conditional memory on layers [1, 14]: additive write into the raw
-        # hc stream at the top of the block (reference model.py:1261-1267)
-        if layer_id in args.engram_layer_ids:
-            self.engram: Engram | None = Engram(model_config, layer_id, args, quant_config=quant_config, prefix=f"{prefix}.engram")
-        else:
-            self.engram = None
-        hc_mult = args.hc_mult
-        self.hc_mult = hc_mult
-        self.hc_sinkhorn_iters = args.hc_sinkhorn_iters
         self.hc_eps = args.hc_eps
-        mix_hc = (2 + hc_mult) * hc_mult
-        hc_dim = hc_mult * args.hidden_size
-        self.hc_attn_fn = torch.empty(mix_hc, hc_dim, dtype=torch.float32)
-        self.hc_ffn_fn = torch.empty(mix_hc, hc_dim, dtype=torch.float32)
-        self.hc_attn_base = torch.empty(mix_hc, dtype=torch.float32)
-        self.hc_ffn_base = torch.empty(mix_hc, dtype=torch.float32)
+        self.sinkhorn = args.hc_sinkhorn_iters
+        hc, dim = args.hc_mult, args.dim
+        mix = (2 + hc) * hc
+        self.attn = DSV41Attention(args, self.role, quant_config=config.quant, prefix=f"{prefix}.attn")
+        self.ffn = MoE(config, layer_id, prefix=f"{prefix}.ffn")
+        self.attn_norm = RMSNorm(dim, args.norm_eps)
+        self.ffn_norm = RMSNorm(dim, args.norm_eps)
+        self.engram = EngramLayer(args, layer_id, quant_config=config.quant, prefix=f"{prefix}.engram") if layer_id in args.engram_layer_ids else None
+        self.hc_attn_fn = torch.empty(mix, hc * dim, dtype=torch.float32)
+        self.hc_ffn_fn = torch.empty(mix, hc * dim, dtype=torch.float32)
+        self.hc_attn_base = torch.empty(mix, dtype=torch.float32)
+        self.hc_ffn_base = torch.empty(mix, dtype=torch.float32)
         self.hc_attn_scale = torch.empty(3, dtype=torch.float32)
         self.hc_ffn_scale = torch.empty(3, dtype=torch.float32)
 
-    def _split(self, R: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
-        mixes = hc_mixes(R, hc_fn, self.norm_eps)
-        pre, post, comb = hc_split(
-            mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps
+    def _boundary(self, s: Streams, fn, scale, base):
+        residual, post, comb, pre_next, x = mhc_fused_post_pre_single_pass(
+            s.y if s.y is not None else s.residual[:, 0], s.residual, s.post, s.comb, s.pre, fn, scale, base,
+            self.norm_eps, self.hc_eps, POST_MULT, self.sinkhorn,
         )
-        return pre, post, comb
+        return residual, post, comb, pre_next, x
 
-    # ----- prefill (ragged batched; x streams are [M, hc, dim], M = flat tokens) -----
-    def prefill_batched(self, R, pre_mix, segments, flat_positions, shared):
+    def attn_input(self, s: Streams, *, image_mask: torch.Tensor | None = None):
+        """Apply the pending post, predict the attention gates, mix and norm the attention input.
+        Returns ``(residual, post, comb, pre_next, x)``."""
         if self.engram is not None:
-            R = self.engram.forward(R, shared["comp_ids"], shared["engram_rows"], flat_positions)
-        pre_a, post_a, comb_a = self._split(R, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
-        x = hc_collapse(R, pre_mix, R.dtype) if pre_mix is not None else R[:, 0]
-        x = self.attn_norm.forward(x)
-        x = self.attn.forward_ragged(x.unsqueeze(0), segments, flat_positions, shared)
-        R = hc_add(x, R, post_a, comb_a)
+            s = Streams(None, self.engram.forward(s.materialize(), image_mask=image_mask), None, None, s.pre)
+        residual, post, comb, pre_next, x = self._boundary(s, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        return residual, post, comb, pre_next, self.attn_norm.forward(x)
 
-        pre_f, post_f, comb_f = self._split(R, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        x = hc_collapse(R, pre_a, R.dtype)
-        x = self.ffn_norm.forward(x)
-        x = self.ffn.forward(x)
-        R = hc_add(x, R, post_f, comb_f)
-        return R, pre_f
+    def ffn_step(self, y: torch.Tensor, residual, post, comb, pre, *, image_mask: torch.Tensor | None = None) -> Streams:
+        """The FFN sublayer after the attention output ``y``: boundary, norm, MoE; returns the chain state."""
+        residual, post, comb, pre_next, x = self._boundary(Streams(y, residual, post, comb, pre), self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+        return Streams(self.ffn.forward(self.ffn_norm.forward(x), image_mask=image_mask), residual, post, comb, pre_next)
 
-    # ----- decode (x streams are [B, hc, dim], B = batch rows) -----
-    def decode_step(self, R, pre_mix, pos, rows, cmp_stage_cap, wctx, shared):
-        if self.engram is not None:
-            R = self.engram.decode_consume(R)
-        pre_a, post_a, comb_a = self._split(R, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
-        x = hc_collapse(R, pre_mix, R.dtype) if pre_mix is not None else R[:, 0]
-        x = self.attn_norm.forward(x)
-        x = self.attn.decode_step(x, pos, rows, cmp_stage_cap, wctx, shared)
-        R = hc_add(x, R, post_a, comb_a)
+    def forward_prefill(self, s: Streams, segments: List[PrefillSegment], positions: torch.Tensor, image_mask: torch.Tensor | None = None) -> Streams:
+        residual, post, comb, pre_next, x = self.attn_input(s, image_mask=image_mask)
+        if self.attn.compressor is not None:
+            self.attn.publish_prefill(x, segments)
+        y = self.attn.forward_prefill(x, segments, positions)
+        return self.ffn_step(y, residual, post, comb, pre_next, image_mask=image_mask)
 
-        pre_f, post_f, comb_f = self._split(R, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        x = hc_collapse(R, pre_a, R.dtype)
-        x = self.ffn_norm.forward(x)
-        x = self.ffn.forward(x)
-        R = hc_add(x, R, post_f, comb_f)
-        return R, pre_f
+    def forward_prefill_narrowed(
+        self, s: Streams, segments: List[PrefillSegment], rows: torch.Tensor, query_segments: List[PrefillSegment],
+        query_positions: torch.Tensor, image_mask: torch.Tensor | None = None, query_image_mask: torch.Tensor | None = None,
+    ) -> Streams | None:
+        """``forward_prefill`` with a row cut after the global KV is published: the attention input and
+        ``publish_prefill`` cover every token of ``segments``, the attention and the FFN only ``rows``
+        (tiled by ``query_segments``) -- the CED decoder's kv source under bounded replay. None when no
+        query segment is left (every chunk in the batch ends before its prompt's last window)."""
+        residual, post, comb, pre_next, x = self.attn_input(s, image_mask=image_mask)
+        if self.attn.compressor is not None:
+            self.attn.publish_prefill(x, segments)
+        if not query_segments:
+            return None
+        y = self.attn.forward_prefill(x[rows], query_segments, query_positions)
+        return self.ffn_step(y, residual[rows], post[rows], comb[rows], pre_next[rows], image_mask=query_image_mask)
+
+    def forward_decode(self, s: Streams, pos: torch.Tensor, rows: torch.Tensor, dctx, cmp_stage_cap: int) -> Streams:
+        residual, post, comb, pre_next, x = self.attn_input(s)
+        y = self.attn.forward_decode(x, pos, rows, dctx, cmp_stage_cap)
+        return self.ffn_step(y, residual, post, comb, pre_next)
 
 
 class Transformer(BaseOP):
-    def __init__(
-        self,
-        args: DeepseekV41Args,
-        model_config,
-        quant_config=None,
-        *,
-        strategy: str = "offload",
-        decode_target: str = "gpu",
-        prefix: str = "",
-    ):
+    def __init__(self, config: ModelConfig, *, prefix: str = "model"):
+        args: DeepseekV41Args = config.dsv41_args
         self.args = args
-        self.norm_eps = args.norm_eps
-        self.hc_mult = args.hc_mult
-        self.embed = VocabParallelEmbedding(args.vocab_size, args.hidden_size)
-        self.layers = OPList(
-            [
-                Block(
-                    i,
-                    args,
-                    model_config,
-                    strategy=strategy,
-                    decode_target=decode_target,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.layers.{i}",
-                )
-                for i in range(args.n_layers)
-            ]
-        )
-        self.norm = RMSNorm(args.hidden_size, self.norm_eps)
-        self.head = ParallelLMHead(args.vocab_size, args.hidden_size, quant_config=quant_config, prefix=f"{prefix}.head")
-        # DSpark draft head (opt-in via FREETOKEN_ENABLE_MTP): mounted here (not on the
-        # CausalLM) so its dense keys are ``model.mtp.{i}`` like the checkpoint ships and
-        # the FTW reader replays. embed/head are aliased to the target's in bind().
-        self.mtp: DSparkDraft | None = None
-        if args.mtp_enabled:
-            self.mtp = DSparkDraft(
-                model_config,
-                args,
-                strategy=strategy,
-                decode_target=decode_target,
-                quant_config=quant_config,
-            )
-        self.aux_capture = (
-            _DSparkAuxCapture(args.dspark_target_layer_ids) if self.mtp is not None else None
-        )
-        self._dspark_aux_hidden: torch.Tensor | None = None
-        # decode-step aux (graph-captured writes, bound with the draft): the DSpark
-        # manager appends a serially decoded position to the draft context from it
-        self._dspark_decode_aux: torch.Tensor | None = None
-        self._dspark_aux_slot: dict[int, int] = (
-            {int(t): i for i, t in enumerate(args.dspark_target_layer_ids)} if self.mtp is not None else {}
-        )
+        self.embed = VocabParallelEmbedding(num_embeddings=args.vocab_size, embedding_dim=args.dim, quant_config=config.quant, prefix=f"{prefix}.embed")
+        self.layers = OPList([Block(config, i, prefix=f"{prefix}.layers.{i}") for i in range(args.n_layers)])
+        self.norm = RMSNorm(args.dim, args.norm_eps)
 
-    def bind(self, pool, device: torch.device) -> None:
-        # two rope regimes (ratio-0 plain theta vs compressed yarn), one table each,
-        # shared by the layers of that regime; sized to the SERVED ceiling
-        # (args.max_seq_len is _adjust_dsv4_config's resolved runtime cap).
-        args = self.args
-        tables: dict[tuple, torch.Tensor] = {}
-        for layer in self.layers.op_list:
-            key = layer.attn._freqs_params
-            if key not in tables:
-                tables[key] = get_freqs_cis(*key, device)
-        for layer in self.layers.op_list:
-            layer.attn.bind_pool(pool, device, tables[layer.attn._freqs_params])
-        # Engram device pieces (vocab/cache/graph staging on the real device)
-        for layer in self.layers.op_list:
-            if layer.engram is not None:
-                layer.engram.rebind(
-                    device, pool, args.max_seq_len, pool.full_loc_map.shape[0],
-                    max_extend_tokens=args.max_seq_len,
-                )
-        # DSpark draft: alias the target's embed/head and size its window KV to the
-        # served decode batch (max_running_req + 1 dummy, set by _adjust_dsv4_config).
-        if self.mtp is not None:
-            self.mtp.bind(device, args.max_batch_size, self.embed, self.head)
-            self._dspark_decode_aux = torch.zeros(
-                args.max_batch_size, args.hidden_size * len(self._dspark_aux_slot),
-                dtype=torch.bfloat16, device=device,
-            )
+    def bind(self, device: torch.device) -> None:
+        tables: dict = {}  # one RoPE table per distinct parameter set, shared by the layers using it
+        for block in self.layers.op_list:
+            block.attn.bind(device, tables)
 
-    def prefill_batched(self, input_ids: torch.Tensor, segments, flat_positions, shared: dict, logits_all: bool = False) -> torch.Tensor:
-        hc = self.hc_mult
-        e = self.embed.forward(input_ids.view(-1))  # [T, dim]
-        R = e.unsqueeze(1).expand(-1, hc, -1).contiguous()
-        pre_mix: torch.Tensor | None = None
-        # every engram layer's disk gather starts now, so a later engram layer's read
-        # overlaps the compute of the layers before it (Engram.prefetch_rows)
-        shared["engram_rows"] = torch.cat([torch.full((n,), ti, dtype=torch.int64, device=R.device)
-                                           for _off, n, ti, _start in segments])
-        for layer in self.layers.op_list:
-            if layer.engram is not None:
-                layer.engram.prefetch_rows(shared["comp_ids"], shared["engram_rows"], flat_positions)
-        capture = self.aux_capture
-        if capture is not None:
-            capture.reset()
-        for layer in self.layers.op_list:
-            R, pre_mix = layer.prefill_batched(R, pre_mix, segments, flat_positions, shared)
-            if capture is not None:
-                capture.note(layer.layer_id, R)
-        if capture is not None:
-            self._dspark_aux_hidden = capture.concat()
-        # model exit: collapse with the LAST FFN pre mix (no learned hc_head on V4.1)
-        x = hc_collapse(R, pre_mix, R.dtype)
-        x = self.norm.forward(x)
-        # all-position logits for a speculative verify (every row, not the last per request)
-        return self.head.forward_all(x) if logits_all else self.head.forward(x)
+    def _entry(self, input_ids: torch.Tensor) -> Streams:
+        h = embed_input_ids(self.embed, input_ids, get_global_ctx().batch)
+        residual = h.unsqueeze(1).expand(-1, self.args.hc_mult, -1).contiguous()
+        pre = torch.zeros(h.shape[0], self.args.hc_mult, dtype=torch.float32, device=h.device)
+        pre[:, 0] = 1.0
+        return Streams(None, residual, None, None, pre)
 
-    def decode(self, input_ids: torch.Tensor, pos: torch.Tensor, cmp_stage_cap: int, shared: dict) -> torch.Tensor:
-        B = input_ids.size(0)
+    def _exit(self, s: Streams) -> torch.Tensor:
+        return self.norm.forward(mhc_mix_input(s.materialize(), s.pre))
+
+    def prefill(self, input_ids: torch.Tensor, positions: torch.Tensor, md: DSV41AttnMetadata) -> torch.Tensor:
+        """Ragged prefill over the flat new-token stream; returns the hidden states the head reads (the
+        decoder stream under bounded replay, where ``md.last_indices`` also point, plus the placeholder
+        row ``md.decoder_pad`` asks for)."""
+        s = self._entry(input_ids)
+        dtype = s.residual.dtype
+        image_mask = input_ids >= self.args.vocab_size if get_global_ctx().batch.mm_embeds is not None else None
+        segments, dec_segments, rows = md.segments, md.decoder_segments, md.decoder_rows
+        decoder_start = self.args.decoder_start_layer
+        if rows is not None:
+            dec_positions = positions[rows]
+            dec_image_mask = None if image_mask is None else image_mask[rows]
+        for block in self.layers.op_list:
+            if rows is None or block.layer_id < decoder_start:
+                s = block.forward_prefill(s, segments, positions, image_mask)
+            elif block.layer_id == decoder_start:
+                s = block.forward_prefill_narrowed(s, segments, rows, dec_segments, dec_positions, image_mask, dec_image_mask)
+                if s is None:
+                    break
+            else:
+                s = block.forward_prefill(s, dec_segments, dec_positions, dec_image_mask)
+        pad = [torch.zeros(1, self.args.dim, dtype=dtype, device=input_ids.device)] if md.decoder_pad else []
+        return torch.cat([self._exit(s)] + pad) if s is not None else pad[0]
+
+    def decode(self, input_ids: torch.Tensor, pos: torch.Tensor, md: DSV41AttnMetadata, cmp_stage_cap: int) -> torch.Tensor:
+        B = input_ids.shape[0]
         rows = torch.arange(B, device=input_ids.device)
-        wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
-        hc = self.hc_mult
-        e = self.embed.forward(input_ids.view(-1))  # [B, dim]
-        R = e.unsqueeze(1).expand(-1, hc, -1).contiguous()
-        pre_mix: torch.Tensor | None = None
-        aux = self._dspark_decode_aux
-        dim = R.shape[-1]
-        for layer in self.layers.op_list:
-            R, pre_mix = layer.decode_step(R, pre_mix, pos, rows, cmp_stage_cap, wctx, shared)
-            slot = self._dspark_aux_slot.get(layer.layer_id + 1) if aux is not None else None
-            if slot is not None:
-                # same capture as the prefill (_DSparkAuxCapture): input of the target layer,
-                # mean over the hc copies
-                aux[:B, slot * dim : (slot + 1) * dim].copy_(R.mean(dim=1))
-        x = hc_collapse(R, pre_mix, R.dtype)
-        x = self.norm.forward(x)
-        return self.head.forward(x)
+        s = self._entry(input_ids)
+        # the layer-invariant step context, resolved once (a capture records it once): ring slots and
+        # window candidates of the shared pool -- and of the private rings when bounded replay keeps
+        # the decoder's window KV per request -- plus each RoPE table at the step's positions
+        dctx = DecodeStepContext.build([b.attn for b in self.layers.op_list], md, pos, rows, self.args.window_size, self.args.index_topk)
+        for block in self.layers.op_list:
+            s = block.forward_decode(s, pos, rows, dctx, cmp_stage_cap)
+        return self._exit(s)
 
 
 class DeepseekV41ForCausalLM(BaseLLMModel):
-    """Engine adapter: a registered :class:`BaseLLMModel` wrapping the V4.1
-    transformer. KV pools, rope tables and compressor carries bind on the first
-    forward (the DSV4 driver contract)."""
-
-    def __init__(self, config):
+    def __init__(self, config: ModelConfig):
         self._config = config
-        args: DeepseekV41Args = config.dsv4_args
-        self._args = args
-        self.model = Transformer(
-            args,
-            config,
-            quant_config=config.quant,
-            strategy=config.moe_strategy,
-            decode_target=config.decode_target,
-            prefix="model",
-        )
+        self._args: DeepseekV41Args = config.dsv41_args
+        self.model = Transformer(config)
+        self.head = ParallelLMHead(num_embeddings=self._args.vocab_size, embedding_dim=self._args.dim, quant_config=config.quant, prefix="head")
         self._bound = False
+        if config.is_multimodal:
+            from .vision import DeepseekV41Vision
 
-    def _comp_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Compressed engram ids for this step's tokens (bound after bind)."""
-        layer = next(lay for lay in self.model.layers.op_list if lay.engram is not None)
-        return layer.engram._vocab[input_ids.view(-1).long()]
+            self.visual = DeepseekV41Vision(config.vision_config, config.hidden_size,
+                                           num_layers=self._args.n_layers, num_experts=self._args.n_routed_experts)
 
-    def dspark_draft(self):
-        """The DSpark draft module, or None when MTP is off (engine hook)."""
-        return self.model.mtp
+    def encode(self, item):
+        return self.visual.forward(item)
 
-    def dspark_compressors(self) -> list:
-        """The kv-source V41Compressors carrying per-layer state (rollback hook)."""
-        return [b.attn.compressor for b in self.model.layers.op_list if b.attn.compressor is not None]
-
-    def get_dspark_decode_aux(self) -> torch.Tensor | None:
-        """Target aux hidden of the last DECODE step, one row per batch row ``[max_bs,
-        hidden * len(dspark_target_layer_ids)]``; None when MTP is off."""
-        return self.model._dspark_decode_aux
-
-    def get_dspark_aux_hidden(self) -> torch.Tensor | None:
-        """Target aux hidden of the last prefill/verify forward: ``[T, hidden * len(
-        dspark_target_layer_ids)]`` — the DSpark ``main_proj`` input. None when MTP is
-        off or no prefill has run yet."""
-        return self.model._dspark_aux_hidden
-
-    def load_host_tables(self, config) -> int:
-        """Engram disk tables: the compressed vocab, hash layout and the per-layer
-        O_DIRECT row sources + pinned decode staging. The ~189 GiB tables stay in
-        the raw checkpoint's shards (O_DIRECT pread) — no VRAM, no pin budget."""
-        engram_layers = [lay for lay in self.model.layers.op_list if lay.engram is not None]
-        if not engram_layers:
-            return 0
-        from .engram import EngramLayout, build_compressed_vocab
-
-        args = self._args
-        layout = EngramLayout(args)
-        doc = build_compressed_vocab(
-            args.model_path, args.vocab_size, args.engram_compressed_vocab_size,
-            args.engram_pad_token_id,
-        )
-        comp_cpu = doc["compressed_ids"]
-        max_bs = max(16, config.cuda_graph_max_bs or 0)
-        cache_rows = 64  # sized properly at bind (pool exists then); placeholder here
-        for layer in engram_layers:
-            layer.engram.bind(
-                torch.device("cpu"), layout, torch.zeros(args.vocab_size, dtype=torch.int64),
-                args.max_seq_len, cache_rows, max_extend_tokens=args.max_seq_len,
-                comp_cpu=comp_cpu, max_graph_bs=max_bs,
-            )
-        self._engram_bound = False
-        return 0
-
-    @contextmanager
-    def forward_host_ctx(self, batch, use_graph: bool):
-        """Engine hook around every dispatch: the decode path's engram rows are
-        pre-read on the HOST thread (os.pread is illegal inside a captured graph)."""
-        if batch.is_decode:
-            reqs = list(batch.reqs)
-            ids_rows = []
-            for r, t in zip(reqs, batch.input_ids.view(-1).tolist()):
-                p = r.device_len  # the sampled token's position (t = hist[p-1])
-                hist = r.input_ids.tolist()
-                ids_rows.append(_decode_ngram_ids(hist, t, p))
-            for layer in self.model.layers.op_list:
-                if layer.engram is not None:
-                    layer.engram.host_fill_decode(ids_rows)
-        yield
+    def place_encoder_weights(self, mode: str) -> None:
+        self.visual.place_weights(mode)
 
     def _ensure_bound(self) -> None:
-        if self._bound:
-            return
-        pool = get_global_ctx().kv_cache
-        self.model.bind(pool, pool.device)
-        self._bound = True
+        if not self._bound:
+            self.model.bind(get_global_ctx().kv_cache.device)
+            if self._config.is_multimodal:
+                for i, block in enumerate(self.model.layers.op_list):
+                    block.ffn.gate._bias_vl = self.visual.routing_bias[i]
+            self._bound = True
 
     def mark_for_rebind(self) -> None:
-        """Force a re-bind on the next forward (runtime pool rebuild swaps the
-        pool object; the model holds no buffers — everything reads via ctx)."""
+        """A runtime pool rebuild changes nothing the model caches (rope tables are pool-independent),
+        but the engine asks; re-bind is cheap and keeps the contract with the DSV4 sibling."""
         self._bound = False
+
+    def engram_layers(self) -> List[EngramLayer]:
+        return [b.engram for b in self.model.layers.op_list if b.engram is not None]
+
+    def load_host_tables(self, engine_config) -> int:
+        """Attach the Engram tables (streamed from the checkpoint shards or the GGUF; zeros for dummy weights)
+        and take over ``forward_host_ctx`` so every dispatch stages its rows. Returns the pinned
+        host bytes the engine reserves from its pin budget."""
+        import os
+
+        layers = self.engram_layers()
+        if not layers:
+            return 0
+        device = torch.device("cuda", torch.cuda.current_device())
+        if getattr(engine_config, "use_dummy_weight", False):
+            from .engram import ZeroEngramTable
+
+            for layer in layers:
+                layer.attach_table(ZeroEngramTable(layer.width, device))
+            return 0
+        from freetoken.models.gguf.reader import gguf_config_source
+
+        from .engram_table import EngramDiskTable, EngramHost, engram_row_source
+
+        if (gguf_src := gguf_config_source(engine_config.model_path)) is not None:
+            from .gguf import gguf_engram_tables
+
+            hash, sources = gguf_engram_tables(gguf_src, self._args)
+        else:
+            from freetoken.utils import download_hf_weight
+            from transformers import AutoTokenizer
+
+            from .engram import EngramHash, build_compressed_token_map
+
+            folder = download_hf_weight(engine_config.model_path)
+            token_map, compressed_vocab = build_compressed_token_map(AutoTokenizer.from_pretrained(folder, trust_remote_code=True))
+            hash = EngramHash(self._args, token_map, compressed_vocab)
+            sources = [engram_row_source(folder, layer.layer_id) for layer in layers]
+        graph_rows = max(engine_config.max_running_req, engine_config.cuda_graph_max_bs or 0, 1)
+        tables = [
+            EngramDiskTable(
+                source, hash.n_cols, device,
+                max_graph_rows=graph_rows,
+                max_extend_tokens=engine_config.max_extend_tokens,
+                use_io_uring=os.getenv("FREETOKEN_ENGRAM_IO_URING", "1") != "0",
+            )
+            for source in sources
+        ]
+        for layer, table in zip(layers, tables):
+            layer.attach_table(table)
+        self._engram_host = EngramHost(hash, tables, device, sync_mode=os.getenv("FREETOKEN_ENGRAM_SYNC", "auto"))
+        self.forward_host_ctx = self._engram_host.forward_host_ctx
+        return sum(t._graph_pinned.numel() + sum(b.numel() for b in t._eager_pinned) for t in tables)
 
     def forward(self) -> torch.Tensor:
         self._ensure_bound()
         batch = get_global_ctx().batch
-        input_ids = batch.input_ids.long()
         md = batch.attn_metadata
+        assert isinstance(md, DSV41AttnMetadata)
         if batch.is_prefill:
-            shared = {"comp_ids": self._comp_ids(input_ids)}
-            return self.model.prefill_batched(
-                input_ids.view(1, -1), md.segments, batch.positions.long(), shared
-            )
-        B = batch.padded_size
-        pos = batch.positions.long().view(-1)[:B]
-        if torch.cuda.is_current_stream_capturing():
-            cmp_stage_cap = md.stage_width - 1
+            hidden = self.model.prefill(batch.input_ids, batch.positions.long(), md)
         else:
-            cmp_stage_cap = int(pos.max().item())
-        shared = {"comp_ids": self._comp_ids(input_ids)}
-        return self.model.decode(input_ids.view(B, 1), pos, cmp_stage_cap, shared)
-
-    def forward_logits_all(self) -> torch.Tensor:
-        """Like ``forward`` but WITHOUT the per-request last-row selection: full
-        ``[T, vocab]`` logits for every forwarded position (DSpark verify path)."""
-        self._ensure_bound()
-        batch = get_global_ctx().batch
-        assert batch.is_prefill, "forward_logits_all expects a prefill-phase verify batch"
-        input_ids = batch.input_ids.long()
-        md = batch.attn_metadata
-        shared = {"comp_ids": self._comp_ids(input_ids)}
-        return self.model.prefill_batched(
-            input_ids.view(1, -1), md.segments, batch.positions.long(), shared, logits_all=True
-        )
+            input_ids = batch.input_ids
+            B = batch.padded_size
+            pos = batch.positions.long().view(-1)[:B]
+            if torch.cuda.is_current_stream_capturing():
+                cmp_stage_cap = md.stage_width - 1
+            else:
+                cmp_stage_cap = int(pos.max().item())
+            hidden = self.model.decode(input_ids.view(B), pos, md, cmp_stage_cap)
+        return self.head.forward(hidden)
 
 
-__all__ = ["Block", "DeepseekV41ForCausalLM", "Transformer"]
+__all__ = ["DeepseekV41ForCausalLM", "Transformer", "Block", "Streams"]

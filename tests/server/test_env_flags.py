@@ -66,7 +66,6 @@ def test_omitted_flags_leave_the_env_untouched():
     ("argv", "env", "want"),
     [
         (["--mtp-draft-tokens", "5"], "FREETOKEN_MTP_DRAFT_TOKENS", "5"),
-        (["--dspark-k", "4"], "FREETOKEN_DSPARK_K", "4"),
         (["--mamba-ssm-dtype", "bfloat16"], "FREETOKEN_MAMBA_SSM_DTYPE", "bfloat16"),
         (["--pin-budget-gb", "24.5"], "FREETOKEN_PIN_BUDGET_GB", "24.5"),
         (["--load-vision"], "FREETOKEN_LOAD_VISION", "1"),
@@ -91,10 +90,6 @@ def test_omitted_flags_leave_the_env_untouched():
         (["--no-bank-cuda-alloc"], "FREETOKEN_BANK_CUDA_ALLOC", "0"),
         (["--skip-bank-pin"], "FREETOKEN_SKIP_BANK_PIN", "1"),
         (["--cpu-moe-isa", "avx512"], "FREETOKEN_CPU_MOE_ISA", "avx512"),
-        (["--dspark-debug"], "FREETOKEN_DSPARK_DEBUG", "1"),
-        (["--dspark-diff"], "FREETOKEN_DSPARK_DIFF", "1"),
-        (["--dspark-timing"], "FREETOKEN_DSPARK_TIMING", "1"),
-        (["--dspark-force-a0"], "FREETOKEN_DSPARK_FORCE_A0", "1"),
         (["--api-log-dir", "/tmp/reqlog"], "FREETOKEN_API_LOG_DIR", "/tmp/reqlog"),
         (["--no-m3-sparse"], "FREETOKEN_M3_SPARSE", "0"),
         (["--m3-inner-backend", "flashinfer"], "FREETOKEN_M3_INNER_BACKEND", "flashinfer"),

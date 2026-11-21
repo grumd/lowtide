@@ -38,7 +38,7 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     p.add_argument("--dtype", choices=sorted(_DTYPES), default="bfloat16",
                    help="dtype the dense weights are stored in inside the FTW (default bfloat16)")
     p.add_argument("--moe-backend", default="offload",
-                   help="offload (experts -> banks) or e.g. triton (experts stay dense)")
+                   help="kept for compatibility: MoE experts always go to banks, which every strategy reads")
     p.add_argument("--quant-backend", type=_parse_quant_backend, default=None,
                    help="kernel per quantized layer type, as for ft serve; the expert banks are packed for the "
                         "chosen MoE kernel and the server picks that kernel back up from the FTW")
@@ -56,9 +56,6 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
                         "engram/ in the FTW dir, hardlinked from the source shards on the same filesystem "
                         "(no extra disk) and copied otherwise (~118 GiB). Without it the tables are read "
                         "in place from the source shards at serve time")
-    p.add_argument("--include-dspark", action="store_true",
-                   help="also export the DSpark MTP draft head (mtp.* weights + draft expert banks) "
-                        "into the FTW; otherwise the draft head is skipped at conversion")
     p.add_argument("--ple", choices=["auto", "fp8", "bf16", "none"], default="bf16",
                    help="stored dtype of the PLE n-gram table side tables (qwen4_exp): 'bf16' "
                         "(default) keeps the table unquantized, 'fp8' quantizes it (half the disk/RAM), "
@@ -92,7 +89,7 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     index = convert_checkpoint(
         ns.model, ns.out, dtype=_DTYPES[ns.dtype],
         moe_backend=ns.moe_backend, quant_backend=ns.quant_backend, shard_limit=shard_limit, device=device,
-        include_engram=ns.include_engram, include_dspark=ns.include_dspark,
+        include_engram=ns.include_engram,
         mtp_mode=ns.mtp, mtp_header=ns.mtp_header, ple_mode=ns.ple,
         vision_mode=ns.vision, expert_quant=ns.expert_quant,
     )

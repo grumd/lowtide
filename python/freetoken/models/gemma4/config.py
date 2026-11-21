@@ -9,7 +9,6 @@ from freetoken.models.config import (
     RotaryConfig,
     SWAAttentionGroupConfig,
     detect_expert_quant,
-    vision_load_enabled,
 )
 
 
@@ -29,8 +28,71 @@ class VisionConfig:
     hidden_act: str
     standardize: bool
     use_clipped_linears: bool
-    soft_tokens_per_image: int
     text_hidden_size: int
+
+
+@dataclass(frozen=True)
+class UnifiedVisionConfig:
+    """The gemma4_unified release's encoder-free vision path: one super-patch becomes one soft token."""
+
+    hidden_size: int
+    patch_dim: int
+    posemb_size: int
+    layer_norm_eps: float
+    rms_norm_eps: float
+    text_hidden_size: int
+
+
+@dataclass(frozen=True)
+class Gemma4EArgs:
+    """What the E2B / E4B releases add to the decoder."""
+
+    # width of one layer's per-layer input; the table holds num_layers of them per token
+    per_layer_hidden_size: int
+    per_layer_vocab_size: int
+    # layers from here on project q only and reuse k, v of the last earlier layer of their attention type
+    first_kv_shared_layer: int
+    # their dense MLP's width: E2B doubles it, E4B keeps intermediate_size
+    kv_shared_intermediate_size: int
+
+    def is_kv_shared(self, layer_id: int) -> bool:
+        return layer_id >= self.first_kv_shared_layer
+
+    def kv_shared_layers(self, *groups_layer_ids: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
+        """``ModelConfig.kv_shared_layers``: each shared layer paired with the last earlier layer of its group."""
+        pairs = []
+        for layer_ids in groups_layer_ids:
+            shared = [i for i in layer_ids if self.is_kv_shared(i)]
+            if not shared:
+                continue
+            source = max((i for i in layer_ids if i < self.first_kv_shared_layer), default=None)
+            if source is None:
+                raise NotImplementedError(
+                    "gemma4 KV-shared layers with no earlier layer of their attention type are not supported"
+                )
+            pairs += [(i, source) for i in shared]
+        return tuple(sorted(pairs))
+
+
+def gemma4_e_args(
+    num_layers: int,
+    per_layer_hidden_size: int,
+    per_layer_vocab_size: int,
+    num_kv_shared_layers: int,
+    num_experts: int,
+    kv_shared_intermediate_size: int,
+) -> Gemma4EArgs | None:
+    """None for the releases without per-layer inputs: their configs set the width to 0."""
+    if not per_layer_hidden_size:
+        if num_kv_shared_layers:
+            raise NotImplementedError("gemma4 with KV-shared layers but no per-layer inputs is not supported")
+        return None
+    if num_experts:
+        # the per-layer input step sits between the dense MLP's residual and layer_scalar, which the MoE block fuses
+        raise NotImplementedError("gemma4 with per-layer inputs and routed experts is not supported")
+    return Gemma4EArgs(
+        per_layer_hidden_size, per_layer_vocab_size, num_layers - num_kv_shared_layers, kv_shared_intermediate_size
+    )
 
 
 def _text_config(hf_config: Any) -> tuple[Any, list[str] | None, Any]:
@@ -40,19 +102,22 @@ def _text_config(hf_config: Any) -> tuple[Any, list[str] | None, Any]:
     return hf_config, top_architectures, hf_config
 
 
-def _parse_vision_config(top_cfg: Any, text_hidden_size: int) -> VisionConfig | None:
+def _parse_vision_config(top_cfg: Any, text_hidden_size: int) -> VisionConfig | UnifiedVisionConfig | None:
     vc = getattr(top_cfg, "vision_config", None)
     if vc is None:
         return None
-    # Vision is opt-in (default OFF). The vision tower + multimodal embedder are ~1 GiB of
-    # resident, never-quantized (bf16) GPU weights that text-only serving never touches:
-    # forward() ignores them and _merge_multimodal is a no-op without image embeds. Default
-    # to text-only so that VRAM goes to KV / the expert cache; set FREETOKEN_LOAD_VISION=1
-    # to load it. Returning None here is the single switch -- both the model build (model.py)
-    # and weight loading (weight.py `include_vision = config.is_multimodal`) flow through
-    # parse_config, so is_multimodal flips off consistently across both.
-    if not vision_load_enabled():
-        return None
+    if getattr(vc, "num_attention_heads", None) is None:
+        # the gemma4_unified release's section describes a linear embedder without attention; any other tower-less section is not served
+        if getattr(vc, "model_patch_size", None) is None:
+            return None
+        return UnifiedVisionConfig(
+            hidden_size=vc.mm_embed_dim,
+            patch_dim=3 * vc.model_patch_size**2,
+            posemb_size=vc.mm_posemb_size,
+            layer_norm_eps=1e-5,  # the reference builds torch LayerNorms with the default eps
+            rms_norm_eps=vc.rms_norm_eps,
+            text_hidden_size=text_hidden_size,
+        )
     rope_params = getattr(vc, "rope_parameters", None) or {}
     act = getattr(vc, "hidden_activation", "gelu_pytorch_tanh")
     act = "gelu_tanh" if "tanh" in act else act
@@ -72,10 +137,6 @@ def _parse_vision_config(top_cfg: Any, text_hidden_size: int) -> VisionConfig | 
         hidden_act=act,
         standardize=bool(getattr(vc, "standardize", True)),
         use_clipped_linears=bool(getattr(vc, "use_clipped_linears", False)),
-        soft_tokens_per_image=int(
-            getattr(top_cfg, "vision_soft_tokens_per_image", None)
-            or getattr(vc, "default_output_length", 280)
-        ),
         text_hidden_size=text_hidden_size,
     )
 
@@ -152,6 +213,15 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # checkpoint's own ignore-list.
     expert_quant = detect_expert_quant(top_cfg)
     dense_quant = "nvfp4" if (expert_quant == "nvfp4" and not num_experts > 0) else "none"
+    # Gemma4UnifiedTextConfig omits the E-series fields
+    e_args = gemma4_e_args(
+        cfg.num_hidden_layers,
+        getattr(cfg, "hidden_size_per_layer_input", None) or 0,
+        getattr(cfg, "vocab_size_per_layer_input", None) or 0,
+        getattr(cfg, "num_kv_shared_layers", None) or 0,
+        num_experts,
+        cfg.intermediate_size * (2 if getattr(cfg, "use_double_wide_mlp", False) else 1),
+    )
 
     return ModelConfig(
         num_layers=cfg.num_hidden_layers,
@@ -180,6 +250,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         embedding_scale=float(cfg.hidden_size) ** 0.5,
         vision_config=_parse_vision_config(top_cfg, cfg.hidden_size),
         image_token_id=getattr(top_cfg, "image_token_id", None),
+        gemma4_e_args=e_args,
+        kv_shared_layers=e_args.kv_shared_layers(full_layer_ids, sliding_layer_ids) if e_args is not None else (),
         attention_groups=(
             FullAttentionGroupConfig(
                 name="full",
@@ -196,9 +268,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
                 head_dim=sliding_head_dim,
                 rotary_config=swa_rotary_config,
                 sliding_window=cfg.sliding_window,
+                bidirectional_mm_blocks=getattr(cfg, "use_bidirectional_attention", None) == "vision",
             ),
         ),
     )
 
 
-__all__ = ["VisionConfig", "parse_config"]
+__all__ = ["Gemma4EArgs", "UnifiedVisionConfig", "VisionConfig", "gemma4_e_args", "parse_config"]

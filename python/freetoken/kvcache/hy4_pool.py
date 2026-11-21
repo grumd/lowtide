@@ -31,7 +31,7 @@ import torch
 from freetoken.utils import align_ceil, init_logger
 
 from .dsa_pool import KpoolDSAKVCache
-from .dsv4_paged_pool import FreeListAllocator
+from .dsv4.window_tier import FreeListAllocator
 
 logger = init_logger(__name__)
 

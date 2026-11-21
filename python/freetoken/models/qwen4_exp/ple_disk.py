@@ -1,4 +1,4 @@
-"""Disk-backed PLE table (--ple-backend disk): the C++ store hashes n-gram windows and batch-reads rows from the checkpoint's fp8 shard tensors into pinned staging; the captured ``lookup`` is a fixed-shape H2D copy + dequant.
+"""Disk-backed PLE table (--ple-backend disk): the C++ store hashes n-gram windows and batch-reads rows from the checkpoint's fp8, bf16 or NVFP4-row shard tensors (or a GGUF table) into pinned staging; the captured ``lookup`` is a fixed-shape H2D copy + dequant.
 
 Hash windows are pure functions of ``req.input_ids`` + ``device_len`` (prefix hits, restores and COW forks need no bookkeeping); the decode input token lives device-side under overlap scheduling and is read back here.
 """
@@ -13,6 +13,8 @@ from typing import Callable, Sequence
 
 import safetensors
 import torch
+
+from freetoken.mm import MM_PAD_SHIFT_VALUE, restore_placeholder
 
 from freetoken.core import Batch
 from freetoken.kernel.pinned import alloc_pinned_tensor
@@ -61,6 +63,9 @@ class PleRowSource:
     elem_bytes: int
     # rows each extent holds when rows_per_extent is only the row-id stride (unequal tables)
     extent_rows: list[int] | None = None
+    # packed ggml rows (a GGUF table, src_dtype "GGML") of ``row_values`` values each
+    ggml_type: int | None = None
+    row_values: int | None = None
 
     @property
     def total_rows(self) -> int:
@@ -68,6 +73,8 @@ class PleRowSource:
 
     @property
     def head_dim(self) -> int:
+        if self.row_values is not None:
+            return self.row_values
         # an NVFP4 row of D values is D/2 code bytes + D/16 scale bytes
         return self.row_bytes * 16 // 9 if self.src_dtype == "NVFP4_ROWS" else self.row_bytes // self.elem_bytes
 
@@ -143,11 +150,28 @@ def source_from_safetensors(folder: str) -> PleRowSource:
     )
 
 
-def resolve_row_source(folder: str) -> PleRowSource:
+def source_from_gguf(model_path: str) -> PleRowSource:
+    """The GGUF ``per_layer_token_embd`` table in place: one extent of packed ggml rows."""
+    from freetoken.layers.quantization.ggml_types import row_bytes
+
+    from .gguf import ple_table_info
+
+    info = ple_table_info(model_path)
+    values, rows = info.ne
+    nbytes = row_bytes(info.ggml_type, values)
+    return PleRowSource([info.path], [0], [info.offset], rows, nbytes, nbytes, 1.0, "GGML", 0,
+                        ggml_type=info.ggml_type, row_values=values)
+
+
+def resolve_row_source(model_path: str) -> PleRowSource:
     """Pick the row source for a checkpoint; the seam where a repacked format would plug in.
 
     ``ple_source_folder`` lets an FTW without PLE side tables fall back to its source."""
-    return source_from_safetensors(ple_source_folder(folder))
+    from freetoken.models.gguf.reader import gguf_config_source
+
+    if (gguf_src := gguf_config_source(model_path)) is not None:
+        return source_from_gguf(gguf_src)
+    return source_from_safetensors(ple_source_folder(model_path))
 
 
 class DiskRowTable:
@@ -159,19 +183,22 @@ class DiskRowTable:
         hash_constants: dict,
         *,
         max_graph_rows: int = 256,
-        max_extend_tokens: int = 8192,
+        max_eager_tokens: int = 8192,
         dtype: torch.dtype = torch.bfloat16,
         page_cache: bool = False,
     ) -> None:
-        from freetoken.kernel import _ple_store
+        from freetoken.kernel.row_store import PleStore, alloc_sync_flag
 
         self.num_rows = source.total_rows
         self.head_dim = source.head_dim  # elements, not bytes
         self._src_dtype = source.src_dtype
+        self._ggml_type = source.ggml_type
+        self._row_bytes = source.row_bytes
         self.dtype = dtype
         self.heads = int(hash_constants["num_ngram_heads"])
         self.scale = source.scale
         self.eos_token_id = int(hash_constants["eos_token_id"])
+        self.image_token_id = hash_constants.get("image_token_id")
         sizes = [int(x) for x in hash_constants["per_head_vocab_sizes"]]
         offsets = [int(x) for x in hash_constants["per_head_offsets"]]
         need = max(o + s for o, s in zip(offsets, sizes))
@@ -179,7 +206,7 @@ class DiskRowTable:
             raise ValueError(
                 f"PLE row source holds {source.total_rows} rows but the hash addresses {need}; incomplete checkpoint?"
             )
-        self._store = _ple_store.PleStore(
+        self._store = PleStore(
             paths=list(source.paths),
             extent_file=list(source.extent_file),
             extent_base=list(source.extent_base),
@@ -206,15 +233,22 @@ class DiskRowTable:
         self._graph_dev = torch.empty(
             max_graph_rows * self._token_bytes, dtype=torch.uint8, device=self._device
         )
-        eager_bytes = max_extend_tokens * self._token_bytes
+        # completes once the last graph launch that read ``_graph_pinned`` has run (recorded by the
+        # dispatch context after the step's fill: a record inside the capture would not be observable)
+        self._graph_consumed = torch.cuda.Event()
+        eager_bytes = max_eager_tokens * self._token_bytes
         self._eager_pinned = alloc_pinned_tensor(eager_bytes, dtype=torch.uint8)
         self._eager_pinned.zero_()  # the warmup prefill stages nothing and reads whatever sits here
         self._eager_dev = torch.empty(eager_bytes, dtype=torch.uint8, device=self._device)
+        # the overlap scheduler stages batch k+1 while batch k's lookup copy may still be queued:
+        # a pinned eager buffer is rewritten only once the H2D copy that last read it has run.
+        # lookup stores a FRESH event per copy and the fence is taken on the engine thread at
+        # submit: a worker must never wait on an event re-recorded behind its own seq WAIT.
+        self._buf_read: dict[int, torch.cuda.Event] = {}
         # probe picks flag-sync (graph WAITs at the consume, host fills then signals) or launch-gating
         self._wait_sync = self._probe_wait_sync(os.getenv(_SYNC_ENV, "auto"))
         # one flag for all graphs: the readback event orders a fill after the previous graph, so signals never overlap
-        self._flag = alloc_pinned_tensor(1, dtype=torch.int64)
-        self._flag.zero_()
+        self._flag = alloc_sync_flag()
         self._token_readback = alloc_pinned_tensor(max_graph_rows, dtype=torch.int32)
         self._readback_event = torch.cuda.Event()
         # Prefill rows are read on a worker thread (I/O releases the GIL): the forward launches at
@@ -223,7 +257,7 @@ class DiskRowTable:
         self._async = self._wait_sync
         if self._async:
             self._io = ThreadPoolExecutor(1, thread_name_prefix="ple-io")
-            self._eager_tokens = max_extend_tokens
+            self._eager_tokens = max_eager_tokens
             self._ahead_pinned = alloc_pinned_tensor(eager_bytes, dtype=torch.uint8)
             self._eager_seq = alloc_pinned_tensor(1, dtype=torch.int64)
             self._eager_seq.zero_()
@@ -238,29 +272,39 @@ class DiskRowTable:
         logger.info_rank0(f"PLE disk backend: {self._store.io_backend()}, {sync}")
 
     def _probe_wait_sync(self, mode: str) -> bool:
-        from freetoken.kernel import _ple_store
+        """Overridable (Hy4 forces launch-gating without graph upload)."""
+        from freetoken.kernel.row_store import probe_wait_sync
 
-        if mode == "gate":
-            return False
-        scratch = alloc_pinned_tensor(1, dtype=torch.int64)
-        scratch.zero_()
-        stream = torch.cuda.current_stream(self._device)
-        ok = (
-            _ple_store.memop_write(stream.cuda_stream, scratch.data_ptr(), 7) == 0
-            and _ple_store.memop_wait_geq(stream.cuda_stream, scratch.data_ptr(), 7) == 0
-        )
-        if ok:
-            stream.synchronize()
-            ok = int(scratch[0]) == 7
-        if mode == "wait" and not ok:
-            raise RuntimeError("FREETOKEN_PLE_SYNC=wait but stream memops are unavailable")
-        return ok
+        return probe_wait_sync(mode, self._device)
+
+    def _ple_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Image pad ids (shifted past MM_PAD_SHIFT_VALUE) hash as the image token."""
+        if self.image_token_id is None:
+            return input_ids
+        return restore_placeholder(input_ids, self.image_token_id)
+
+    def _ple_context(self, ids: torch.Tensor, position: int) -> list[int]:
+        if self.image_token_id is None:
+            return _context(ids, position, self.eos_token_id)
+        return [self.image_token_id if t >= MM_PAD_SHIFT_VALUE else t for t in _context(ids, position, self.eos_token_id)]
+
+    def _buf_fence(self, pinned: torch.Tensor) -> torch.cuda.Event | None:
+        """Engine thread: the event of the H2D copy that last read ``pinned`` (None: never read)."""
+        return self._buf_read.get(pinned.data_ptr())
+
+    def _buf_ready(self, evt: torch.cuda.Event | None) -> None:
+        """Block until ``evt`` (a :meth:`_buf_fence`) has completed; safe on the I/O worker."""
+        if evt is not None:
+            with torch.cuda.device(self._device):
+                evt.synchronize()
 
     # ---------------- host side (engine thread, before the forward launches) ----------------
 
-    def _stage_flush(self, runs: Sequence[torch.Tensor], pinned: torch.Tensor, seq: int) -> None:
+    def _stage_flush(self, runs: Sequence[torch.Tensor], pinned: torch.Tensor, seq: int,
+                     fence: torch.cuda.Event | None = None) -> None:
         """Worker thread: one batched read of ``runs`` into ``pinned``, then publish ``seq``."""
         try:
+            self._buf_ready(fence)
             offset = 0
             for run in runs:
                 self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
@@ -296,7 +340,8 @@ class DiskRowTable:
             if cur is not None:
                 cur.result()
             self._seq += 1
-            self._cur = self._io.submit(self._stage_flush, runs, self._eager_pinned, self._seq)
+            self._cur = self._io.submit(self._stage_flush, runs, self._eager_pinned, self._seq,
+                                      self._buf_fence(self._eager_pinned))
             self._wait_seq = self._seq
         prompt = getattr(req, "prompt_ids", None)
         if prompt is not None and req.device_len < len(prompt):
@@ -304,18 +349,23 @@ class DiskRowTable:
             chunk = -(-(req.device_len - req.cached_len) // 1024) * 1024
             start = req.device_len
             end = min(len(prompt), start + min(chunk, self._eager_tokens))
-            run = torch.cat((torch.tensor(_context(prompt, start, self.eos_token_id), dtype=torch.int64),
-                             prompt[start:end].to(torch.int64)))
-            self._ahead = (req.uid, start, end, self._io.submit(self._stage_flush, [run], self._ahead_pinned, 0))
+            run = torch.cat((torch.tensor(self._ple_context(prompt, start), dtype=torch.int64),
+                             self._ple_ids(prompt[start:end]).to(torch.int64)))
+            self._ahead = (req.uid, start, end, self._io.submit(self._stage_flush, [run], self._ahead_pinned, 0,
+                                                                    self._buf_fence(self._ahead_pinned)))
 
     def fill(self, runs: Sequence[torch.Tensor], *, graph: bool) -> None:
         """Stage per-request token runs (two context ids, then the new tokens) in batch order."""
         if self._async:
             self._join()
+        if graph:
+            self._graph_consumed.synchronize()
         self._stage_runs(runs, graph)
 
     def _stage_runs(self, runs: Sequence[torch.Tensor], graph: bool) -> None:
         pinned = self._graph_pinned if graph else self._eager_pinned
+        if not graph:
+            self._buf_ready(self._buf_fence(pinned))
         offset = 0
         for run in runs:
             self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
@@ -344,9 +394,9 @@ class DiskRowTable:
                     ready.synchronize()
                 self._stage_runs(runs_fn(), graph=True)
             except BaseException:
-                from freetoken.kernel import _ple_store
+                from freetoken.kernel.row_store import signal
 
-                _ple_store.signal_flag(self._flag.data_ptr())
+                signal(self._flag)
                 raise
 
         self._cur = self._io.submit(work)
@@ -354,39 +404,41 @@ class DiskRowTable:
 
     def host_fill_batch(self, batch: Batch, use_graph: bool):
         """Stage this batch's rows; returns the post-dispatch fill callable under flag-sync, else None."""
-        eos = self.eos_token_id
-        if batch.is_decode:
+        # decode and FlashML's verify: rows_per_req tokens per request on the device, the first at device_len - rows
+        rows = getattr(batch, "rows_per_req", None) or 1
+        if batch.is_decode or rows > 1:
             reqs = list(batch.reqs)
+            histories = [self._ple_context(r.input_ids, r.device_len - rows) for r in reqs]
             if use_graph and self._wait_sync:
                 bs = batch.padded_size
-                self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
+                self._token_readback[: bs * rows].copy_(batch.input_ids, non_blocking=True)
                 self._readback_event.record(torch.cuda.current_stream(self._device))
 
                 def _complete() -> None:
                     try:
                         self._readback_event.synchronize()
-                        tokens = self._token_readback[:bs].to(torch.int64).tolist()
-                        runs = [torch.tensor([*_context(r.input_ids, r.device_len - 1, eos), t], dtype=torch.int64)
-                                for r, t in zip(reqs, tokens)]
+                        tokens = self._token_readback[: bs * rows].to(torch.int64).tolist()
+                        runs = [torch.tensor([*history, *tokens[i * rows : (i + 1) * rows]], dtype=torch.int64)
+                                for i, history in enumerate(histories)]
                         self.fill(runs, graph=True)
                     except BaseException:
-                        from freetoken.kernel import _ple_store
+                        from freetoken.kernel.row_store import signal
 
                         # unblock the stream before surfacing; the step's output is discarded
-                        _ple_store.signal_flag(self._flag.data_ptr())
+                        signal(self._flag)
                         raise
 
                 return _complete
             # launch-gating: this D2H is the step's readback and orders the fill after sampling
             tokens = batch.input_ids.to("cpu").to(torch.int64).tolist()
-            runs = [torch.tensor([*_context(r.input_ids, r.device_len - 1, eos), t], dtype=torch.int64)
-                    for r, t in zip(reqs, tokens)]
+            runs = [torch.tensor([*history, *tokens[i * rows : (i + 1) * rows]], dtype=torch.int64)
+                    for i, history in enumerate(histories)]
             self.fill(runs, graph=use_graph)
             return None
         runs = [
             torch.cat((
-                torch.tensor(_context(req.input_ids, req.cached_len, eos), dtype=torch.int64),
-                req.input_ids[req.cached_len : req.device_len].to(torch.int64),
+                torch.tensor(self._ple_context(req.input_ids, req.cached_len), dtype=torch.int64),
+                self._ple_ids(req.input_ids[req.cached_len : req.device_len]).to(torch.int64),
             ))
             for req in batch.padded_reqs
         ]
@@ -410,23 +462,24 @@ class DiskRowTable:
         # no try/finally: a failed launch leaves no WAIT pending, so the fill must not run
         if deferred is not None:
             deferred()
+        if use_graph:
+            # only after this step's fill: the next fill waits on this launch, not the fill on it
+            self._graph_consumed.record(torch.cuda.current_stream(self._device))
 
     # ---------------- device side (PLETableBackend protocol) ----------------
 
     def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         rows = row_ids.shape[0]
+        stream = torch.cuda.current_stream(self._device)
         capturing = torch.cuda.is_current_stream_capturing()
         if capturing and self._wait_sync:
-            from freetoken.kernel import _ple_store
+            from freetoken.kernel.row_store import wait_reset
 
-            _ple_store.memop_wait_reset(
-                torch.cuda.current_stream(self._device).cuda_stream, self._flag.data_ptr()
-            )
+            wait_reset(stream, self._flag)
         if not capturing and self._async and self._wait_seq:
-            from freetoken.kernel import _ple_store
+            from freetoken.kernel import _row_store
 
-            stream = torch.cuda.current_stream(self._device).cuda_stream
-            if _ple_store.memop_wait_geq(stream, self._eager_seq.data_ptr(), self._wait_seq) != 0:
+            if _row_store.memop_wait_geq(stream.cuda_stream, self._eager_seq.data_ptr(), self._wait_seq) != 0:
                 self._finish_prefill_fill()  # no stream WAIT: block the host instead
             self._wait_seq = 0
         pinned, dev = (
@@ -434,12 +487,25 @@ class DiskRowTable:
         )
         nbytes = rows * self._token_bytes
         dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
+        if not capturing:
+            evt = self._buf_read[pinned.data_ptr()] = torch.cuda.Event()  # fresh: see __init__
+            evt.record(stream)
         if self._src_dtype == "NVFP4_ROWS":
             from freetoken.kernel.triton.ple import nvfp4_rows_dequant
 
             values = nvfp4_rows_dequant(dev[:nbytes], self.head_dim, self.scale).to(self.dtype)
+        elif self._ggml_type is not None:
+            from freetoken.kernel import ggml
+            from freetoken.layers.quantization.ggml_types import float_dtype
+
+            fdt = float_dtype(self._ggml_type)
+            if fdt is not None:
+                values = dev[:nbytes].view(fdt).to(self.dtype, copy=True)
+            else:
+                values = ggml.dequantize(dev[:nbytes].view(-1, self._row_bytes), self._ggml_type, self.head_dim, self.dtype)
         else:
-            values = dev[:nbytes].view(_PLE_SRC_DTYPES[self._src_dtype][0]).to(self.dtype)
+            # copy=True: rows already in self.dtype must not alias the staging buffer the next fill reuses
+            values = dev[:nbytes].view(_PLE_SRC_DTYPES[self._src_dtype][0]).to(self.dtype, copy=True)
             if self.scale != 1.0:
                 values = values * self.scale
         values = values.view(*row_ids.shape[:-1], -1)

@@ -175,13 +175,13 @@ def test_streamed_prefill_buffers_evict_the_coldest_experts():
     # decode after a streamed chunk refills the empty buffer slots [0, 2E) first, so they hold
     # its most recent fetches: invalidate them, as a chunk does, and decode again
     for b in range(2):
-        cache._invalidate_prefill_buffer(b)
+        cache._invalidate_prefill_buffer(b, 0)
     _decode(cache, 40, seed=8)
     before = _resident(cache)
     assert any(s < 2 * E for s in range(active) if int(cache.id_of_slot[s]) >= 0)
     cache.begin_prefill()
     for b in range(2):  # what the chunk's prefetches do to the buffer range
-        cache._invalidate_prefill_buffer(b)
+        cache._invalidate_prefill_buffer(b, 0)
     torch.cuda.synchronize()
     after = _resident(cache)
     assert set(after) <= set(before)

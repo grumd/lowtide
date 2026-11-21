@@ -100,8 +100,8 @@ class DSV4AttnMetadata(BaseAttnMetadata):
         Computed FRESH on every call -- NEVER cached on the metadata. Under CUDA-graph capture
         the GraphRunner runs a warm forward and then the captured forward on the SAME batch and
         metadata; a cached tensor would leave these gathers out of the captured graph, freezing
-        every replay at the capture-time ring slots (-1 fills included -> kernel/index_copy_
-        OOB on the first real step). Reads the snapshot rather than the live map, so a
+        every replay at the capture-time ring slots (-1 fills included -> the window store
+        drops its writes on the first real step). Reads the snapshot rather than the live map, so a
         concurrent allocate_paged cannot redirect an in-flight replay; runs inside the captured
         graph (its inputs -- the snapshot and ``positions`` -- are graph buffers), which is why
         it takes ``pos`` instead of reading it off the batch.
@@ -190,7 +190,9 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
             last_indices=last, table_rows=self._table_rows(batch), window_ar=self._window_ar
         )
 
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
+        if rows_per_req != 1:
+            raise NotImplementedError("dsv4_sparse captures decode graphs only")
         assert self.capture is None, "Capture already initialized."
         self.max_graph_bs = max(bs_list)
         self.capture = DSV4CaptureData.create(self.max_graph_bs, max_seq_len, self.device)
@@ -226,23 +228,6 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         g = slot_lut[win_cols.clamp_min(0)]
         return torch.where(win_cols < 0, torch.full_like(g, -1), g)
 
-    def window_ring_cols(self, ti: int, start_pos: int, n: int) -> torch.Tensor:
-        """Per-query window slots in the DECODE ring order (``[1, n, window]``).
-
-        Mirrors ``DSV4AttnMetadata.window_ctx``: ring slot ``j`` holds the latest position
-        ``p - ((p - sl) % win)`` for the query position ``p``; ``-1`` where that is negative
-        or ``j > p``. Decode reads its window half in this order, so a verify that wants the
-        same reduction must too (``dspark_verify=decode``)."""
-        win = self.window_size
-        device = self.pool.device
-        sl = torch.arange(win, device=device)
-        p = start_pos + torch.arange(n, device=device)
-        pos_j = p[:, None] - ((p[:, None] - sl[None, :]) % win)
-        full = self.pool.full_loc_map[ti, pos_j.clamp_min(0)]
-        slots = self.pool.translate_full_to_window(full)
-        valid = (sl[None, :] <= p[:, None]) & (pos_j >= 0)
-        return torch.where(valid, slots, torch.full_like(slots, -1)).unsqueeze(0)
-
     def blocks_to_global(
         self, blocks: torch.Tensor, ratio: int, ti: int | None = None,
         rows: torch.Tensor | None = None,
@@ -266,24 +251,21 @@ class DSV4SparseAttnBackend(BaseAttnBackend, CompressorBackendMixin, IndexerBack
         self, q: torch.Tensor, layer_id: int, topk_idxs: torch.Tensor, n_window: int,
         attn_sink: torch.Tensor, softmax_scale: float,
         cmp_counts: torch.Tensor | None = None, has_compression: bool = True,
-        allow_multi_query_split: bool = False,
     ) -> torch.Tensor:
         """Paged sparse MLA attention over ``[window | compressed]`` global slots.
 
         ``cmp_counts`` bounds the compressed half per query from DEVICE memory, so a captured
-        graph's work tracks the live position instead of the staged width. ``allow_multi_query_split``
-        lets an m>1 batch use the decode split-k reduction (the DSpark decode verify).
+        graph's work tracks the live position instead of the staged width.
         """
         from freetoken.kernel.triton.dsv4.sparse_attn import sparse_attn_paged
 
         pool = self.pool
         # ratio-0 layers have no compressed pool; the kernel never reads it there (n_window ==
-        # topk), so alias the window pool to keep the two-pool stride assert happy.
+        # topk), so alias the window pool to keep the two-pool shape assert happy.
         cmp = pool.cmp_pool[layer_id] if has_compression else pool.window_pool[layer_id]
         return sparse_attn_paged(
             q, pool.window_pool[layer_id], cmp, attn_sink,
             topk_idxs.int(), n_window, softmax_scale, cmp_counts=cmp_counts,
-            allow_multi_query_split=allow_multi_query_split,
         )
 
     # ----- internals --------------------------------------------------------------------

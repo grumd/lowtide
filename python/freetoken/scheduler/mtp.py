@@ -37,6 +37,7 @@ Round shape:
 from __future__ import annotations
 
 import os
+import time
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 import torch
@@ -52,6 +53,25 @@ if TYPE_CHECKING:
     from .scheduler import Scheduler
 
 logger = init_logger(__name__)
+
+def round_msg(
+    r: Req, tok: int, finished: bool, finish_reason: str | None, matched_stop: str | None,
+    *, draft: bool,
+) -> DetokenizeMsg:
+    """One token a speculative round commits, stamped into the request's timings as the drain
+    stamps a plain decode step's; ``draft`` counts it as an accepted draft."""
+    if draft:
+        r.stats.draft_n_accepted += 1
+    r.stats.stamp_token(time.perf_counter())
+    msg = DetokenizeMsg(
+        uid=r.uid, next_tokens=[tok], finished=finished,
+        finish_reason=finish_reason, matched_stop=matched_stop,
+        stop_strs=r.sampling_params.stop_strs or None,
+    )
+    if finished or r.sampling_params.timings_per_token:
+        msg.timings = r.stats.finish(r.input_ids.numel() - r.prompt_len)
+    return msg
+
 
 class _DraftReq:
     """Minimal request view for synthetic draft batches. The QSA backend's metadata
@@ -134,7 +154,7 @@ class _RoundState(NamedTuple):
 
 class MTPManager:
     # qwen4-exp MTP carries per-request residual streams (`req.mtp_streams_row`) that the
-    # scheduler must refresh every decode step; DSpark does not (uses the target aux buffer).
+    # scheduler must refresh every decode step.
     uses_streams = True
     # begin_round/finish_round let the verify be the overlapped batch (Phase 4)
     overlaps = True
@@ -446,8 +466,7 @@ class MTPManager:
         # alone would slice the token_pool's first axis and hand the model a 2-D [T,
         # max_len] block instead of the per-position gather. The actual gather is
         # deferred to just before the verify forward: the draft ids are only staged
-        # into token_pool in step 3, and extend_forward reads batch.input_ids as-is
-        # (DSpark stages before its gather for the same reason).
+        # into token_pool in step 3, and extend_forward reads batch.input_ids as-is.
         _lap("prep")
 
         # -- 2. draft chain: k sequential single-token MTP forwards. The anchor token is
@@ -644,6 +663,7 @@ class MTPManager:
                 fin = hit_length or hit_eos or ms is not None
                 return fin, ("stop" if (hit_eos or ms is not None) else "length") if fin else None, ms
 
+            r.stats.draft_n += k
             for j in range(a):
                 if r.output_budget_exhausted:
                     # The committed prefix is already at max_device_len (a prior round
@@ -660,13 +680,7 @@ class MTPManager:
                     and not finished
                 ):
                     r.toolcall_anchor_len = r.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=r.uid, next_token=tok, finished=finished,
-                        finish_reason=finish_reason, matched_stop=matched_stop,
-                        stop_strs=r.sampling_params.stop_strs or None,
-                    )
-                )
+                reply.append(round_msg(r, tok, finished, finish_reason, matched_stop, draft=True))
                 if finished:
                     break
             bonus_published = not finished
@@ -679,13 +693,7 @@ class MTPManager:
                     and not finished
                 ):
                     r.toolcall_anchor_len = r.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=r.uid, next_token=bonus, finished=finished,
-                        finish_reason=finish_reason, matched_stop=matched_stop,
-                        stop_strs=r.sampling_params.stop_strs or None,
-                    )
-                )
+                reply.append(round_msg(r, bonus, finished, finish_reason, matched_stop, draft=False))
             finished_at_draft = finished and not bonus_published
             # re-extend range: pending token + accepted drafts (NOT the bonus)
             rext_end = C[i] + 1 + (m if finished_at_draft else a)
@@ -754,13 +762,13 @@ class MTPManager:
                 f"MTP debug round: uids={[r.uid for r in reqs]} C={C} "
                 f"anchor={state.anchor_toks.tolist()} "
                 f"a={a_list} bonus={bonus_list} drafts={drafts_host} "
-                f"reply={[(m.next_token, m.finished) for m in reply]}"
+                f"reply={[(m.next_tokens, m.finished) for m in reply]}"
             )
 
         # -- 8. publish
         dv = getattr(eng, "draft_vocab", None)
         if dv is not None:
-            dv.observe([m.next_token for m in reply])
+            dv.observe([t for m in reply for t in m.next_tokens])
         if reply:
             used, total = sched._kv_usage_pages()
             mamba_slots = sched._mamba_slot_usage()

@@ -215,7 +215,8 @@ class SWARadixCache:
         # then a live (non-tombstone) leaf for the in-window remainder (never a tombstone leaf --
         # the clamp + the free_swa -page_size margin guarantee a live tail).
         if total < insert_len:
-            suffix_ids = input_ids[total:]
+            # Both suffix nodes can share this copy without retaining the request buffer.
+            suffix_ids = input_ids[total:].clone()
             suffix_kv = kv_indices[total:].clone()
             boundary = max(0, min(swa_evicted_seqlen, insert_len) - total)
             boundary = min(boundary, max(0, len(suffix_ids) - self.page_size))
@@ -226,6 +227,24 @@ class SWARadixCache:
             if len(suffix_ids):
                 self._add_child(node, suffix_ids, suffix_kv, tombstone=False)
         return total, (torch.cat(freed) if freed else self.empty)
+
+    def has_locked_tombstone(self, input_ids: torch.Tensor, after_len: int) -> bool:
+        """True if insert(input_ids, update_kv_after_len=after_len) would keep a tombstone that
+        another request still full-locks, freeing the caller's copy of it."""
+        node, total = self.root, 0
+        while total < len(input_ids):
+            child = node.children.get(self.key_fn(input_ids[total:]))
+            if child is None:
+                return False
+            match_len = align_down(child.get_match_len(input_ids[total:]), self.page_size)
+            if match_len == 0:
+                return False
+            if child.swa_tombstone and child.ref_count > 0 and after_len < total + match_len:
+                return True
+            if match_len < child.length:
+                return False
+            node, total = child, total + match_len
+        return False
 
     def _add_child(self, parent: RadixTreeNode, ids: torch.Tensor, kv: torch.Tensor,
                    *, tombstone: bool) -> RadixTreeNode:

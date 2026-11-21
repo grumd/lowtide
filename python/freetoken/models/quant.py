@@ -14,8 +14,9 @@ from typing import Any
 from freetoken.layers.quantization import NameMap, QuantConfig, QuantKind
 
 
-def quant_config_for(hf_config: Any, spec, *, hf_quant_config: dict | None = None) -> QuantConfig:
-    """The checkpoint's dialect config under the family's attribute -> checkpoint naming."""
+def quant_config_for(hf_config: Any, spec) -> QuantConfig:
+    """The checkpoint's dialect config under the family's attribute -> checkpoint naming
+    (an old ModelOpt ``hf_quant_config.json`` is folded in by ``cached_load_hf_config``)."""
     return QuantConfig.from_hf(
         hf_config,
         name_map=NameMap(
@@ -24,7 +25,6 @@ def quant_config_for(hf_config: Any, spec, *, hf_quant_config: dict | None = Non
             packed=spec.packed_modules_mapping,
         ),
         unquantized=spec.unquantized_modules,
-        hf_quant_config=hf_quant_config,
     )
 
 

@@ -1,13 +1,13 @@
 from __future__ import annotations
+
 import os
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Tuple, TypeAlias
+from typing import Any, ClassVar, Dict, List, Literal, Protocol, Tuple, TypeAlias
 
 from freetoken.attention.base import AttnType
 
-# State-dict key prefixes for the (optional) vision stack. Used both to drop the vision
-# config (so the tower is never built) and to skip the matching tensors in the FTW reader.
-VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.")
+# State-dict key prefixes of the vision stack; load_weight drops them when the engine serves text-only.
+VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "vision_embedder.", "visual.")
 _VISION_TRUE = {"1", "true", "yes", "on"}
 
 
@@ -109,6 +109,25 @@ class RotaryConfig:
     max_position: int
     base: float
     scaling: Dict[str, Any] | None
+    # 3-axis rope sections; None keeps the 1-D rope path, set only when the model serves vision
+    mrope_section: list | None = None
+    mrope_layout: str = "contiguous"  # see freetoken.layers.rotary.build_section_table
+
+    @property
+    def table_positions(self) -> int:
+        """Positions the cos/sin table covers: the longest sequence this rope can serve."""
+        from freetoken.layers.rotary import rope_table_positions
+
+        return rope_table_positions(self.max_position, self.scaling)
+
+
+def mrope_layout_from_rope_params(rope_params: Any) -> str:
+    """rope_parameters flags -> layout name: mrope_interleaved_glm, else mrope_interleaved, else contiguous."""
+    if rope_params.get("mrope_interleaved_glm"):
+        return "interleaved_glm"
+    if rope_params.get("mrope_interleaved"):
+        return "interleaved"
+    return "contiguous"
 
 
 @dataclass(frozen=True)
@@ -132,6 +151,9 @@ class KVCacheGroupSpec:
     # Attention-type taxonomy value for this group; drives the backend capability
     # matrix and (with the pool factory) selects the KV pool family.
     attn_type: AttnType = AttnType.FULL
+    # (layer, source) pairs: layers of this group that read the source's slab and own none.
+    # They are not in ``layer_ids``, so neither the pool nor the cost model gives them a slab.
+    shared_layers: Tuple[Tuple[int, int], ...] = ()
 
     @property
     def num_layers(self) -> int:
@@ -181,6 +203,8 @@ class SWAAttentionGroupConfig(BaseAttentionGroupConfig):
     head_dim: int
     rotary_config: RotaryConfig
     sliding_window: int
+    # image token spans attend to each other in both directions on these layers
+    bidirectional_mm_blocks: bool = False
 
 
 @dataclass(frozen=True)
@@ -205,7 +229,8 @@ class DSV4AttentionGroupConfig(BaseAttentionGroupConfig):
     """DSV4 sparse attention (window + compressed tiers + Lightning Indexer). Standalone
     class on purpose: subclassing SWAAttentionGroupConfig would flip has_swa_attention
     and reroute DSV4 through the SWA gates. Geometry beyond the latent width lives in
-    dsv4_args; the pool prices itself from there, not from this spec."""
+    dsv4_args (``dsv41_args`` for the ``v41`` variant); the pool prices itself from there,
+    not from this spec."""
 
     kind: ClassVar[Literal["dsv4"]] = "dsv4"
     cache_kind: ClassVar[Literal["dsv4_paged"]] = "dsv4_paged"
@@ -213,6 +238,11 @@ class DSV4AttentionGroupConfig(BaseAttentionGroupConfig):
     num_kv_heads: int
     head_dim: int
     sliding_window: int  # the P-token window page
+    # "v41": DeepSeek-V4.1's cross-layer-shared packed tiers (AttnType.DSV41, its own pool and backend)
+    variant: Literal["v4", "v41"] = "v4"
+    # image token spans attend to each other in both directions, so prefill chunks end
+    # before a block instead of splitting it (the scheduler's keep_images_whole gate)
+    bidirectional_mm_blocks: bool = False
 
 
 AttentionGroupConfig: TypeAlias = (
@@ -236,13 +266,34 @@ def _full_group_attn_type(group: FullAttentionGroupConfig) -> AttnType:
     return AttnType.MLA
 
 
+class SlotVerify(Protocol):
+    """How a speculative verify step stages and commits one slot state; the state's owner supplies it and the pool only calls it.
+
+    The pool builds one per engine as ``cls(spec, max_bs, rows_per_req, device, dtype)``, ``dtype`` being the state's own, and keeps it across ``rebuild``.
+    A verify forward reads the live state only and writes what the commit needs into this handler's scratch; the owner gets it back with ``pool.verify_handler(spec.name)``.
+    Scratch row = verify-batch row, never a pool slot.
+    The scratch is single-buffered, which is safe because speculative decoding forces the normal loop.
+    A handler reads only its own scratch and writes only its own state, so the handlers commit in any order.
+    """
+
+    @staticmethod
+    def nbytes(spec: SlotStateSpec, max_bs: int, rows_per_req: int, dtype) -> int:
+        """Scratch bytes, from the spec alone, before any pool exists."""
+        ...
+
+    def commit(self, pool, slots, counts) -> None:
+        """Roll live slot ``slots[i]`` to where it stands after the first ``counts[i]`` rows of verify request i; int64 device tensors, one entry per request.
+
+        Reads the scratch without consuming it and may run more than once per step; reads the state through ``pool.slot_state`` on every call, since ``rebuild`` replaces it.
+        """
+        ...
+
+
 @dataclass(frozen=True)
 class SlotStateSpec:
     """One extra per-request tensor riding the LinearStatePool slots.
 
-    Allocated as ``[max(1, len(layer_ids)), num_slots, *shape]`` and advanced, snapshot,
-    COW'd and rebuilt with the GDN state; the owner reads it back through
-    ``pool.slot_state(name, layer_id)``. ``shape`` is per slot and TP-replicated.
+    Allocated as ``[max(1, len(layer_ids)), num_slots, *shape]``; ``copy_from``, ``reset`` and ``rebuild`` cover it with the GDN state. The owner advances it in the forward and writes its own prefill track snapshot into ``fla_metadata.track_dst``, after the chunk's rows; it reads the state back through ``pool.slot_state(name, layer_id)``. ``shape`` is per slot and TP-replicated.
     """
 
     name: str
@@ -250,6 +301,8 @@ class SlotStateSpec:
     layer_ids: Tuple[int, ...] = ()
     dtype: Any | None = None  # a torch dtype; None -> the pool's compute dtype
     fill_value: float = 0.0
+    # None on a model's own state: speculative decoding cannot serve the model; a proposer's state may leave it None and keep itself right in post_verify
+    verify: type[SlotVerify] | None = None
 
 
 @dataclass(frozen=True)
@@ -327,6 +380,9 @@ class ModelConfig:
     # CSA/HCA compressors, Lightning Indexer, manifold-constrained Hyper-Connections,
     # hash routing). Opaque to model-agnostic engine code; None for non-DSV4 models.
     dsv4_args: Any | None = None
+    # DeepSeek-V4.1 payload (DeepseekV41Args): DSV41 layer roles, Engram, replay policy. Opaque
+    # to model-agnostic engine code; None for every other model.
+    dsv41_args: Any | None = None
     # GLM-5.2 (glm_moe_dsa) MLA/DSA payload (GlmMoeDsaArgs): the MLA low-rank dims and the
     # DSA indexer geometry the model module needs. Opaque to model-agnostic engine code;
     # None for every other model.
@@ -344,23 +400,24 @@ class ModelConfig:
     # n-gram embedding geometry and the QSA indexer scoring geometry the model module
     # needs. Opaque to model-agnostic engine code; None for every other model.
     qwen4_args: Any | None = None
-    # DeepSeek-V4.1 (deepseek_v41) payload (DeepseekV41Args): CSA2 compress/kv-source
-    # geometry, Engram n-gram memory geometry and the DSpark draft scalars the model
-    # module needs. Opaque to model-agnostic engine code; None for every other model.
-    dsv41_args: Any | None = None
     # Hy4-flash (hy_v4_flash) payload (Hy4Args): per-layer-type MLA head counts and rope thetas,
     # the compressed-indexer geometry, the LatentMoE widths, the identity-HC knobs and the
     # Engram hash geometry. Opaque to model-agnostic engine code; None for every other model.
     hy4_args: Any | None = None
+    # Gemma-4 E2B / E4B payload (Gemma4EArgs): per-layer input embeddings and KV-shared
+    # layers. Opaque to model-agnostic engine code; None for every other model.
+    gemma4_e_args: Any | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
-    # A draft head (MTP/DSpark) is built for this serve (FREETOKEN_ENABLE_MTP + the
+    # A draft head (MTP) is built for this serve (FREETOKEN_ENABLE_MTP + the
     # checkpoint shipping one). The FTW replay must NOT skip the draft's dense keys then.
     mtp_enabled: bool = False
     # Number of ``mtp.layers.N`` blocks the checkpoint ships (0 = no draft head). Their
     # attention layer ids continue after the main stack (num_layers + i).
     mtp_num_layers: int = 0
+    # (layer, source) pairs: the layer attends over the KV the source layer stored and stores none
+    kv_shared_layers: Tuple[Tuple[int, int], ...] = ()
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
     slot_states: Tuple[SlotStateSpec, ...] = ()
@@ -388,6 +445,14 @@ class ModelConfig:
     @property
     def is_multimodal(self) -> bool:
         return self.vision_config is not None
+
+    @property
+    def model_is_mrope(self) -> bool:
+        """True when any full-attention layer uses 3-axis (t/h/w) rope positions."""
+        return any(
+            getattr(getattr(g, "rotary_config", None), "mrope_section", None) is not None
+            for g in self.attention_groups
+        )
 
     @property
     def has_hybrid_attention(self) -> bool:
@@ -461,7 +526,7 @@ class ModelConfig:
         if isinstance(group, SWAAttentionGroupConfig):
             return AttnType.SWA
         if isinstance(group, DSV4AttentionGroupConfig):
-            return AttnType.DSV4
+            return AttnType.DSV41 if group.variant == "v41" else AttnType.DSV4
         return _full_group_attn_type(group)
 
     def kv_cache_group_specs(self) -> Tuple[KVCacheGroupSpec, ...]:
@@ -476,13 +541,21 @@ class ModelConfig:
                 ),
             )
 
+        sources = dict(self.kv_shared_layers)
+
+        def split(group) -> dict:
+            return dict(
+                layer_ids=tuple(i for i in group.layer_ids if i not in sources),
+                shared_layers=tuple((i, sources[i]) for i in group.layer_ids if i in sources),
+            )
+
         specs: list[KVCacheGroupSpec] = []
         for group in self.attention_groups:
             if isinstance(group, FullAttentionGroupConfig):
                 specs.append(
                     KVCacheGroupSpec(
                         name=group.name,
-                        layer_ids=group.layer_ids,
+                        **split(group),
                         num_kv_heads=group.num_kv_heads,
                         head_dim=group.head_dim,
                         sliding_window=None,
@@ -497,7 +570,7 @@ class ModelConfig:
                 specs.append(
                     KVCacheGroupSpec(
                         name=group.name,
-                        layer_ids=group.layer_ids,
+                        **split(group),
                         num_kv_heads=group.num_kv_heads,
                         head_dim=group.head_dim,
                         sliding_window=group.sliding_window,
@@ -515,7 +588,7 @@ class ModelConfig:
                         num_kv_heads=group.num_kv_heads,
                         head_dim=group.head_dim,
                         sliding_window=group.sliding_window,
-                        attn_type=AttnType.DSV4,
+                        attn_type=AttnType.DSV41 if group.variant == "v41" else AttnType.DSV4,
                     )
                 )
         return tuple(specs)

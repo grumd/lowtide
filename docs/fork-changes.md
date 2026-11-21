@@ -80,7 +80,7 @@ The fork's rules: one code path for every supported setup; behavior from measure
 
 Compared with upstream `3d919e9`. Full list in [`CHANGELOG.md`](../CHANGELOG.md).
 
-- DeepSeek-V4.1-Flash (`dsv41`): mHC, CSA2 sparse attention, Lightning Indexer, Engram memory, DSpark draft.
+- DeepSeek-V4.1-Flash (`dsv41`): mHC, CSA2 sparse attention, Lightning Indexer, Engram memory, DSpark draft. Dropped in the FlashML merge (2026-11-21) for FlashML's own `deepseek_v41`.
 - Qwen3.8-Flash-Next vision tower and `image_url` input. PLE table dtype via `ft checkpoint --ple`.
 - MTP speculative decoding (embedded, external or INT4 head) with CUDA-graphed rounds.
 - TP-sharded loading, per-GPU `--memory-ratio`, fp8 all-reduce.

@@ -7,12 +7,14 @@ Three separate paths, because the checkpoint's three weight classes live in diff
   ``ngram_embedding.shard_<i>`` tensors concatenated into one pinned :class:`HostBank`.
 * :func:`nvfp4_expert_spec` -- how the routed NVFP4 experts are named, for the offload cache's expert reader.
 
-Dropped: ``model.visual.*`` (served text-only). ``mtp.*`` (the speculative draft head)
-is dropped unless ``FREETOKEN_ENABLE_MTP=1`` (``qwen4_args.mtp_enabled``). When enabled,
-the dense ``mtp.*`` tensors yield under their raw names and the routed experts are
-normalized to the resident bf16 stacked layout by :func:`iter_mtp_experts` -- whatever
-the checkpoint ships (RadixArk's stacked bf16 ``experts.gate_up_proj`` or NVIDIA's
+Dropped unless asked for: ``model.visual.*`` (yielded as ``visual.*`` only when the model built the
+tower, ``include_vision``); ``mtp.*`` (the speculative draft head) unless ``FREETOKEN_ENABLE_MTP=1``
+(``qwen4_args.mtp_enabled``). When enabled, the dense ``mtp.*`` tensors yield under their raw names
+and the routed experts are normalized to the resident bf16 stacked layout by :func:`iter_mtp_experts`
+-- whatever the checkpoint ships (RadixArk's stacked bf16 ``experts.gate_up_proj`` or NVIDIA's
 per-expert block-fp8 ``experts.<e>.{proj}_proj.weight`` + ``.weight_scale_inv``).
+FlashML's :func:`iter_mtp_weights` / :func:`iter_mtp_expert_pieces` (the separate-draft MTP path)
+read the head through :class:`_DenseReader` instead.
 """
 
 from __future__ import annotations
@@ -28,12 +30,15 @@ from typing import Iterator
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
+from freetoken.layers.quantization import QuantConfig, QuantScheme, get_quant_config
+from freetoken.models.config import VISION_KEY_PREFIXES
 from freetoken.models.loader import drop_page_cache, iter_weight_files
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
 )
 from freetoken.moe.host_banks import HostBank, read_range_into
 from freetoken.models.qwen4_exp.config import parse_config
+from freetoken.models.register import get_model_spec
 from freetoken.models.wna16_banks import Wna16ExpertSourceSpec
 from freetoken.utils import cached_load_hf_config, div_ceil, div_even, download_hf_weight
 from freetoken.utils.progress import byte_bar
@@ -143,10 +148,9 @@ def _rename(raw_name: str, keep_mtp: bool = False, include_vision: bool = False)
             return None  # text-only serving: the tower is not built (see ModelConfig.is_multimodal)
         if raw_name.endswith(_SCALE_SUFFIXES):
             return None  # consumed with its quantized weight (FP4-Local: MXFP8 attn, NVFP4 MLP)
-        # The vision tower lives under ``vision_tower.`` in the model; the generic FTW
-        # replay gate (VISION_KEY_PREFIXES) uses the same prefix.
+        # FlashML's QwenVLVisionMixin tower lives under ``visual.`` (a VISION_KEY_PREFIXES entry)
         prefix = "model.visual." if raw_name.startswith("model.visual.") else "visual."
-        return "vision_tower." + raw_name[len(prefix) :]
+        return "visual." + raw_name[len(prefix) :]
     if raw_name.startswith("mtp."):
         if not keep_mtp:
             return None
@@ -163,11 +167,181 @@ def _rename(raw_name: str, keep_mtp: bool = False, include_vision: bool = False)
         return None  # routed experts: offload source banks
     if raw_name.endswith(_SCALE_SUFFIXES):
         return None
+    # static KV-cache scales of the quantizers; the KV cache runs in the engine's dtype
+    if raw_name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
+        return None
     if raw_name.startswith("model.language_model."):
         return "model." + raw_name[len("model.language_model.") :]
     if raw_name.startswith("language_model."):
         return "model." + raw_name[len("language_model.") :]
     return raw_name
+
+
+# --- FlashML's QuantConfig-aware dense reader: used by iter_mtp_weights (separate MTP draft).
+# iter_weights keeps the dequant-to-bf16 path below (_QWEN4_EXP_DEQUANTIZED in register.py).
+# leaves the model builds as quant-aware Linear layers: their tensors are read under the QuantConfig
+_LINEAR_LEAVES = frozenset({
+    "q_proj", "k_proj", "v_proj", "o_proj", "index_qk_proj",
+    "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
+    "gate_proj", "up_proj", "down_proj",
+    "input_mix_weight_down", "block_inject_weight", "input_mix_weight_up",
+    "key_proj", "value_proj", "lm_head", "fc_embedding", "fc_hidden",
+})
+# activation scales of modules whose scheme carries no input_scale role
+_DROPPED_SUFFIXES = frozenset({"input_scale", "input_global_scale"})
+_ELEM_DTYPES = {"e4m3": torch.float8_e4m3fn, "e2m1": torch.uint8}
+_QUANT_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2, torch.uint8, torch.int8)
+# The per-layer HC mix reads the low-rank down projection and the injection logits from one GEMM; vLLM pads the merged rows to a multiple of 16 for cuBLAS (hyperconnection.py pad_size).
+# The top-level hyper_connection_mixer has no injection and never fuses.
+_PAD_TO = {"input_mix_weight_down_block_inject": 16}
+_HC_WITH_INJECT = (".attn_hyper_connection", ".mlp_hyper_connection")
+
+
+def _per_row_scale(scale: torch.Tensor, rows: int) -> torch.Tensor:
+    """Per-tensor scalar or per-channel ``[rows, 1]`` scale -> fp32 ``[rows]``; any other count is refused rather than broadcast onto the wrong rows."""
+    flat = scale.reshape(-1).to(torch.float32)
+    if flat.numel() == 1:
+        return flat.expand(rows).contiguous()
+    if flat.numel() != rows:
+        raise ValueError(f"scale has {flat.numel()} elements for a weight with {rows} output rows (shape {tuple(scale.shape)}); expected 1 or {rows}")
+    return flat.contiguous()
+
+
+class _DenseReader:
+    """Routes each Linear tensor to the buffer its module's scheme declares; packed projections are concatenated per role once every part is in.
+
+    The part table is the family's packed_modules_mapping. The QuantConfig picks the GDN in_proj layout and, through its dialect's storage names, which checkpoint tensor fills which role.
+    """
+
+    def __init__(self, quant: QuantConfig | None, packed: tuple[tuple[str, tuple[str, ...]], ...]) -> None:
+        self.quant = quant
+        self.groups = {fused: parts for fused, parts in packed if fused != "experts"}  # experts: bank reader
+        self.by_part: dict[str, list[tuple[str, int]]] = {}
+        for fused, parts in self.groups.items():
+            for idx, part in enumerate(parts):
+                self.by_part.setdefault(part, []).append((fused, idx))
+        # target module -> (part count, {part: {role: tensor}}, {part: the roles its module stores}, scheme)
+        self.pending: dict[str, tuple[int, dict[int, dict[str, torch.Tensor]], dict[int, set[str]], QuantScheme | None]] = {}
+
+    def scheme(self, module: str) -> QuantScheme | None:
+        return None if self.quant is None else self.quant.scheme_for(module)
+
+    def target(self, module: str) -> tuple[str, int, int]:
+        """``(fused module, part index, part count)``; a standalone linear is its own single-part target."""
+        parent, _, leaf = module.rpartition(".")
+        candidates = self.by_part.get(leaf)
+        if not candidates:
+            return module, 0, 1
+        if len(candidates) > 1:
+            # GDN: quantized checkpoints split qkv|z from b|a; same test as layers/linear_attn/gdn.py
+            split = self.scheme(f"{parent}.in_proj_qkvz") is not None
+            keep = {"in_proj_qkvz", "in_proj_ba"} if split else {"in_proj"}
+            candidates = [c for c in candidates if c[0] in keep]
+        fused, idx = candidates[0]
+        if fused in _PAD_TO and not parent.endswith(_HC_WITH_INJECT):
+            return module, 0, 1
+        return f"{parent}.{fused}", idx, len(self.groups[fused])
+
+    def add(self, name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]] | None:
+        """Take one tensor; the emitted ``[(name, tensor)]`` once its target module is complete, ``[]`` before, None if ``name`` is not a Linear's tensor."""
+        module, _, suffix = name.rpartition(".")
+        if module.rpartition(".")[2] not in _LINEAR_LEAVES:
+            return None
+        scheme = self.scheme(module)
+        roles = {"weight": "weight"} if scheme is None else {n: r for r, e in self.quant.storage(scheme).items() for n in e.names}
+        role = roles.get(suffix)
+        if role is None:
+            if suffix in _DROPPED_SUFFIXES:
+                return []
+            raise ValueError(f"{name}: the checkpoint's quant config declares {module} {scheme or 'unquantized'}, stored as {sorted(roles)}")
+        if role == "weight":
+            self._check_weight(name, module, scheme, tensor)
+        target, idx, count = self.target(module)
+        _, parts, expected, _ = self.pending.setdefault(target, (count, {}, {}, scheme))
+        part = parts.setdefault(idx, {})
+        if role in part:
+            raise ValueError(f"{name}: {module} already has its {role} from another checkpoint tensor")
+        part[role] = tensor
+        expected[idx] = set(roles.values())
+        if scheme is not None and set(part) == expected[idx]:
+            parts[idx] = self._finish(module, scheme, part)
+        if len(parts) < count or any(set(parts[i]) != expected[i] for i in parts):
+            return []
+        del self.pending[target]
+        return self._emit(target, [parts[i] for i in range(count)], scheme)
+
+    def missing(self) -> list[str]:
+        """One line per incomplete module: the roles its parts still lack."""
+        lines = []
+        for target, (count, parts, expected, _scheme) in sorted(self.pending.items()):
+            lacking = sorted(set().union(*(expected[i] - set(parts[i]) for i in parts)))
+            if len(parts) < count:
+                lacking.append(f"{count - len(parts)} of {count} fused parts")
+            lines.append(f"{target}: missing {lacking}")
+        return lines
+
+    @staticmethod
+    def _check_weight(name: str, module: str, scheme: QuantScheme | None, tensor: torch.Tensor) -> None:
+        if scheme is None:
+            if tensor.dtype in _QUANT_DTYPES:
+                raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} unquantized")
+            return
+        elem = _ELEM_DTYPES.get(scheme.weight.elem)
+        if elem is None:
+            raise ValueError(f"{name}: qwen4_exp has no dense reader for {scheme}")
+        if tensor.dtype is not elem:
+            raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} {scheme}")
+        rows, cols = tensor.shape[0], tensor.shape[1] * (2 if scheme.weight.elem == "e2m1" else 1)
+        block_rows, block_cols = scheme.weight.group or (1, 1)
+        if block_rows > 1 and rows % block_rows or block_cols > 1 and cols % block_cols:
+            raise ValueError(f"{name}: {rows}x{cols} is not a multiple of the {block_rows}x{block_cols} scale block of {module}")
+
+    def _finish(self, module: str, scheme: QuantScheme, part: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Validate one complete part against ``scheme`` and put its scales in the layer's form."""
+        storage = self.quant.storage(scheme)
+        part = {role: 1.0 / t.to(torch.float32) if storage[role].reciprocal else t for role, t in part.items()}
+        weight = part["weight"]
+        rows, cols = weight.shape[0], weight.shape[1] * (2 if scheme.weight.elem == "e2m1" else 1)
+        block_rows, block_cols = scheme.weight.group or (1, 1)
+        scale_role = "weight_scale_inv" if "weight_scale_inv" in part else "weight_scale"
+        out = dict(part)
+        if block_cols < 0:
+            try:
+                out[scale_role] = _per_row_scale(part[scale_role], rows)
+            except ValueError as exc:
+                raise ValueError(f"{module}.{scale_role}: {exc}") from None
+        else:
+            want = (rows // block_rows, cols // block_cols)
+            if tuple(part[scale_role].shape) != want:
+                raise ValueError(f"{module}: {scale_role} is {tuple(part[scale_role].shape)}, expected {want} for {scheme}")
+            if scheme.weight.scale == "e4m3" and part[scale_role].dtype is not torch.float8_e4m3fn:
+                raise ValueError(f"{module}: {scale_role} is {part[scale_role].dtype} but {scheme} stores e4m3 scales")
+        if "weight_global" in part:
+            g = part["weight_global"].reshape(-1).to(torch.float32)
+            if g.numel() != 1:
+                raise ValueError(f"{module}: weight_global has {g.numel()} elements, expected one per-tensor scale")
+            out["weight_global"] = g.expand(rows).contiguous()
+        if "input_scale" in part:
+            out["input_scale"] = part["input_scale"].reshape(()).to(torch.float32)
+        return out
+
+    @staticmethod
+    def _emit(target: str, parts: list[dict[str, torch.Tensor]], scheme: QuantScheme | None) -> list[tuple[str, torch.Tensor]]:
+        pad_to = _PAD_TO.get(target.rpartition(".")[2], 0)
+        if pad_to and scheme is not None:
+            raise ValueError(f"{target}: qwen4_exp pads this fusion to {pad_to} rows and reads it bf16 only, the checkpoint's quant config declares {scheme}")
+        out = []
+        for role in parts[0]:
+            tensors = [part[role] for part in parts]
+            if role == "input_scale":
+                # fused parts read the same activation, so one range covers them: max is exact then and safe if they drift
+                out.append((f"{target}.{role}", torch.stack(tensors).max()))
+                continue
+            pad = (-sum(t.shape[0] for t in tensors)) % pad_to if pad_to else 0
+            if pad:
+                tensors.append(torch.zeros(pad, *tensors[0].shape[1:], dtype=tensors[0].dtype, device=tensors[0].device))
+            out.append((f"{target}.{role}", tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)))
+        return out
 
 
 def _try_fuse(
@@ -399,6 +573,43 @@ def shard_ftw_weight(name: str, w: torch.Tensor, model_path: str, tp) -> torch.T
     return tp_shard_key(name, w, _ftw_shard_config(model_path), tp)
 
 
+def rename_ftw_weight(name: str) -> str:
+    """FTW replay: FTWs written before the FlashML merge store the tower as ``vision_tower.*``;
+    the model now names it ``visual.*`` (QwenVLVisionMixin)."""
+    if name.startswith("vision_tower."):
+        return "visual." + name[len("vision_tower."):]
+    return name
+
+
+def _open_dense_index(model_path: str, device):
+    """Header inventory + reader so an fp8/NVFP4 dense weight finds its scale companion under any
+    dialect suffix (.weight_scale per-row, .weight_scale_inv block) and across shards."""
+    from freetoken.models.checkpoint_index import CheckpointIndex, TensorReader
+
+    index = CheckpointIndex.load(model_path)
+    return index, TensorReader(index, device=str(device))
+
+
+def _read_dense(f, raw_name: str, index, reader) -> torch.Tensor:
+    """One dense tensor, served bf16: "naive-quantized" checkpoints store dense projections (GDN
+    in/out_proj, QSA q/k/v/o, shared expert) as Float8 + a per-row or per-block scale, FP4-Local
+    its vision MLP/merger as W4A16_NVFP4. torch.cat refuses Float8, so this runs BEFORE the fusions."""
+    from freetoken.models.checkpoint_index import StorageKind, dequantize, detect_storage
+
+    tensor = f.get_tensor(raw_name)
+    if tensor.dtype in _FP8_DTYPES:
+        stem = raw_name[: -len(".weight")] if raw_name.endswith(".weight") else raw_name
+        if detect_storage(index, stem) is StorageKind.BF16:
+            raise ValueError(f"fp8 weight has no .weight_scale/.weight_scale_inv companion: {stem!r}")
+        return dequantize(index, stem, reader.get)
+    if tensor.dtype == torch.uint8 and raw_name.endswith(".weight"):
+        stem = raw_name[: -len(".weight")]
+        if detect_storage(index, stem) is not StorageKind.NVFP4:
+            raise ValueError(f"uint8 weight {stem!r} is not NVFP4-packed")
+        return dequantize(index, stem, reader.get, nvfp4_to_bf16=True)
+    return tensor
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -406,6 +617,7 @@ def iter_weights(
     include_moe_experts: bool,
     include_non_moe: bool,
     include_mtp: bool = True,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield the dense (non-expert) weights, prefix-stripped and fused to the model's buffers.
 
@@ -432,20 +644,7 @@ def iter_weights(
         return
 
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
-
-    # Generic storage inventory: lets an fp8 dense weight find its scale companion
-    # under ANY dialect suffix (.weight_scale per-row, .weight_scale_inv block) and
-    # across shards. Headers only, cheap.
-    from freetoken.models.checkpoint_index import (
-        CheckpointIndex,
-        StorageKind,
-        TensorReader,
-        dequantize,
-        detect_storage,
-    )
-
-    index = CheckpointIndex.load(model_path)
-    reader = TensorReader(index, device=str(device))
+    index, reader = _open_dense_index(model_path, device)
     try:
         for file in tqdm(
             iter_weight_files(model_path),
@@ -460,28 +659,11 @@ def iter_weights(
                     name = _rename(
                         raw_name,
                         keep_mtp=config.qwen4_args.mtp_enabled,
-                        include_vision=config.is_multimodal,
+                        include_vision=include_vision and config.is_multimodal,
                     )
                     if name is None:
                         continue
-                    tensor = f.get_tensor(raw_name)
-                    # "naive-quantized" checkpoints store dense projections (GDN in/out_proj,
-                    # QSA q/k/v/o, shared expert) as Float8 + a per-row or per-block scale.
-                    # torch.cat refuses any Float8 involvement, so dequantize to bf16 BEFORE
-                    # the fusions — the resident dense set is bf16 in every variant.
-                    if tensor.dtype in _FP8_DTYPES:
-                        stem = raw_name[: -len(".weight")] if raw_name.endswith(".weight") else raw_name
-                        if detect_storage(index, stem) is StorageKind.BF16:
-                            raise ValueError(
-                                f"fp8 weight has no .weight_scale/.weight_scale_inv companion: {stem!r}"
-                            )
-                        tensor = dequantize(index, stem, reader.get)
-                    elif tensor.dtype == torch.uint8 and raw_name.endswith(".weight"):
-                        # W4A16_NVFP4 dense linears (the FP4-Local vision MLP/merger): served bf16.
-                        stem = raw_name[: -len(".weight")]
-                        if detect_storage(index, stem) is not StorageKind.NVFP4:
-                            raise ValueError(f"uint8 weight {stem!r} is not NVFP4-packed")
-                        tensor = dequantize(index, stem, reader.get, nvfp4_to_bf16=True)
+                    tensor = _read_dense(f, raw_name, index, reader)
                     fused = _try_fuse(name, tensor, fuse_buf)
                     if fused is not None:
                         if fused != ():  # () means buffered, not yet complete
@@ -499,6 +681,65 @@ def iter_weights(
     # the standalone artifact, and the base checkpoint does not ship it here.
     if include_mtp:
         yield from iter_mtp_experts(model_path, config, tp)
+
+
+# routed experts: expert_pieces.iter_extra_layer_expert_pieces
+_MTP_EXPERTS_PREFIX = "mtp.layers.0.mlp.experts."
+_MTP_EXPERT_RE = re.compile(re.escape(_MTP_EXPERTS_PREFIX) + r"(?:(?P<expert>\d+)\.(?P<proj>gate|up|down)_proj\.(?P<kind>weight|weight_scale_inv)|(?P<stacked>gate_up|down)_proj)$")
+
+
+def iter_mtp_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The ``mtp.*`` head but its routed experts, named as Qwen4ExpMTPDraft names it and fused like the target's dense weights."""
+    hf_config = cached_load_hf_config(model_path)
+    reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0]).packed_modules_mapping)
+    seen = False
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for raw_name in f.keys():
+                if not raw_name.startswith("mtp.") or raw_name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
+                    continue
+                seen = True
+                if raw_name.startswith(_MTP_EXPERTS_PREFIX):
+                    continue
+                tensor = f.get_tensor(raw_name)
+                emitted = reader.add(raw_name, tensor)
+                if emitted is None:
+                    yield raw_name[len("mtp."):], tensor
+                else:
+                    yield from ((n.removeprefix("mtp."), t) for n, t in emitted)
+    if not seen:
+        raise ValueError(f"{model_path} has no mtp.* weights")
+    if reader.pending:
+        raise ValueError(f"{model_path}: incomplete MTP projections: {reader.missing()}")
+
+
+def iter_mtp_expert_pieces(model_path: str):
+    """The MTP head's routed experts: the stacked bf16 pair, or per-expert projections with their block-fp8 scales."""
+    from freetoken.moe.expert_pieces import iter_extra_layer_expert_pieces
+
+    def locate(name: str):
+        m = _MTP_EXPERT_RE.match(name)
+        if m is None:
+            return None
+        if m["stacked"]:
+            return None, m["stacked"]
+        return int(m["expert"]), m["proj"] + ("_scale" if m["kind"] == "weight_scale_inv" else "")
+
+    return iter_extra_layer_expert_pieces(model_path, _MTP_EXPERTS_PREFIX, locate)
+
+
+def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The vision tower alone, named and dequantized as iter_weights names it (``visual.*``)."""
+    index, reader = _open_dense_index(model_path, device)
+    try:
+        for file in iter_weight_files(model_path):
+            with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+                for raw_name in f.keys():
+                    name = _rename(raw_name, include_vision=True)
+                    if name is not None and name.startswith(VISION_KEY_PREFIXES):
+                        yield name, _read_dense(f, raw_name, index, reader)
+    finally:
+        reader.close()
 
 
 # ======================================================================================

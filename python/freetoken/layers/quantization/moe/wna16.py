@@ -41,7 +41,9 @@ class TritonWna16MoEKernel(MoEKernel):
     slot_prefill = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, resident_ok=False, tp_ok=True, cpu_ok=False, plain_silu_only=False)
+        if cfg.strategy == "resident":
+            return "WNA16 experts are served from the offload cache, not resident"
+        reason = self._common_reject(cfg, tp_ok=True, cpu_ok=False, plain_silu_only=False)
         if reason:
             return reason
         reason = gated_epilogue_reason(cfg)

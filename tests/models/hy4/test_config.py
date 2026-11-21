@@ -289,9 +289,11 @@ def test_prefill_workspace_follows_the_tp_size(monkeypatch, tp, per_token):
     mc = parsed_config()
     monkeypatch.setattr(config_mod, "get_model_spec", lambda arch: SimpleNamespace(module="m", parse_config="p"))
     monkeypatch.setattr(config_mod, "_load_attr", lambda module, name: lambda hf: mc)
-    monkeypatch.setattr(config_mod, "checkpoint_quant_config", lambda *a: mc.quant)
+    monkeypatch.setattr(config_mod, "checkpoint_quant_config", lambda *a, **kw: mc.quant)
+    spec = SimpleNamespace(module="m", parse_config="p", encoders=())
     cfg = SimpleNamespace(hf_config=SimpleNamespace(architectures=["x"]), model_path="", mtp_path="",
-                          tp_info=DistributedInfo(0, tp))
+                          tp_info=DistributedInfo(0, tp), active_encoders=(), model_spec=spec,
+                          online_quant=None, online_quant_modules=())
     resolved = config_mod.EngineConfig.model_config.func(cfg)
     assert prefill_workspace(resolved) == (256 << 20, per_token)
     if tp == 1:

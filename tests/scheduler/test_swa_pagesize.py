@@ -76,7 +76,7 @@ def _run_lifecycle(cm: CacheManager, total_len: int, n_decode: int = 3,
     for i in range(steps):
         req.append_host(torch.tensor([9999], dtype=torch.int32))
         req.decode_batch_idx = i + 1
-        cm.maybe_free_swa_out_of_window([req], forward_iter=i)
+        cm.maybe_free_swa_out_of_window([req])
         cm.allocate_paged([req])
         req.complete_one()
     cm.cache_req(req, finished=True)
@@ -135,7 +135,7 @@ def test_hybrid_chunk_donate_skips_unaligned_boundary(ps):
 
     req = _req(3 * ps + 3, 1)
     h = cm.match_req(SimpleNamespace(input_ids=req.input_ids, input_len=req.input_len,
-                                     mm_embeds=None)).cuda_handle
+                                     )).cuda_handle
     req.cache_handle = h
     req.cached_len = h.cached_len
     cm.lock(h)
@@ -160,10 +160,11 @@ def test_hybrid_chunk_donate_skips_unaligned_boundary(ps):
     assert req.cache_handle.cached_len == 2 * ps
 
 
-def test_finish_retains_prompt_window_under_pressure():
+def test_finish_retains_prompt_window_under_pressure(monkeypatch):
     """Faithful scheduler order incl. the boundary commit: after finish + ambient evict_swa
     pressure, a follow-up request cutting exactly at the prompt end (the reasoning-dropped
     next turn) still reuses [0, P)."""
+    monkeypatch.setenv("FREETOKEN_SWA_EVICTION_INTERVAL", "1")  # window slides every step
     ps = 1
     prompt_len, n_decode = 6, 12
     cm = _mgr(ps, "swa_radix", num_pages=64)
@@ -179,7 +180,7 @@ def test_finish_retains_prompt_window_under_pressure():
     for i in range(n_decode):
         req.append_host(torch.tensor([9999], dtype=torch.int32))
         req.decode_batch_idx = i + 1
-        cm.maybe_free_swa_out_of_window([req], forward_iter=0)  # window slides every step
+        cm.maybe_free_swa_out_of_window([req])
         cm.allocate_paged([req])
         req.complete_one()
     cm.cache_req(req, finished=True)

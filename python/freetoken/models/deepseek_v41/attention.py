@@ -1,323 +1,305 @@
-"""DeepSeek-V4.1 attention: SWA-128 window + shared compressed caches (CSA2).
+"""DSV41 attention layer (reference ``Attention``): latent MLA over a sliding window plus, on
+compressing layers, ``index_topk`` compressed positions -- one paged sparse-attention call.
 
-Driver for the DSV4 paged machinery with the V4.1 layer taxonomy:
+Per layer mode (``LayerRole``):
 
-- layers 0/1 (ratio 0): window-only attention;
-- layers 2/8/14 (ratio 2) and 20 (ratio 1) own a V41Compressor and write their
-  compressed cache; every other cr>0 layer READS its kv source's cache
-  (backend-side indirection, see backend.py);
-- Phase 3a selects compressed candidates STATICALLY (all valid blocks — the
-  same mechanism V4 uses for its indexierlosen ratio-128 layers), bounded per
-  query by ``cmp_counts``; the learned indexer (top-512 + candidate filter)
-  replaces this in Phase 3b (the DSV4.1 plan);
-- per-head ``attn_sink`` rides the sparse kernel (in-kernel sink logit).
+* Full     -- ``publish_*`` compresses its input into the kv source's main KV (fp4) and index keys
+              (fp4), then its indexer selects fresh Top-K rows and publishes them on the forward's
+              ``SharedSelection``; the decoder's first Full layer also builds the candidate pool.
+* Reindex  -- selects fresh Top-K rows with its own indexer over the shared keys (inside the
+              candidate pool in the decoder) and publishes them.
+* Reuse    -- attends over the latest published Top-K rows.
+* Window   -- the sliding window only.
 
-Weight mapping and the o-projection geometry are unchanged from Phase 2
-(wq_a/q_norm/wq_b, weightless per-head rms, wo_a group-BMM/wo_b, inverse rope
-on the output's trailing rope dims).
+All modes compute their own query and sliding-window KV (fp8 into the layer's window ring). The
+attention output is rotated back (K == V share one rotated latent) and projected through the
+grouped low-rank ``wo_a`` (block-diagonal over ``o_groups``; fp8 payload kept, W8A16 at decode) and ``wo_b``.
+
+Prefill runs ragged over a flat token stream tiled by ``PrefillSegment``s; the compressor / indexer
+state is per request, so those run per segment. Decode is batched (one token per row) and
+CUDA-graph safe: every gather reads the backend's snapshot, never the live page table.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import List
+
 import torch
-import torch.nn.functional as F
-
+from freetoken.attention.dsv41_sparse import PrefillSegment
 from freetoken.core import get_global_ctx
-from freetoken.distributed import get_tp_info
-from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace
-from freetoken.models.deepseek_v4.layers import (
-    get_compress_topk_idxs,
-    get_window_topk_idxs,
-)
-from freetoken.models.deepseek_v4.ops import apply_rotary_emb
-from freetoken.layers import (
-    BaseOP,
-    LinearColParallelMerged,
-    LinearReplicated,
-    LinearRowParallel,
-    RMSNorm,
-)
-from freetoken.utils import div_even
+from freetoken.kernel.triton.dsv4.fp8_linear import GEMV_MAX_M, dequant_block_fp8, grouped_w8a16_gemv
+from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
+from freetoken.layers.quantization import QuantKind
+from freetoken.layers.quantization.scheme import fp8_block_size
 
-from .args import DeepseekV41Args
-from .compress import V41Compressor
-from .indexer import V41Indexer
+from .args import DeepseekV41Args, LayerRole, Mode
+from .compressor import Compressor
+from .indexer import Indexer
+from .rope import apply_rotary_emb, apply_rotary_emb_decode, get_freqs_cis
 
 
-class Attention(BaseOP):
-    def __init__(self, config, layer_id: int, args: DeepseekV41Args, *, quant_config=None, prefix: str = ""):
-        self.layer_id = layer_id
-        self.eps = args.norm_eps
+class DSV41Attention(BaseOP):
+    def __init__(self, args: DeepseekV41Args, role: LayerRole, *, quant_config=None, prefix: str = ""):
+        self.args = args
+        self.role = role
+        self.layer_id = role.layer_id
         self.n_heads = args.n_heads
         self.head_dim = args.head_dim
-        self.rope_head_dim = args.qk_rope_head_dim
+        self.rope_dim = args.rope_head_dim
         self.n_groups = args.o_groups
         self.o_lora_rank = args.o_lora_rank
-        self.window_size = args.sliding_window
-        self.compress_ratio = args.compress_ratios[layer_id]
-        tp = get_tp_info().size
-        self.local_heads = div_even(self.n_heads, tp)
-        self.local_groups = div_even(self.n_groups, tp)
+        self.window = args.window_size
+        self.softmax_scale = args.head_dim**-0.5
 
-        self.attn_sink = torch.empty(self.n_heads, dtype=torch.float32)
-        # TP: the sparse kernel indexes sinks by LOCAL query head — resolve this
-        # rank's slice at attend time (the param itself stays full for strict load)
-        rank = get_tp_info().rank
-        self._sink_slice = slice(rank * self.local_heads, (rank + 1) * self.local_heads)
-        self.wq_a = LinearReplicated(config.hidden_size, args.q_lora_rank, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.wq_a")
-        self.q_norm = RMSNorm(args.q_lora_rank, self.eps)
-        self.wq_b = LinearColParallelMerged(args.q_lora_rank, [self.n_heads * self.head_dim], has_bias=False, quant_config=config.quant, prefix=f"{prefix}.wq_b")
-        self.wkv = LinearReplicated(config.hidden_size, self.head_dim, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.wkv")
-        self.kv_norm = RMSNorm(self.head_dim, self.eps)
-        wo_a_rows = self.local_groups * self.o_lora_rank
-        wo_a_k = self.local_heads * self.head_dim // self.local_groups
-        self.wo_a = torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16)
-        self.wo_b = LinearRowParallel(self.n_groups * self.o_lora_rank, config.hidden_size, has_bias=False, quant_config=config.quant, prefix=f"{prefix}.wo_b")
-        self.softmax_scale = self.head_dim ** -0.5
-
-        # kv-source resolution: the layer whose compressed cache this layer reads,
-        # and that source's ratio (sizes the compressed rows / block arithmetic)
-        self.is_kv_source = layer_id in args.kv_source_layer_ids
-        self.kv_source_layer = 0
-        self.src_ratio = 0
-        if self.compress_ratio:
-            source = 0
-            for s in args.kv_source_layer_ids:
-                if s <= layer_id:
-                    source = s
-            self.kv_source_layer = source
-            self.src_ratio = args.compress_ratios[source]
-            assert self.is_kv_source or self.src_ratio > 0
-
-        # compressor on kv-source layers only (consumers read the source's cache)
-        if self.is_kv_source:
-            self.compressor: V41Compressor | None = V41Compressor(
-                args, self.compress_ratio, self.head_dim, quant_config=config.quant, prefix=f"{prefix}.compressor"
-            )
+        self.wq_a = LinearReplicated(args.dim, args.q_lora_rank, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_a")
+        self.q_norm = RMSNorm(args.q_lora_rank, args.norm_eps)
+        self.wq_b = LinearReplicated(args.q_lora_rank, args.n_heads * args.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_b")
+        self.wkv = LinearReplicated(args.dim, args.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wkv")
+        self.kv_norm = RMSNorm(args.head_dim, args.norm_eps)
+        # Block-diagonal over groups. The reference dequantizes it to bf16 and runs a grouped einsum
+        # (the activation stays bf16); a quantized checkpoint keeps the e4m3 payload + e8m0 scale
+        # here and dequantizes in-kernel -- the same math, half the bytes per decode step, and no
+        # bf16 copy in VRAM. An unquantized checkpoint ships it bf16.
+        wo_a_scheme = quant_config.scheme_for(f"{prefix}.wo_a") if quant_config is not None else None
+        self._wo_a_block = fp8_block_size(wo_a_scheme) if wo_a_scheme is not None and wo_a_scheme.kind is QuantKind.FP8_BLOCK else None
+        rows, cols = args.o_groups * args.o_lora_rank, args.n_heads * args.head_dim // args.o_groups
+        if self._wo_a_block is not None:
+            self.wo_a = torch.empty(rows, cols, dtype=torch.float8_e4m3fn)
+            self.wo_a_scale = torch.empty(rows // self._wo_a_block, cols // self._wo_a_block, dtype=torch.float8_e8m0fnu)
         else:
-            self.compressor = None
-        # indexer on index-source layers ([2,8,14,20,24,28,32,36]); non-index
-        # cr>0 layers consume the shared per-forward selection buffers
-        self.is_index_source = layer_id in args.indexer_layer_ids
-        if self.is_index_source:
-            self.indexer: V41Indexer | None = V41Indexer(
-                config, layer_id, args, quant_config=quant_config, prefix=f"{prefix}.indexer"
-            )
-        else:
-            self.indexer = None
+            self.wo_a = torch.empty(rows, cols, dtype=torch.bfloat16)
+        self.wo_b = LinearReplicated(args.o_groups * args.o_lora_rank, args.dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wo_b")
+        self.attn_sink = torch.empty(args.n_heads, dtype=torch.float32)
 
-        # two rope regimes: ratio-0 layers plain theta, ratio>0 layers the compressed-KV yarn
-        if self.compress_ratio:
-            original_seq_len, rope_theta = args.original_seq_len, args.compress_rope_theta
-        else:
-            original_seq_len, rope_theta = 0, args.rope_theta
-        self._freqs_params = (
-            self.rope_head_dim, args.max_seq_len, original_seq_len,
-            rope_theta, args.rope_factor, args.beta_fast, args.beta_slow,
-        )
-        self._freqs_cis: torch.Tensor | None = None
+        self.compressor = Compressor(args, self.layer_id, role.ratio, quant_config=quant_config, prefix=f"{prefix}.compressor") if role.mode is Mode.FULL else None
+        self.indexer = Indexer(args, role, quant_config=quant_config, prefix=f"{prefix}.indexer") if role.has_indexer else None
+        self._freqs_params = args.freqs_params(self.layer_id)
+        self._freqs: torch.Tensor | None = None
 
+    # addressing lives on the live backend, pool buffers on the live pool (both read per access)
     @property
     def attn(self):
         return get_global_ctx().attn_backend
 
-    def bind_pool(self, pool, device: torch.device, freqs_cis: torch.Tensor) -> None:
-        self._freqs_cis = freqs_cis
-        if self.compressor is not None:
-            self.compressor.bind_paged(pool, self.layer_id, freqs_cis, device, tier="attn")
-        if self.indexer is not None:
-            self.indexer.bind_pool(pool, freqs_cis)
+    @property
+    def freqs_key(self) -> tuple:
+        """The RoPE table this layer rotates with (window layers: base theta; compressing layers: the
+        compressed theta under YaRN). Layers with the same key share one table."""
+        return self._freqs_params
 
-    def reset(self) -> None:
-        if self.compressor is not None:
-            self.compressor.reset()
+    def bind(self, device: torch.device, tables: dict | None = None) -> None:
+        """Attach the RoPE table; ``tables`` (key -> table) lets the model share one table per key
+        instead of every layer holding its own ``[max_seq_len, rd // 2]`` copy."""
+        if tables is not None and self.freqs_key in tables:
+            self._freqs = tables[self.freqs_key]
+            return
+        rd, original_seq_len, theta, factor, beta_fast, beta_slow = self._freqs_params
+        self._freqs = get_freqs_cis(rd, self.args.max_seq_len, original_seq_len, theta, factor, beta_fast, beta_slow, device)
+        if tables is not None:
+            tables[self.freqs_key] = self._freqs
 
-    def _wo(self, o: torch.Tensor, seqlen: int) -> torch.Tensor:
-        o = o.reshape(1, seqlen, self.local_groups, -1)
-        wo_a = self.wo_a.view(self.local_groups, self.o_lora_rank, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, wo_a).flatten(2)
-        return self.wo_b.forward(o)
+    @property
+    def freqs(self) -> torch.Tensor:
+        assert self._freqs is not None, "attention layer is not bound (call bind first)"
+        return self._freqs
 
-    def _q_path(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-        """q [1, T, local_heads, 512] (the attend kernel's 4D contract), roped
-        (weightless per-head rms after wq_b)."""
-        rd = self.rope_head_dim
-        T = x.numel() // x.shape[-1]
-        q = self.q_norm.forward(self.wq_a.forward(x))
-        q = self.wq_b.forward(q).view(1, T, self.local_heads, self.head_dim)
-        apply_rotary_emb(q[..., -rd:], freqs)
-        return q
+    # ----- shared pieces -------------------------------------------------------------------
+    def _q(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        qr = self.q_norm.forward(self.wq_a.forward(x))
+        q = self.wq_b.forward(qr).unflatten(-1, (self.n_heads, self.head_dim))
+        return qr, q
 
-    def _kv_latent(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-        """The 512-wide kv latent, roped (this row goes to the layer's window ring).
+    def _kv(self, x: torch.Tensor) -> torch.Tensor:
+        return self.kv_norm.forward(self.wkv.forward(x))
 
-        Accepts 2D [T, dim] or 3D [1, T, dim] input; returns kv [T, 512] (2D) so
-        the store/attend paths keep their flat-token convention."""
-        rd = self.rope_head_dim
-        kv = self.kv_norm.forward(self.wkv.forward(x))
-        kv3 = kv.unsqueeze(0) if kv.dim() == 2 else kv
-        apply_rotary_emb(kv3[..., -rd:], freqs)
-        kv = kv.view(-1, self.head_dim)
-        # Reference _window_kv (model.py:707): the window K stays fp8, quantized over the
-        # whole post-rope vector (RoPE tail included) with block fp8_block_size=32.
-        act_quant_fp8_inplace(kv, 32)
-        return kv
+    def _wo(self, o: torch.Tensor) -> torch.Tensor:
+        """``wo_b(wo_a(o))``: up to ``GEMV_MAX_M`` rows the grouped W8A16 GEMV over the fp8 payload, else the
+        reference's grouped einsum over the bf16 (or dequantized) ``wo_a``."""
+        t = o.shape[0]
+        o = o.reshape(t, self.n_groups, -1)
+        if self._wo_a_block is not None and t <= GEMV_MAX_M:
+            return self.wo_b.forward(grouped_w8a16_gemv(o, self.wo_a, self.wo_a_scale, block=self._wo_a_block))
+        wo_a = self.wo_a if self._wo_a_block is None else dequant_block_fp8(self.wo_a, self.wo_a_scale, block=self._wo_a_block)
+        return self.wo_b.forward(torch.einsum("tgd,grd->tgr", o, wo_a.view(self.n_groups, self.o_lora_rank, -1)).flatten(1))
 
-    def _store_window(self, kv: torch.Tensor, segments) -> None:
-        slots = torch.cat([
-            self.attn.window_slots_of(ti, start_pos, start_pos + n)
-            for _off, n, ti, start_pos in segments
-        ])
-        self.attn.store_window(kv, self.layer_id, slots)
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
+        key = f"{prefix}.wo_a" if prefix else "wo_a"
+        scale_key = f"{key}_scale"
+        if self._wo_a_block is None and scale_key in state_dict:
+            # a bf16 layer (no fp8 scheme) fed a quantized checkpoint dequantizes wo_a on the way in
+            from .weight import dequant_fp8_block
 
-    def forward_ragged(self, x, segments, flat_positions, shared):
-        """Ragged batched prefill (V4 driver contract): x [1, T, dim]; per-request
-        segments (offset, extend_len, table_idx, start_pos); the compressor carry
-        runs PER REQUEST for isolation; one flat attend launch over all T queries.
-        ``shared`` carries the per-forward indexer selection buffers (topk picks +
-        candidate mask) from each index-source layer to its consumers."""
-        win = self.window_size
-        rd = self.rope_head_dim
-        device = x.device
-        _, T, _ = x.size()
-        decode_verify = get_global_ctx().dspark_decode_verify
-        if len(segments) == 1:
-            freqs = self._freqs_cis[segments[0][3] : segments[0][3] + T]
-        else:
-            freqs = self._freqs_cis.index_select(0, flat_positions)
+            state_dict[key] = dequant_fp8_block(state_dict[key], state_dict.pop(scale_key))
+        elif self._wo_a_block is not None and scale_key not in state_dict:
+            # an FTW conversion made before wo_a kept its fp8 payload carries a dequantized bf16
+            # tensor and no scale: say so instead of failing on the missing key
+            raise RuntimeError(
+                f"{key}: the checkpoint has no {scale_key} for the fp8 wo_a layout; an FTW checkpoint "
+                "converted by an earlier build stores wo_a dequantized -- reconvert it with `ft checkpoint`"
+            )
+        super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
 
-        qr = self.q_norm.forward(self.wq_a.forward(x))  # [1, T, q_lora]
-        q = self.wq_b.forward(qr).view(1, T, self.local_heads, self.head_dim)
-        apply_rotary_emb(q[..., -rd:], freqs)
-        kv = self._kv_latent(x, freqs)
-        self._store_window(kv, segments)
+    # ----- prefill -----------------------------------------------------------------------------
+    def publish_prefill(self, x: torch.Tensor, segments: List[PrefillSegment]) -> None:
+        """Full mode: compress this layer's input for every segment into the source's main KV and
+        index keys. Runs on EVERY new token (under bounded replay the decoder source publishes for
+        the whole prompt even though its attention runs on the prompt's last window only)."""
+        assert self.compressor is not None and self.indexer is not None
+        attn, ratio, src = self.attn, self.role.ratio, self.layer_id
+        for seg in segments:
+            slots = attn.window_slots_of(seg.table_idx, seg.start_pos, seg.end)
+            tail = None
+            if self.compressor.needs_tail_carry(seg.start_pos):
+                tail = int(attn.window_slots_of(seg.table_idx, seg.start_pos - 1, seg.start_pos).item())
+            latent, starts = self.compressor.forward_prefill(x[seg.offset : seg.offset + seg.n], seg.start_pos, slots, tail)
+            if not latent.shape[0]:
+                continue
+            rows = attn.compressed_rows_of(seg.table_idx, starts, ratio)
+            freqs = self.freqs.index_select(0, starts)
+            attn.store_index(self.indexer.index_keys(latent, freqs), src, rows)
+            apply_rotary_emb(latent[..., -self.rope_dim :], freqs)
+            attn.store_main(latent, src, rows)
 
-        win_parts: list[torch.Tensor] = []
-        cmp_parts: list[torch.Tensor] = []
-        max_c = 0
-        for seg_i, (off, n, ti, start_pos) in enumerate(segments):
-            slots = self.attn.window_slots_of(ti, start_pos, start_pos + n)
-            if decode_verify:
-                # decode shares the plain-decode reduction: ring slot j (not ascending position)
-                win_global = self.attn.window_ring_cols(ti, start_pos, n)
-            elif start_pos == 0:
-                win_cols = get_window_topk_idxs(win, 1, n, 0).to(device)
-                win_global = self.attn.win_cols_to_global(win_cols, slots)
+    def forward_prefill(self, x: torch.Tensor, segments: List[PrefillSegment], positions: torch.Tensor) -> torch.Tensor:
+        """Ragged prefill over ``x [T, dim]`` tiled by ``segments`` (``positions [T]`` absolute)."""
+        attn, role = self.attn, self.role
+        freqs = self.freqs.index_select(0, positions)
+        qr, q = self._q(x)
+        apply_rotary_emb(q[..., -self.rope_dim :], freqs)
+        kv = self._kv(x)
+        apply_rotary_emb(kv[..., -self.rope_dim :], freqs)
+
+        sel = attn.selection
+        win_parts, cmp_parts, pools = [], [], []
+        for seg in segments:
+            lo, hi = seg.offset, seg.offset + seg.n
+            attn.store_window(kv[lo:hi], self.layer_id, attn.layer_window_slots_of(self.layer_id, seg.table_idx, seg.start_pos, seg.end))
+            win_parts.append(attn.window_topk_prefill(seg, self.layer_id))
+            if not role.compresses:
+                continue
+            if role.has_indexer:
+                locs = attn.locs_prefill(seg.table_idx, seg.end // role.ratio * role.ratio)
+                cand = sel.candidates[:, lo:hi] if role.uses_candidates else None
+                rows, pool = self.indexer.select_prefill(
+                    x[lo:hi], qr[lo:hi], freqs[lo:hi], start_pos=seg.start_pos, ratio=role.ratio, locs=locs, candidates=cand,
+                )
+                cmp_parts.append(rows)
+                if pool is not None:
+                    pools.append(pool)
             else:
-                w_lo = max(0, start_pos - win + 1)
-                ws_pool = self.attn.window_slots_of(ti, w_lo, start_pos + n)
-                abs_p = start_pos + torch.arange(n, device=device).unsqueeze(1)
-                cand = (abs_p - win + 1).clamp(min=w_lo) + torch.arange(win, device=device)
-                win_cols = torch.where(cand > abs_p, -1, cand - w_lo).unsqueeze(0)
-                win_global = self.attn.win_cols_to_global(win_cols, ws_pool)
-            win_parts.append(win_global)
+                assert sel.source == role.kv_source, "Reuse layer without a published selection for its source"
+                cmp_parts.append(sel.topk_rows[:, lo:hi])
+        if role.has_indexer:
+            sel.source, sel.topk_rows = role.kv_source, torch.cat(cmp_parts, dim=1)
+            if pools:
+                sel.candidates = torch.cat(pools, dim=1)
+        win = torch.cat(win_parts, dim=1)
+        topk = torch.cat([win, torch.cat(cmp_parts, dim=1)], dim=-1) if role.compresses else win
 
-            if self.src_ratio:
-                x_seg = x[:, off : off + n]
-                if self.is_kv_source:
-                    if start_pos == 0:
-                        self.reset()
-                        latent = self.compressor.compute(x_seg, 0, slots, ti=ti)
-                    else:
-                        tail_ws = int(self.attn.window_slots_of(ti, start_pos - 1, start_pos).item())
-                        latent = self.compressor.compute_extend(
-                            x_seg, start_pos, slots, tail_window_slot=tail_ws, ti=ti,
-                            capture=get_global_ctx().dspark_carry_capture,
-                        )
-                    if self.indexer is not None:
-                        self.indexer.write_k_prefill(latent, start_pos, ti)
-                    self.compressor.finalize(latent, start_pos, ti)
-                if self.indexer is not None:
-                    qr_seg = qr[:, off : off + n]
-                    cmp_global = self.indexer.prefill_select(
-                        x_seg, qr_seg, start_pos, n, ti, seg_i, shared
-                    )
-                else:
-                    # consumer: the index source's picks for this segment's tokens
-                    # (already translated to global rows by the index source)
-                    cmp_global = shared["topk"][:, off : off + n]
-                cmp_parts.append(cmp_global)
-                max_c = max(max_c, cmp_global.shape[-1])
+        o = attn.attend(q.unsqueeze(0), self.layer_id, topk.to(torch.int32), self.window, self.attn_sink, self.softmax_scale)[0]
+        apply_rotary_emb(o[..., -self.rope_dim :], freqs, inverse=True)
+        return self._wo(o)
 
-        topk_parts = []
-        for i, (_off, _n, _ti, _start) in enumerate(segments):
-            wg = win_parts[i]
-            if wg.shape[-1] < win and len(segments) > 1:
-                wg = F.pad(wg, (0, win - wg.shape[-1]), value=-1)
-            parts = [wg]
-            if self.src_ratio:
-                cg = cmp_parts[i]
-                if cg.shape[-1] < max_c:
-                    cg = F.pad(cg, (0, max_c - cg.shape[-1]), value=-1)
-                parts.append(cg)
-            topk_parts.append(torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0])
-        topk_idxs = (topk_parts[0] if len(topk_parts) == 1 else torch.cat(topk_parts, dim=1)).int()
-        # bs>1 pads the window half to the full window; bs==1 keeps the segment's
-        # natural width (a cold prompt shorter than the window yields < win columns)
-        n_window = win if len(segments) > 1 else win_parts[0].shape[-1]
-        if self.indexer is not None and self.src_ratio:
-            # the flat picks buffer for this index source's consumers (uniform
-            # topk width — the pad above already applied per segment)
-            shared["topk"] = torch.cat(
-                [p if p.shape[-1] == max_c else F.pad(p, (0, max_c - p.shape[-1]), value=-1)
-                 for p in cmp_parts], dim=1
-            ).int()
-
-        o = self.attn.attend(
-            q, self.layer_id, topk_idxs, n_window, self.attn_sink[self._sink_slice],
-            self.softmax_scale, has_compression=bool(self.src_ratio),
-            allow_multi_query_split=decode_verify and len(segments) == 1,
-        )  # [1, T, local_heads, 512]
-        apply_rotary_emb(o[..., -rd:], freqs, True)
-        return self._wo(o, T)
-
-    def decode_step(self, x, pos, rows, cmp_stage_cap, wctx=None, shared=None):
-        """Batched single-token attention (EAGER/graph); V4 driver contract."""
-        B = x.size(0)
-        win = self.window_size
-        rd = self.rope_head_dim
-        device = x.device
-        if wctx is None:
-            wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
-        window_slots, prev_window_slots, window_slots_topk = wctx
-        freqs_t = self._freqs_cis.index_select(0, pos)
-
-        qr = self.q_norm.forward(self.wq_a.forward(x))  # [B, q_lora]
-        q = self.wq_b.forward(qr).view(B, self.local_heads, self.head_dim)
-        q4 = q.view(1, B, self.local_heads, self.head_dim)
-        apply_rotary_emb(q4[..., -rd:], freqs_t)
-        kv = self._kv_latent(x, freqs_t)
-        self.attn.store_window(kv, self.layer_id, window_slots)
+    # ----- decode ------------------------------------------------------------------------------
+    def forward_decode(self, x: torch.Tensor, pos: torch.Tensor, rows: torch.Tensor, dctx: "DecodeStepContext", cmp_stage_cap: int) -> torch.Tensor:
+        """Batched single-token attention. ``pos [B]`` device positions, ``rows [B]`` local rows into
+        the decode snapshot, ``dctx`` the step's layer-invariant context (ring slots, window
+        candidates, RoPE rows), ``cmp_stage_cap`` the static compressed staging bound (max position
+        any row reaches; the capture width under a graph)."""
+        attn, role = self.attn, self.role
+        B = x.shape[0]
+        freqs_t = dctx.freqs[self.freqs_key]
+        qr, q = self._q(x)
+        apply_rotary_emb_decode(q[..., -self.rope_dim :].unsqueeze(1), freqs_t)
+        kv = self._kv(x)
+        apply_rotary_emb_decode(kv[..., -self.rope_dim :].unsqueeze(1), freqs_t)
+        # the shared ring context feeds the compressor's carry ring on every layer; a request-private
+        # window layer stores and reads its own KV through its ring context instead
+        window_slots, prev_window_slots = dctx.window_slots, dctx.prev_window_slots
+        private = dctx.private is not None and attn.pool.is_private_window(self.layer_id)
+        tier = dctx.private if private else dctx.shared
+        attn.store_window(kv, self.layer_id, tier.slots if private else window_slots)
 
         cmp_counts = None
-        if self.src_ratio:
-            if self.is_kv_source:
-                latent, should = self.compressor.decode_step(x, pos, prev_window_slots, window_slots, rows)
-                if self.indexer is not None:
-                    self.indexer.write_k_decode(latent, should, pos, rows)
-            if self.indexer is not None:
-                compress_global, cmp_counts = self.indexer.decode_select(
-                    x, qr, pos, latent if self.is_kv_source else None,
-                    should if self.is_kv_source else None,
-                    rows, shared, cmp_stage_cap,
-                )
-                # publish for this index source's consumers (21-23 read 20, …)
-                shared["topk"] = compress_global
-                shared["cmp_counts"] = cmp_counts
+        if role.compresses:
+            ratio, src = role.ratio, role.kv_source
+            n_stage = (cmp_stage_cap + 1) // ratio
+            sel = attn.selection
+            if role.mode is Mode.FULL:
+                latent, completed = self.compressor.forward_decode(x, pos, prev_window_slots, window_slots)
+                dst = attn.decode_store_rows(rows, pos, ratio, src, completed)
+                freqs_g = self.freqs.index_select(0, (pos + 1 - ratio).clamp_min(0))
+                k = self.indexer.k_norm.forward(self.indexer.wk.forward(latent))
+                apply_rotary_emb_decode(k[..., -self.rope_dim :].unsqueeze(1), freqs_g)
+                attn.store_index(k, src, dst)
+                apply_rotary_emb_decode(latent[..., -self.rope_dim :].unsqueeze(1), freqs_g)
+                attn.store_main(latent, src, dst)
+            if role.has_indexer:
+                cand = sel.candidates if role.uses_candidates else None
+                cmp_rows, counts, pool = self.indexer.select_decode(x, qr, freqs_t, pos=pos, ratio=ratio, locs=attn.snapshot(), T=n_stage, candidates=cand)
+                sel.source, sel.topk_rows, sel.cmp_counts = src, cmp_rows, counts
+                if pool is not None:
+                    sel.candidates = pool
+                # the step's [window | compressed] candidate buffer of this tier takes the new rows once;
+                # the Reuse layers that follow read them in place (no per-layer cat / cast)
+                tier.topk[..., self.window :].copy_(cmp_rows)
             else:
-                compress_global = shared["topk"]  # [B, 1, topk], already global
-                cmp_counts = shared["cmp_counts"]
-            topk_idxs = torch.cat([window_slots_topk, compress_global], dim=-1)
+                assert sel.source == src, "Reuse layer without a published selection for its source"
+                counts = sel.cmp_counts
+            topk = tier.topk
+            cmp_counts = counts
         else:
-            topk_idxs = window_slots_topk
-        topk_idxs = topk_idxs.int()
+            topk = tier.window_topk
 
-        o = self.attn.attend(
-            q4, self.layer_id, topk_idxs, win, self.attn_sink[self._sink_slice],
-            self.softmax_scale, cmp_counts=cmp_counts, has_compression=bool(self.src_ratio),
-        )  # [1, B, local_heads, 512]
-        apply_rotary_emb(o[..., -rd:], freqs_t, True)
-        return self._wo(o, B)
+        o = attn.attend(q.view(B, 1, self.n_heads, self.head_dim), self.layer_id, topk, self.window, self.attn_sink, self.softmax_scale, cmp_counts=cmp_counts)
+        apply_rotary_emb_decode(o[..., -self.rope_dim :], freqs_t, inverse=True)
+        return self._wo(o.view(B, self.n_heads, self.head_dim))
 
 
-__all__ = ["Attention"]
+@dataclass
+class TierCandidates:
+    """One window tier's per-step decode candidates: the request's store slot and the int32
+    ``[B, 1, win]`` window candidates, plus the ``[B, 1, win + topk]`` ``[window | compressed]``
+    buffer whose compressed half the index layers of that tier fill as they publish."""
+
+    slots: torch.Tensor
+    window_topk: torch.Tensor
+    topk: torch.Tensor
+
+
+@dataclass
+class DecodeStepContext:
+    """Everything a decode step resolves once for all layers (a capture records it once): the shared
+    pool's ring slots (the compressor's carry ring keys on them), the shared / private tier
+    candidates, and each RoPE table gathered at the step's positions."""
+
+    window_slots: torch.Tensor
+    prev_window_slots: torch.Tensor
+    shared: TierCandidates
+    private: TierCandidates | None
+    freqs: dict
+
+    @classmethod
+    def build(cls, layers, md, pos: torch.Tensor, rows: torch.Tensor, window: int, topk: int) -> "DecodeStepContext":
+        B = pos.shape[0]
+
+        def tier(slots, window_topk):
+            win32 = window_topk.to(torch.int32)
+            buf = torch.empty((B, 1, window + topk), dtype=torch.int32, device=pos.device)
+            buf[..., :window].copy_(window_topk)
+            return TierCandidates(slots, win32, buf)
+
+        window_slots, prev_window_slots, window_topk = md.window_ctx(pos, rows)
+        private = None
+        if get_global_ctx().kv_cache.private_window_layer_ids:
+            private = tier(*md.private_window_ctx(pos, rows))
+        tables: dict = {}
+        for layer in layers:
+            key = layer.freqs_key
+            if key not in tables:
+                tables[key] = layer.freqs.index_select(0, pos)
+        return cls(window_slots, prev_window_slots, tier(window_slots, window_topk), private, tables)
+
+
+__all__ = ["DSV41Attention", "DecodeStepContext", "TierCandidates"]

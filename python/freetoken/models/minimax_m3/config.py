@@ -1,10 +1,9 @@
 """Engine-facing config for MiniMax-M3 (``minimax_m3``).
 
 The checkpoint is a multimodal wrapper (``model_type=minimax_m3_vl``): the text tower
-lives in ``text_config`` and the weights carry a ``language_model.`` prefix. FreeToken
-serves the text tower; the ViT vision stack (``vision_tower.`` / projector) is skipped
-at load like the other VL checkpoints' (``VISION_KEY_PREFIXES``) -- multimodal input
-is future work, so ``ModelConfig.vision_config`` stays None here.
+lives in ``text_config`` and the weights carry a ``language_model.`` prefix. Its vision
+section becomes ``ModelConfig.vision_config`` for the tower in vision.py; an engine that
+builds no vision encoder hands parse_config a config without that section.
 
 Attention is GQA with block-sparse selection on the trailing layers: parse_config
 declares ONE full-attention group over all layers carrying ``mla=False`` plus the
@@ -27,6 +26,7 @@ their swigluoai activation restricts the NVFP4 GEMM backend to the Triton kernel
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Any
 
 from freetoken.models.config import (
@@ -34,40 +34,81 @@ from freetoken.models.config import (
     ModelConfig,
     RotaryConfig,
 )
+from freetoken.utils import init_logger
 
 from .args import load_args
+
+logger = init_logger(__name__)
+
+# the config names only the image token; the reference processor reads these two from the tokenizer's fixed added tokens
+IMAGE_START_ID = 200029  # ]<]start of image[>[
+IMAGE_END_ID = 200030  # ]<]end of image[>[
+
 
 def _text_config(hf_config: Any) -> Any:
     return getattr(hf_config, "text_config", None) or hf_config
 
 
-# House rule: an env switch that changes WHAT IS SERVED must leave a server-log
-# trace. parse_config runs a few times per process (engine + weight loader), so
-# each resolved-mode line is logged once per distinct value.
-_LOGGED_MODES: set = set()
+@dataclass(frozen=True)
+class VisionConfig:
+    hidden_size: int
+    num_layers: int
+    num_heads: int
+    intermediate_size: int
+    num_channels: int
+    patch_size: int
+    temporal_patch_size: int
+    spatial_merge_size: int
+    layer_norm_eps: float
+    rope_theta: float
+    projector_hidden_size: int
+    text_hidden_size: int
 
 
-def _log_mode_once(key: str, message: str) -> None:
-    if key in _LOGGED_MODES:
-        return
-    _LOGGED_MODES.add(key)
-    from freetoken.utils import init_logger
+def _compression(vc: Any, key: str) -> int:
+    """The native vision config carries the merge sizes flat; the checkpoint's own config nests them under img_token_compression_config."""
+    value = getattr(vc, key, None)
+    return int(vc.img_token_compression_config[key] if value is None else value)
 
-    init_logger(__name__).info(message)
+
+def parse_vision_config(hf_config: Any) -> VisionConfig | None:
+    """None when the config carries no vision section, which is how a text-only engine asks for no tower."""
+    vc = getattr(hf_config, "vision_config", None)
+    if vc is None:
+        return None
+    if vc.hidden_act != "gelu":
+        raise NotImplementedError(f"minimax_m3 vision tower activation {vc.hidden_act!r}; only gelu is implemented")
+    # the native config moves rope_theta into rope_parameters; the checkpoint's own config keeps it flat
+    rope_params = getattr(vc, "rope_parameters", None) or {}
+    text_hidden_size = _text_config(hf_config).hidden_size
+    return VisionConfig(
+        hidden_size=vc.hidden_size,
+        num_layers=vc.num_hidden_layers,
+        num_heads=vc.num_attention_heads,
+        intermediate_size=vc.intermediate_size,
+        num_channels=vc.num_channels,
+        patch_size=vc.patch_size,
+        temporal_patch_size=_compression(vc, "temporal_patch_size"),
+        spatial_merge_size=_compression(vc, "spatial_merge_size"),
+        layer_norm_eps=vc.layer_norm_eps,
+        rope_theta=float(rope_params["rope_theta"] if "rope_theta" in rope_params else vc.rope_theta),
+        projector_hidden_size=getattr(hf_config, "projector_hidden_size", None) or text_hidden_size,
+        text_hidden_size=text_hidden_size,
+    )
 
 
 def parse_config(hf_config: Any) -> ModelConfig:
     text = _text_config(hf_config)
 
     num_layers = text.num_hidden_layers
+    # House rule: an env switch that changes WHAT IS SERVED must leave a server-log trace; parse_config runs a few times per process.
     # Dev/testing only: cap the layer count (e.g. FREETOKEN_M3_MAX_LAYERS=5 -> 3 dense
     # + 2 MoE layers) so the forward path / KV / offload cache can be exercised without
     # pinning the full ~230 GB of experts. Unset in normal use (GLM-5.2 precedent).
     _cap = os.environ.get("FREETOKEN_M3_MAX_LAYERS")
     if _cap and int(_cap) < num_layers:  # a cap >= the real count changes nothing
         num_layers = int(_cap)
-        _log_mode_once(
-            f"cap={num_layers}",
+        logger.info_once(
             f"FREETOKEN_M3_MAX_LAYERS: serving a TRUNCATED model "
             f"({num_layers}/{text.num_hidden_layers} layers) -- dev/testing only, "
             "outputs are garbage; unset the env for real serving.",
@@ -75,8 +116,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
 
     sparse_enabled = os.getenv("FREETOKEN_M3_SPARSE", "1") != "0"
     if not sparse_enabled:
-        _log_mode_once(
-            "sparse=0",
+        logger.info_once(
             "FREETOKEN_M3_SPARSE=0: serving the DENSE-attention ablation (plain "
             "MHA pool, no indexer; different math and outputs from the shipped "
             "block-sparse model).",
@@ -190,7 +230,10 @@ def parse_config(hf_config: Any) -> ModelConfig:
         dense_quant="mxfp8" if dense_mxfp8 else "none",
         lm_head_quant="none",
         m3_args=args,
+        vision_config=parse_vision_config(hf_config),
+        # the native config maps image_token_id onto the checkpoint's image_token_index
+        image_token_id=getattr(hf_config, "image_token_id", getattr(hf_config, "image_token_index", None)),
     )
 
 
-__all__ = ["parse_config"]
+__all__ = ["IMAGE_END_ID", "IMAGE_START_ID", "VisionConfig", "parse_config", "parse_vision_config"]

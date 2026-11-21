@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+import torch
 
 from freetoken.layers import (
     BaseOP,
@@ -33,11 +35,59 @@ class BaseLLMModel(ABC, BaseOP):
         yield
 
 
+@runtime_checkable
+class SupportsMultimodal(Protocol):
+    """What the engine asks of a model that serves multimodal items; the text forward takes its token embeddings from embed_input_ids."""
+
+    def encode(self, item: MMItem) -> torch.Tensor:
+        """``[item.num_tokens, D]`` soft tokens for one item of any modality the family serves, on the model device."""
+        ...
+
+    def place_encoder_weights(self, mode: str) -> None:
+        """Every encoder tower's weights: ``gpu`` resident or ``host`` streamed from pinned banks."""
+        ...
+
+
+class FeatureSink(Protocol):
+    """Where a forward hands per-row hidden states to a draft model; set on ``batch.features``.
+
+    A CUDA graph replays the sink it was captured with, never the one set at replay: write only to buffers the draft owns, keep no per-step state on the sink.
+    """
+
+    wanted_layers: frozenset[int]
+
+    def final_hidden(self, x: torch.Tensor) -> None:
+        """Every row's final hidden state, once per forward: the LM head's input, or what the model hands over itself before the head."""
+        ...
+
+    def layer_output(self, layer_id: int, x: torch.Tensor, residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
+        """A layer's output rows, ``x + residual`` (``x`` alone when ``residual`` is None), ``[T, num_streams*H]`` stream-major; called only for layers in ``wanted_layers``. The sum is left to the sink, so it adds only the rows it keeps. The forward may overwrite ``x`` and ``residual`` afterwards, so copy what is kept."""
+        ...
+
+
+def embed_input_ids(embed_tokens, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+    """Token embeddings of the batch; on a chunk with multimodal rows, batch.mm_embeds' leading columns replace the rows batch.mm_rows."""
+    if batch.mm_embeds is None:
+        return embed_tokens.forward(input_ids)
+    # multimodal rows carry content pad ids above the vocab: clamp for the lookup, the copy overwrites those rows
+    x = embed_tokens.forward(input_ids.clamp(max=embed_tokens.num_embeddings - 1))
+    x.index_copy_(0, batch.mm_rows, batch.mm_embeds[:, : x.shape[1]].to(x.dtype))
+    return x
+
+
 class GatedMLP(BaseOP):
-    def __init__(self, config: ModelConfig, *, quant_config: QuantConfig | None = None, prefix: str = ""):
+    def __init__(
+        self,
+        config: ModelConfig,
+        *,
+        intermediate_size: int | None = None,
+        quant_config: QuantConfig | None = None,
+        prefix: str = "",
+    ):
+        intermediate_size = intermediate_size or config.intermediate_size
         self.gate_up_proj = LinearColParallelMerged(
             config.hidden_size,
-            [config.intermediate_size, config.intermediate_size],
+            [intermediate_size, intermediate_size],
             has_bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
@@ -49,7 +99,7 @@ class GatedMLP(BaseOP):
             raise ValueError(f"Unsupported activation function: {config.hidden_act}")
         self.act_fn = act_fn
         self.down_proj = LinearRowParallel(
-            config.intermediate_size,
+            intermediate_size,
             config.hidden_size,
             has_bias=False,
             quant_config=quant_config,

@@ -22,14 +22,16 @@ from freetoken.kernel.aot_models import expert_bank_row_bytes
 from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
 from freetoken.models.qwen4_exp.config import parse_config
 from freetoken.models.qwen4_exp.weight import (
-    _NVFP4_SOURCE_SPEC,
     _ZERO_CENTERED_NORM_SUFFIXES,
     iter_weights,
     load_ple_table,
+    nvfp4_expert_spec,
 )
 from freetoken.moe.expert_banks import build_expert_banks
 from freetoken.moe.host_banks import HostResidency
 from freetoken.utils import cached_load_hf_config
+
+from .common import install_quant_config, meta_state_dict
 
 MODEL_PATH = os.environ.get("FREETOKEN_QWEN4EXP_MODEL")
 pytestmark = [
@@ -166,8 +168,9 @@ def dense_pass() -> tuple[list[str], dict[str, torch.Tensor]]:
     wanted = {name for name, _raw, _mode in SAMPLES}
     names: list[str] = []
     sampled: dict[str, torch.Tensor] = {}
+    install_quant_config(MODEL_PATH)
     for name, tensor in iter_weights(
-        MODEL_PATH, torch.device("cpu"), include_moe_experts=True, include_non_moe=True
+        MODEL_PATH, torch.device("cpu"), include_moe_experts=True, include_non_moe=True, include_vision=False
     ):
         names.append(name)
         if name in wanted or name.endswith(_ZERO_CENTERED_NORM_SUFFIXES):
@@ -190,27 +193,12 @@ def test_emitted_names_are_unique_and_complete(dense_pass):
 @pytest.fixture(scope="module")
 def model_state_dict_keys() -> set[str]:
     """Keys ``Qwen4ExpForCausalLM`` declares -- the authoritative target the loader must fill."""
-    from freetoken.layers import rotary
-    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
-
-    config = parse_config(cached_load_hf_config(MODEL_PATH))
-    saved = rotary._ROPE_DEVICE
-    rotary.set_rope_device(torch.device("cpu"))  # get_rope refuses to build on meta
-    rotary.get_rope.cache_clear()
-    try:
-        with torch.device("meta"):
-            return set(Qwen4ExpForCausalLM(config).state_dict())
-    finally:
-        rotary.set_rope_device(saved)
-        rotary.get_rope.cache_clear()
+    return set(meta_state_dict(MODEL_PATH))
 
 
 def test_emitted_names_are_the_model_state_dict(dense_pass, model_state_dict_keys):
     names, _sampled = dense_pass
-    # The routed NVFP4 experts come from the offload source banks, never from the dense pass.
-    expected = {k for k in model_state_dict_keys
-                if not k.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.down_proj"))}
-    assert set(names) == expected
+    assert set(names) == model_state_dict_keys
 
 
 def test_every_zero_centered_norm_is_present_and_raw(dense_pass, reader):
@@ -275,7 +263,7 @@ def test_ple_table_loads_pinned_and_matches_the_checkpoint(reader):
 
     # The two pinned host allocations the engine must budget for.
     total = PLE_BYTES + NUM_LAYERS * EXPERT_LAYER_BYTES
-    assert abs(total / 2**30 - 111.14) < 0.05
+    assert abs(total / 2**30 - 111.32) < 0.05
 
 
 @pytest.fixture(scope="module")
@@ -283,8 +271,9 @@ def layer0_expert_banks():
     """The real NVFP4 source-bank loader, restricted to layer 0 (1.32 GiB instead of 63.5)."""
     if not torch.cuda.is_available():
         pytest.skip("expert bank pinning needs CUDA")
+    install_quant_config(MODEL_PATH)
     spec = dataclasses.replace(
-        _NVFP4_SOURCE_SPEC, layer_to_bank=lambda layer, config: 0 if layer == 0 else None
+        nvfp4_expert_spec(MODEL_PATH, None), layer_to_bank=lambda layer, config: 0 if layer == 0 else None
     )
     config = SimpleNamespace(num_experts=E, hidden_size=H, moe_intermediate_size=I,
                              num_moe_layers=1)
@@ -324,14 +313,14 @@ def test_sampled_experts_match_the_checkpoint(layer0_expert_banks, reader):
             scale = reader.get(f"{base}.{proj}.weight_scale")
             assert torch.equal(banks[bank][0][expert][rows].reshape(-1).view(torch.uint8),
                                scale.reshape(-1).view(torch.uint8))
-        gate_g = reader.get(f"{base}.gate_proj.weight_scale_2").to(torch.float16)
+        gate_g = reader.get(f"{base}.gate_proj.weight_scale_2").to(torch.float32)
         assert torch.equal(banks["gate_up_global"][0][expert, :I], gate_g.reshape(1).expand(I))
 
 
 def test_expert_bank_bytes_match_the_aot_row_table(layer0_expert_banks):
     measured = sum(t[0].numel() * t[0].element_size() for t in layer0_expert_banks.values())
     assert measured == EXPERT_LAYER_BYTES
-    assert abs(NUM_LAYERS * EXPERT_LAYER_BYTES / 2**30 - 63.46) < 0.05
+    assert abs(NUM_LAYERS * EXPERT_LAYER_BYTES / 2**30 - 63.63) < 0.05
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="dummy banks are pinned")
@@ -350,9 +339,17 @@ def test_rename_maps_vision_only_when_included():
     assert _rename("model.visual.blocks.0.attn.qkv.weight") is None
     assert (
         _rename("model.visual.blocks.0.attn.qkv.weight", include_vision=True)
-        == "vision_tower.blocks.0.attn.qkv.weight"
+        == "visual.blocks.0.attn.qkv.weight"
     )
     assert (
         _rename("model.visual.merger.linear_fc1.weight", include_vision=True)
-        == "vision_tower.merger.linear_fc1.weight"
+        == "visual.merger.linear_fc1.weight"
     )
+
+
+def test_rename_ftw_weight_maps_the_old_tower_prefix():
+    from freetoken.models.qwen4_exp.weight import rename_ftw_weight
+
+    assert rename_ftw_weight("vision_tower.blocks.0.attn.qkv.weight") == "visual.blocks.0.attn.qkv.weight"
+    assert rename_ftw_weight("visual.merger.norm.weight") == "visual.merger.norm.weight"
+    assert rename_ftw_weight("model.layers.0.mlp.gate.weight") == "model.layers.0.mlp.gate.weight"

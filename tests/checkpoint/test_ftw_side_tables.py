@@ -71,7 +71,7 @@ def test_side_table_files_on_a_missing_dir_is_empty(tmp_path):
 
 
 def test_checkpoint_cli_forwards_side_payload_flags(monkeypatch, tmp_path):
-    """--include-engram / --include-dspark reach convert_checkpoint; default off."""
+    """--include-engram reaches convert_checkpoint; default off."""
     from freetoken.checkpoint import __main__ as cli
 
     captured: dict = {}
@@ -85,17 +85,15 @@ def test_checkpoint_cli_forwards_side_payload_flags(monkeypatch, tmp_path):
             "shards": [],
             "quant_format": None,
             "fingerprint": None,
-            "includes": {"engram": kw.get("include_engram"), "dspark": kw.get("include_dspark")},
+            "includes": {"engram": kw.get("include_engram")},
         }
 
     monkeypatch.setattr(cli, "convert_checkpoint", fake_convert)
     monkeypatch.setattr(cli, "assign_gpu", lambda gpu: None)
     monkeypatch.setattr(cli, "bind_assigned_gpu", lambda: type("B", (), {"index": 0})())
 
-    assert cli.main(["--model", "src", "--out", "dst", "--include-engram", "--include-dspark"]) == 0
+    assert cli.main(["--model", "src", "--out", "dst", "--include-engram"]) == 0
     assert captured["include_engram"] is True
-    assert captured["include_dspark"] is True
 
     assert cli.main(["--model", "src", "--out", "dst"]) == 0
     assert captured["include_engram"] is False
-    assert captured["include_dspark"] is False

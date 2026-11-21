@@ -1,4 +1,4 @@
-"""Speculative-round page accounting (MTP / DSpark rollback boundary).
+"""Speculative-round page accounting (MTP rollback boundary).
 
 The verify forward allocates pages over the whole `[C, C+k+1)` range. After publishing
 the accepted drafts the round must roll back to the COMMITTED prefix (`rext_end`), not to

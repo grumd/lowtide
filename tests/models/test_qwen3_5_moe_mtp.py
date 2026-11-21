@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from freetoken.distributed import set_tp_info
 from freetoken.models.qwen3_5_moe.config import parse_config
 from freetoken.models.qwen3_5_moe.mtp import Qwen3_5MTP
-from freetoken.models.qwen3_5_moe.weight import _is_gemma_norm, _rename
+from freetoken.models.qwen3_5_moe.weight import _rename
 
 
 def _set_tp(rank: int, size: int) -> None:
@@ -75,15 +75,6 @@ def test_rename_keeps_mtp_only_when_enabled():
     assert _rename("model.language_model.layers.0.mlp.down_proj.weight") == (
         "model.layers.0.mlp.down_proj.weight"
     )
-
-
-def test_mtp_norms_are_gemma_ones():
-    assert _is_gemma_norm("mtp.norm.weight")
-    assert _is_gemma_norm("mtp.pre_fc_norm_embedding.weight")
-    assert _is_gemma_norm("mtp.pre_fc_norm_hidden.weight")
-    assert _is_gemma_norm("mtp.layers.0.input_layernorm.weight")
-    assert _is_gemma_norm("mtp.layers.0.self_attn.q_norm.weight")
-    assert not _is_gemma_norm("mtp.fc.weight")
 
 
 def test_mtp_module_shapes():

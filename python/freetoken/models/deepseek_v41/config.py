@@ -1,93 +1,99 @@
 """Engine-facing config for DeepSeek-V4.1-Flash.
 
-``parse_config`` maps the transformer fields the engine needs into
-:class:`ModelConfig` and carries the full :class:`DeepseekV41Args` in
-``ModelConfig.dsv41_args`` (engram / DSpark / CSA2 geometry rides along inertly
-until their phases land — the DSV4.1 plan).
-
-Phase 3 attention: the DSV4 machinery (paged window ring + per-kv-source
-compressed caches, ratios 0/1/2) via ``DSV4AttentionGroupConfig`` and
-``ModelConfig.dsv4_args`` — the engine's DSV4 plumbing (pool class, sizing,
-_adjust_dsv4_config) reads the dsv4_args payload, so V4.1 rides it directly.
-``dsv41_args`` is the same object under the family's name. The learned
-indexer (top-512 + candidate filter) is Phase 3b; Phase 3a selects compressed
-candidates statically (all blocks — V4's own no-indexer mechanism).
+``parse_config`` maps the standard transformer fields into :class:`ModelConfig`, carries the full
+:class:`DeepseekV41Args` in ``ModelConfig.dsv41_args`` for the model module and the KV pool (which
+sizes its tiers from it), and declares the ``v41`` variant of the DSV4 attention group.
+The engine reconciles the runtime knobs (``max_seq_len``, ``swa_decoder_replay``) onto ``dsv41_args``
+at config resolution.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, fields
 from typing import Any
 
-from freetoken.models.config import (
-    DSV4AttentionGroupConfig,
-    ModelConfig,
-    RotaryConfig,
-)
+from freetoken.models.config import DSV4AttentionGroupConfig, ModelConfig, RotaryConfig
 
-from .args import load_args
+from .args import DeepseekV41Args
 
 
-def parse_config(hf_config: Any) -> ModelConfig:
-    args = load_args(hf_config)
+@dataclass(frozen=True)
+class VisionConfig:
+    num_hidden_layers: int = 32
+    hidden_size: int = 1024
+    num_attention_heads: int = 16
+    intermediate_size: int = 2816
+    patch_size: int = 14
+    rope_theta: float = 10000.0
+    downsample_ratio: int = 3
+    max_image_tokens: int = 1024
+    min_pixels: int = 544 * 544
+    max_wh_ratio: float | None = None
 
-    rope_scaling = {
-        "rope_type": "yarn",
-        "factor": args.rope_factor,
-        "beta_fast": args.beta_fast,
-        "beta_slow": args.beta_slow,
-        "original_max_position_embeddings": args.original_seq_len,
-    }
-    rotary = RotaryConfig(
-        head_dim=args.head_dim,
-        # the module owns its rope (trailing 64 dims, two regimes); the group's
-        # rotary_config stays for the pool/engine surface
-        rotary_dim=args.qk_rope_head_dim,
-        max_position=args.max_position_embeddings,
-        base=args.rope_theta,
-        scaling=rope_scaling,
-    )
-    layer_ids = tuple(range(args.n_layers))
 
+def model_config_from_args(args: DeepseekV41Args, *, max_position: int, vision: VisionConfig | None = None, image_token_id: int | None = None) -> ModelConfig:
+    """The ModelConfig of a DeepSeek-V4.1 text tower, from the HF config or a GGUF's metadata."""
     return ModelConfig(
         num_layers=args.n_layers,
         num_qo_heads=args.n_heads,
-        num_kv_heads=1,  # MLA-style latent (K == V)
+        num_kv_heads=1,  # one shared latent KV head (K == V)
         head_dim=args.head_dim,
-        hidden_size=args.hidden_size,
+        hidden_size=args.dim,
         vocab_size=args.vocab_size,
         intermediate_size=args.moe_inter_dim,
-        hidden_act=args.hidden_act,
+        hidden_act="silu",
         rms_norm_eps=args.norm_eps,
         tie_word_embeddings=False,
-        rotary_config=rotary,
+        rotary_config=RotaryConfig(
+            head_dim=args.head_dim,
+            rotary_dim=args.rope_head_dim,
+            max_position=max_position,
+            base=args.rope_theta,
+            scaling={
+                "rope_type": "yarn",
+                "factor": args.rope_factor,
+                "beta_fast": args.beta_fast,
+                "beta_slow": args.beta_slow,
+                "original_max_position_embeddings": args.original_seq_len,
+            },
+        ),
         num_experts=args.n_routed_experts,
         num_experts_per_tok=args.n_activated_experts,
         moe_intermediate_size=args.moe_inter_dim,
         norm_topk_prob=args.norm_topk_prob,
+        n_shared_experts=args.n_shared_experts,
+        routed_scaling_factor=args.route_scale,
+        swiglu_limit=args.swiglu_limit,
         model_type="deepseek_v41",
         architectures=["DeepseekV41ForCausalLM"],
         moe_enabled=True,
-        expert_quant="mxfp4",
-        first_k_dense_replace=0,
-        n_shared_experts=args.n_shared_experts,
-        shared_expert_intermediate_size=args.moe_inter_dim,
-        routed_scaling_factor=args.route_scale,
+        expert_quant="ds_fp4",
         attn_sm_scale=args.head_dim**-0.5,
-        # The engine's DSV4 plumbing (pool class, sizing, _adjust_dsv4_config) reads the
-        # dsv4_args payload; dsv41_args is the same bag under the family's name.
-        dsv4_args=args,
         dsv41_args=args,
-        mtp_enabled=args.mtp_enabled,
+        vision_config=vision,
+        image_token_id=image_token_id,
         attention_groups=(
             DSV4AttentionGroupConfig(
                 name="dsv41",
-                layer_ids=layer_ids,
+                layer_ids=tuple(range(args.n_layers)),
                 num_kv_heads=1,
                 head_dim=args.head_dim,
-                sliding_window=args.sliding_window,
+                sliding_window=args.window_size,
+                variant="v41",
             ),
         ),
     )
 
 
-__all__ = ["parse_config"]
+def parse_config(hf_config: Any) -> ModelConfig:
+    args = DeepseekV41Args.from_hf(hf_config)
+    text = getattr(hf_config, "text_config", None) or hf_config
+    max_position = int(getattr(text, "max_position_embeddings", 0) or getattr(hf_config, "max_position_embeddings", 0) or 0)
+    if max_position <= 0:
+        max_position = int(args.original_seq_len * args.rope_factor)
+    vc = getattr(hf_config, "vision_config", None)
+    vision = VisionConfig(**{f.name: getattr(vc, f.name, f.default) for f in fields(VisionConfig)}) if vc is not None else None
+    return model_config_from_args(args, max_position=max_position, vision=vision, image_token_id=getattr(hf_config, "image_token_id", None))
+
+
+__all__ = ["model_config_from_args", "parse_config"]

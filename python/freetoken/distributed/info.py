@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Iterator
 
 
 @dataclass(frozen=True)
@@ -35,4 +37,17 @@ def try_get_tp_info() -> DistributedInfo | None:
     return _TP_INFO
 
 
-__all__ = ["DistributedInfo", "set_tp_info", "get_tp_info", "try_get_tp_info"]
+@contextmanager
+def replicated_tp() -> Iterator[None]:
+    """Build the layers inside unsharded (TP=1 shapes, no all-reduce): a tower every rank
+    runs whole, or that only the primary rank holds (--vision-on-cpu)."""
+    global _TP_INFO
+    saved = _TP_INFO
+    _TP_INFO = DistributedInfo(0, 1)
+    try:
+        yield
+    finally:
+        _TP_INFO = saved
+
+
+__all__ = ["DistributedInfo", "set_tp_info", "get_tp_info", "try_get_tp_info", "replicated_tp"]

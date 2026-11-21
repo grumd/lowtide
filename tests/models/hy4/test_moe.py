@@ -539,9 +539,9 @@ def test_silu_only_nvfp4_kernels_decline_hy4():
         print(f"\nSTEP5 {kernel.__name__} declines Hy4: {reason}")
         assert reason, kernel
         # a missing backend / the wrong arch is reported first on this box; the flags both pass:
-        silu_gate = kernel()._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=False, plain_silu_only=True)
+        silu_gate = kernel()._common_reject(cfg, tp_ok=False, cpu_ok=False, plain_silu_only=True)
         assert "plain-silu only" in (silu_gate or ""), kernel
-        assert kernel()._common_reject(dataclasses.replace(cfg, activation="silu", limit=None), resident_ok=False,
+        assert kernel()._common_reject(dataclasses.replace(cfg, activation="silu", limit=None),
                                        tp_ok=False, cpu_ok=False, plain_silu_only=True) is None
 
 

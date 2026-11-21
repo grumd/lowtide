@@ -11,7 +11,7 @@ import torch
 from freetoken.distributed import DistributedInfo, set_tp_info
 from freetoken.layers.quantization import NoQuantConfig
 from freetoken.models.qwen3_5_moe.attention import Qwen3_5Attention
-from freetoken.models.qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet
+from freetoken.layers.linear_attn import GatedDeltaNet as Qwen3_5GatedDeltaNet
 from freetoken.models.qwen3_5_moe.weight import tp_shard_key
 
 
@@ -210,7 +210,8 @@ def _attn_cfg(head_dim=64, hidden=64):
         num_qo_heads=8, num_kv_heads=2, head_dim=head_dim, hidden_size=hidden,
         rms_norm_eps=1e-5, quant=NoQuantConfig(),
         rotary_config=SimpleNamespace(
-            rotary_dim=head_dim, max_position=4096, base=10000.0, scaling={}
+            rotary_dim=head_dim, max_position=4096, base=10000.0, scaling={},
+            mrope_section=None, mrope_layout=None,
         ),
     )
 

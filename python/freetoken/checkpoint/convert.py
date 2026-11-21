@@ -28,7 +28,7 @@ from safetensors.torch import save_file
 
 from freetoken.utils import cached_load_hf_config, download_hf_weight
 
-from .ftw import DEFAULT_SHARD_LIMIT, DSPARK_BANK_NUM_LAYERS, FTWWriter, layer_bank_entry_name
+from .ftw import DEFAULT_SHARD_LIMIT, FTWWriter, layer_bank_entry_name
 
 # Machine-readable convert progress for a supervising process (e.g. a GUI frontend parses
 # these `FTCONVERT <phase> <done> <total>` stdout lines to drive its convert bar). Gated by
@@ -95,27 +95,6 @@ def _ple_rides_verbatim(header: dict, ple_keys: list[str], out_dtype: str) -> bo
     is ``auto``), so the shard(s) can be copied verbatim instead of re-encoded through RAM."""
     src = _ple_table_source_dtype(header, ple_keys)
     return src is not None and (out_dtype == "auto" or out_dtype == src)
-
-
-def _ships_mtp(model_path: str) -> bool:
-    """Whether the source checkpoint stores any ``mtp.*`` tensors (a draft head)."""
-    import struct
-
-    folder = download_hf_weight(model_path)
-    index = os.path.join(folder, "model.safetensors.index.json")
-    if os.path.exists(index):
-        with open(index, encoding="utf-8") as fh:
-            return any(k.startswith("mtp.") for k in json.load(fh)["weight_map"])
-    for path in glob.glob(os.path.join(folder, "*.safetensors")):
-        try:
-            with open(path, "rb") as fh:
-                n = struct.unpack("<Q", fh.read(8))[0]
-                header = json.loads(fh.read(n))
-        except (OSError, ValueError, struct.error):
-            continue
-        if any(k.startswith("mtp.") for k in header):
-            return True
-    return False
 
 
 def _validate_mtp_artifact(main_config, header: str) -> None:
@@ -234,8 +213,8 @@ class _ConvertSink:
         self._desc = desc
         # canonical role -> the bank name the file stores
         self._names = names or {}
-        # the FTW kind the entries are written under: the DSpark draft uses its own
-        # namespace so the target's load_ftw_banks never sees its (differently sized) banks
+        # the FTW kind the entries are written under (a draft with its own expert count
+        # would use its own namespace so the target's load_ftw_banks never sees its banks)
         self._kind = kind
         # the machine-readable FTCONVERT expert bar is sized to the target's pool; the
         # draft's extra bytes would overshoot it, so the draft sink stays off it
@@ -361,7 +340,6 @@ def convert_checkpoint(
     shard_limit: int = DEFAULT_SHARD_LIMIT,
     device: str | None = None,
     include_engram: bool = False,
-    include_dspark: bool = False,
     mtp_mode: str = "auto",
     mtp_header: str = "",
     ple_mode: str = "bf16",
@@ -370,12 +348,10 @@ def convert_checkpoint(
 ) -> dict:
     """Write ``model_path`` as an FTW checkpoint at ``out_dir``. Returns the index dict.
 
-    ``include_engram`` / ``include_dspark`` opt the model's side payloads into the FTW:
-    the ~189 GiB Engram n-gram tables (otherwise read in place from the source shards at
-    serve time) and the DSpark MTP draft head (otherwise skipped). Both are OFF by
-    default so the FTW stays the current dense+banks layout; the index records which
-    were included under ``"includes"`` so the loader can tell an FTW apart. Including the
-    engram costs ~189 GiB of extra disk. A family with an ``ftw_engram_files`` hook (Hy4)
+    ``include_engram`` opts the model's Engram n-gram tables into the FTW (otherwise read in
+    place from the source shards at serve time). OFF by default so the FTW stays the
+    current dense+banks layout; the index records it under ``"includes"`` so the loader
+    can tell an FTW apart. A family with an ``ftw_engram_files`` hook (Hy4)
     keeps its tables beside the entries instead (``engram/``, hardlinked when it can be).
 
     The FTW format is TP-agnostic and conversion runs single-process, so the resulting
@@ -402,7 +378,7 @@ def convert_checkpoint(
     # Opt the requested side payloads in BEFORE any config is parsed: the per-model
     # weight readers gate mtp.*/engram.* on these at parse time (mirrors the existing
     # FREETOKEN_ENABLE_MTP gate).
-    if include_dspark or mtp_mode in ("on", "file"):
+    if mtp_mode in ("on", "file"):
         os.environ["FREETOKEN_ENABLE_MTP"] = "1"
     if include_engram:
         os.environ["FREETOKEN_EXPORT_ENGRAM"] = "1"
@@ -440,15 +416,17 @@ def convert_checkpoint(
     mc = cfg.model_config
     if mtp_mode == "file":
         _validate_mtp_artifact(mc, mtp_header)
-    offload = moe_backend == "offload" and getattr(mc, "is_moe", False)
+    # every MoE strategy reads the routed experts from the banks, fused included
+    offload = getattr(mc, "is_moe", False)
     include_moe_experts = not offload
-    method = None
+    method = layer_methods = None
     if offload:
-        from freetoken.engine.engine import offload_expert_method
+        from freetoken.engine.engine import offload_expert_methods
         from freetoken.layers import set_rope_device
 
         set_rope_device(dev)
-        method = offload_expert_method(cfg)
+        object.__setattr__(cfg, "moe_strategy", "offload")
+        method, layer_methods = offload_expert_methods(cfg)
 
     # The FTW is a SELF-CONTAINED checkpoint: it carries everything the source had.
     # 1) The MTP draft head: the dense reader gates mtp.* on FREETOKEN_ENABLE_MTP at
@@ -467,10 +445,18 @@ def convert_checkpoint(
 
     from freetoken.utils.progress import byte_bar, count_bar
 
+    # a family refuses a source it has no FTW form for before the writer creates out_dir
+    from freetoken.models.register import _load_attr, get_model_spec
+
+    try:
+        check_source = _load_attr(get_model_spec(mc.architectures[0]).module, "ftw_check_source")
+    except (AttributeError, KeyError, ValueError):
+        check_source = None
+    if check_source is not None:
+        check_source(model_path)
+
     writer = FTWWriter(out_dir, shard_limit=shard_limit)
     n_weight = n_bank = n_alpha = 0
-    n_dspark_layers = None
-    n_dspark_bank = n_dspark_alpha = 0
 
     # 1) dense weights (host tensors; load straight to CPU to avoid GPU pressure)
     _progress("dense", 0, 0)  # phase start; per-tensor cumulative bytes follow (total unknown)
@@ -479,9 +465,13 @@ def convert_checkpoint(
     from freetoken.models.weight import ftw_side_tensors
 
     side_owns, side_iter = ftw_side_tensors(model_path) if mtp_mode != "off" else (None, None)
+    from freetoken.models.gguf.reader import gguf_config_source
+
+    # an FTW keeps only a GGUF's text metadata, so it cannot build an mmproj tower
+    include_vision = vision_mode == "on" and gguf_config_source(model_path) is None
     for name, tensor in count_bar(load_weight(model_path, torch.device("cpu"),
                                               include_moe_experts=include_moe_experts,
-                                              mtp_path=_mtp_path),
+                                              mtp_path=_mtp_path, include_vision=include_vision),
                                   "Converting dense weights"):
         if side_owns is not None and side_owns(name):
             continue
@@ -494,6 +484,7 @@ def convert_checkpoint(
 
     # 2) offload expert banks (post-repack) + alpha scales (slow path auto-picks parallel/serial)
     quant_format = None
+    layer_quant_formats = None
     num_layers = None
     if offload:
         # every method-packed format streams each layer to its own FTW entry as it completes (via the sink); the GGUF provider reports through ExpertBanks.streamed whether it engaged the sink or materialized the whole bank set first
@@ -502,9 +493,11 @@ def convert_checkpoint(
         names = legacy_bank_names(legacy_format_for(method.kind, method.kernel.name)) if method is not None else {}
         sink = _ConvertSink(writer, names=names)
         banks = load_expert_banks(
-            model_path, mc, method=method, device=dev, dtype=dtype, layer_sink=sink
+            model_path, mc, method=method, device=dev, layer_sink=sink, layer_methods=layer_methods
         )
         quant_format = banks.quant_format
+        layer_quant_formats = banks.layer_formats
+        assert layer_quant_formats is None or banks.streamed, "experts of several formats always stream to the sink"
         if banks.streamed:
             sink.close()
             num_layers = sink.num_layers  # however many distinct layers the sink actually saw
@@ -551,48 +544,7 @@ def convert_checkpoint(
                 n_alpha += name in ("gate_up_alpha", "down_alpha")
             bar.close()
 
-    # 3) Draft head, two shapes:
-    #    * DSV4.1 DSpark: the draft's experts have their own count (E=128 vs 384) and ride a
-    #      dedicated FTW bank kind/namespace -> explicit --include-dspark exports those banks.
-    #    * Qwen3.8 (qwen4_exp): the MTP head is dense bf16 and the dense reader already yields
-    #      it whenever the config declares mtp layers -- there are no separate draft banks, so
-    #      --include-dspark is satisfied (tolerated) rather than an error.
-    if include_dspark:
-        from freetoken.models.weight import dspark_expert_method
-
-        dspark_method = dspark_expert_method(model_path, mc)
-        if dspark_method is not None:
-            if not offload:
-                raise SystemExit("--include-dspark requires --moe-backend offload (the draft experts are offloaded)")
-            from freetoken.checkpoint.ftw import DSPARK_BANK_KIND
-            from freetoken.models.weight import load_dspark_banks
-            from freetoken.moe.legacy_format import legacy_bank_names, legacy_format_for
-
-            num_stages = int(mc.dsv4_args.num_nextn_predict_layers)
-            names = legacy_bank_names(legacy_format_for(dspark_method.kind, dspark_method.kernel.name))
-            dsink = _ConvertSink(writer, "Converting DSpark draft banks", names=names,
-                                 kind=DSPARK_BANK_KIND, progress=False)
-            dbanks = load_dspark_banks(
-                model_path, mc, method=dspark_method, num_stages=num_stages,
-                device=dev, dtype=dtype, layer_sink=dsink,
-            )
-            dsink.close()
-            # build_expert_banks streams through the sink for method-packed formats; the
-            # draft is MXFP4, so this holds and the layer count is the draft's stage count
-            assert dbanks.streamed, "DSpark draft banks must stream per layer"
-            n_dspark_layers = dsink.num_layers
-            n_dspark_bank = dsink.n_written
-            assert n_dspark_layers == num_stages, (n_dspark_layers, num_stages)
-            for an in ("gate_up_alpha", "down_alpha"):
-                alpha = getattr(dbanks, an, None)
-                if alpha is not None:
-                    writer.add_tensor(an, alpha, kind=DSPARK_BANK_KIND)
-                    n_dspark_alpha += 1
-        elif not _ships_mtp(model_path):
-            raise SystemExit("--include-dspark: the checkpoint ships no draft head (mtp.*)")
-        # else: a dense MTP head (e.g. qwen4_exp) — already yielded by the dense reader.
-
-    # 4) Side payloads a family keeps under their own kind (Hy4: the DFly2 drafter, raw checkpoint
+    # 3) Side payloads a family keeps under their own kind (Hy4: the DFly2 drafter, raw checkpoint
     #    tensors), counted and flagged per kind like the sections above.
     n_side: dict[str, int] = {}
     for name, tensor, kind in side_iter or ():
@@ -607,6 +559,18 @@ def convert_checkpoint(
         from freetoken.models.weight import ftw_engram_files
 
         engram_files = ftw_engram_files(model_path, out_dir)
+    # FlashML's side-file hook (DeepSeek-V4.1: the engram tables); a family with a
+    # side_table_files hook (qwen4_exp PLE) is handled by the block below instead
+    side_files: list[str] = []
+    _family = get_model_spec(mc.architectures[0]).module
+    try:
+        _load_attr(_family, "side_table_files")
+    except (AttributeError, KeyError, ValueError):
+        try:
+            side_hook = _load_attr(_family, "ftw_side_files")
+        except (AttributeError, KeyError, ValueError):
+            side_hook = None
+        side_files = side_hook(model_path, out_dir) if side_hook is not None else []
     # Model-specific side tables (qwen4_exp: the PLE n-gram table): .safetensors files
     # the model loads outside the dense stream — without them the FTW dir cannot serve.
     # ``ple_mode`` selects the stored dtype: ``bf16``/``fp8`` re-encode to that dtype
@@ -670,28 +634,28 @@ def convert_checkpoint(
         # read back at load (ftw.load_ftw_banks). dtype/moe_backend were dropped: each
         # tensor already carries its own dtype, and nothing reads a model-level backend.
         "quant_format": quant_format,
+        # Experts of several formats: each MoE layer's quant_format (quant_format above is the most common). A layer only
+        # stores the banks its kernel reads; the reader gives it zero-byte placeholders for the others.
+        "layer_quant_formats": layer_quant_formats,
         # The reader takes num_layers from the model config (copied into this
         # checkpoint); recording it here too gives load_ftw_banks a cross-check that
         # the banks match the config they ship with. None for non-offload checkpoints.
         "expert_bank_num_layers": num_layers,
-        # The DSpark draft's banks live under their own kind; their layer count (the
-        # draft stage count) is the cross-check for load_dspark_banks. None when absent.
-        DSPARK_BANK_NUM_LAYERS: n_dspark_layers,
         "counts": {
             "weight": n_weight,
             "experts_bank": n_bank + n_alpha,
-            "dspark_experts_bank": n_dspark_bank + n_dspark_alpha,
             **n_side,
         },
         "copied_metadata": copied,
         # Engram tables kept beside the entries (Hy4 --include-engram: engram/, read in place at
         # serve time instead of from source_model_path); None when the FTW has no such files.
         "engram_files": engram_files,
+        # FlashML side files (DeepSeek-V4.1 engram), [] for the others
+        "side_files": side_files,
         # Which optional side payloads this FTW carries. The loader reads these to decide
-        # whether the Engram tables / DSpark draft come from the FTW or are skipped.
+        # whether the Engram tables come from the FTW or are read in place.
         "includes": {
             "engram": bool(include_engram),
-            "dspark": bool(include_dspark),
             "mtp_mode": mtp_mode,
             "mtp_header": os.path.abspath(mtp_header) if mtp_mode == "file" else None,
             # Stored PLE n-gram table dtype ("fp8"/"bf16"); None when the model has no table

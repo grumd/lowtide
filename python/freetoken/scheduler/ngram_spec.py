@@ -53,6 +53,8 @@ from freetoken.env import ENV
 from freetoken.message import DetokenizeMsg
 from freetoken.utils import init_logger
 
+from .mtp import round_msg
+
 if TYPE_CHECKING:
     from .scheduler import Scheduler
 
@@ -694,28 +696,26 @@ class NgramSpecManager:
                 fin = hit_length or hit_eos or ms is not None
                 return fin, ("stop" if (hit_eos or ms is not None) else "length") if fin else None, ms
 
-            def _emit(tok: int) -> None:
+            def _emit(tok: int, draft: bool) -> None:
                 nonlocal finished, finish_reason, matched_stop
                 r.append_host(torch.tensor([tok]))
                 finished, finish_reason, matched_stop = _check(tok)
                 if tok == sched.toolcall_anchor_id and r.toolcall_anchor_len is None and not finished:
                     r.toolcall_anchor_len = r.input_ids.numel()
-                reply.append(DetokenizeMsg(
-                    uid=r.uid, next_token=tok, finished=finished, finish_reason=finish_reason,
-                    matched_stop=matched_stop, stop_strs=r.sampling_params.stop_strs or None,
-                ))
+                reply.append(round_msg(r, tok, finished, finish_reason, matched_stop, draft=draft))
 
+            r.stats.draft_n += real[i]
             for j in range(a):
                 if r.output_budget_exhausted:
                     finished, finish_reason = True, "length"
                     break
-                _emit(drafts[i][j])
+                _emit(drafts[i][j], True)
                 m += 1
                 if finished:
                     break
             bonus_published = not finished
             if bonus_published and not r.output_budget_exhausted:
-                _emit(bonus)
+                _emit(bonus, False)
             finished_at_draft = finished and not bonus_published
             # committed: the pending token + the published drafts (not the bonus)
             rext_end = C[i] + 1 + (m if finished_at_draft else a)

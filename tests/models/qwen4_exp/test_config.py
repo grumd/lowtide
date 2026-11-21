@@ -1,12 +1,17 @@
-"""qwen4_exp.parse_config against a synthetic config shaped like the RadixArk NVFP4 checkpoint."""
+"""qwen4_exp.parse_config against synthetic configs shaped like the released checkpoints."""
 
 from types import SimpleNamespace
 
 import pytest
 
 from freetoken.attention import AttnType
-from freetoken.models.config import FullAttentionGroupConfig, LinearGatedDeltaGroupConfig
+from freetoken.models.config import (
+    FullAttentionGroupConfig,
+    LinearGatedDeltaGroupConfig,
+)
 from freetoken.models.qwen4_exp.config import parse_config
+
+from .common import LOVEDHEART_NVFP4_FP8, NVIDIA_NVFP4, QWEN_FP8, RADIXARK_NVFP4
 
 
 def _text_config():
@@ -61,31 +66,13 @@ def _text_config():
     )
 
 
-def _hf_config():
+def _hf_config(quantization_config=RADIXARK_NVFP4):
     return SimpleNamespace(
         model_type="qwen4_exp",
         architectures=["Qwen4ExpForConditionalGeneration"],
         image_token_id=248056,
         text_config=_text_config(),
-        quantization_config={
-            "quant_algo": "NVFP4",
-            "quant_method": "modelopt",
-            "ignore": [
-                "model.embed_tokens",
-                "mtp.*",
-                "model.mtp.*",
-                "*.self_attn.*",
-                "*.linear_attn.*",
-                "*.mlp.gate*",
-                "*.mlp.shared_expert.*",
-                "*.mlp.shared_expert_gate*",
-                "*hyper_connection*",
-                "*.ple.*",
-                "model.visual.*",
-                "model.language_model.embed_tokens",
-                "lm_head",
-            ],
-        },
+        quantization_config=quantization_config,
     )
 
 
@@ -115,22 +102,25 @@ def test_kv_specs_resolve_qsa():
     assert cfg.has_linear_attention
 
 
-def test_moe_and_quant_flags():
+def test_moe_dims():
     cfg = parse_config(_hf_config())
     assert cfg.num_experts == 512
     assert cfg.num_experts_per_tok == 10
     assert cfg.norm_topk_prob is True
     assert cfg.moe_enabled
-    assert cfg.expert_quant == "nvfp4"
-    assert cfg.dense_quant == "none"
-    assert cfg.attn_quant == "none"
-    assert cfg.lm_head_quant == "none"
 
 
-def test_unquantized_config_parses():
-    hf = _hf_config()
-    hf.quantization_config = None
-    assert parse_config(hf).expert_quant == "none"
+@pytest.mark.parametrize(
+    "quantization_config, expert_quant",
+    [
+        pytest.param(RADIXARK_NVFP4, "nvfp4", id="RadixArk/Qwen3.8-Flash-Next-NVFP4"),
+        pytest.param(NVIDIA_NVFP4, "nvfp4", id="nvidia/Qwen3.8-Flash-Next-NVFP4"),
+        pytest.param(QWEN_FP8, "fp8_block", id="Qwen/Qwen3.8-Flash-Next-FP8"),
+        pytest.param(None, "none", id="Qwen/Qwen3.8-Flash-Next"),
+    ],
+)
+def test_released_checkpoints_expert_quant(quantization_config, expert_quant):
+    assert parse_config(_hf_config(quantization_config)).expert_quant == expert_quant
 
 
 def test_qwen4_args_payload():
@@ -199,28 +189,109 @@ def test_text_only_config_parses():
     assert cfg.moe_enabled
 
 
-def test_vision_config_is_opt_in(monkeypatch):
-    hf = _hf_config()
-    hf.vision_config = SimpleNamespace(
-        hidden_size=1152,
-        intermediate_size=4304,
-        depth=27,
-        num_heads=16,
-        patch_size=16,
-        temporal_patch_size=2,
-        in_channels=3,
-        spatial_merge_size=2,
-        out_hidden_size=2560,
-        num_position_embeddings=2304,
-        rope_parameters={"rope_type": "axial", "rope_theta": 10000.0},
+def _vision_config():
+    return SimpleNamespace(
+        hidden_size=1152, depth=27, num_heads=16, intermediate_size=4304, patch_size=16, temporal_patch_size=2,
+        spatial_merge_size=2, num_position_embeddings=2304, out_hidden_size=2560, in_channels=3,
+        deepstack_visual_indexes=[],
     )
-    monkeypatch.delenv("FREETOKEN_LOAD_VISION", raising=False)
-    cfg = parse_config(hf)
-    assert cfg.vision_config is None and not cfg.is_multimodal
 
-    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
-    cfg = parse_config(hf)
-    assert cfg.is_multimodal
-    assert cfg.vision_config.hidden_size == 1152
-    assert cfg.vision_config.head_dim == 72
-    assert cfg.image_token_id == 248056
+
+def test_vision_turns_on_mrope_and_the_tower():
+    hf = _hf_config()
+    hf.vision_config = _vision_config()
+    config = parse_config(hf)
+    assert config.is_multimodal and config.model_is_mrope
+    assert config.rotary_config.mrope_section == [11, 11, 10]
+    assert config.rotary_config.mrope_layout == "interleaved" and config.rotary_config.rotary_dim == 64
+    assert config.vision_config.out_hidden_size == 2560 and config.vision_config.deepstack_visual_indexes == ()
+    assert config.qwen4_args.image_token_id == 248056
+
+
+def test_text_only_keeps_the_1d_rope():
+    config = parse_config(_hf_config())
+    assert not config.is_multimodal and not config.model_is_mrope and config.rotary_config.mrope_section is None
+
+
+# the merged-projection prefixes the model asks the QuantConfig about (attention.py / layers/linear_attn/gdn.py)
+DENSE_PREFIXES = (
+    "model.layers.3.self_attn.qkv_proj", "model.layers.3.self_attn.o_proj",
+    "model.layers.0.linear_attn.in_proj_qkvz", "model.layers.0.linear_attn.out_proj",
+)
+BF16_PREFIXES = (
+    "model.layers.0.linear_attn.in_proj_ba", "model.layers.0.mlp.shared_expert.gate_up_proj",
+    "model.layers.3.self_attn.indexer.index_qk_proj", "lm_head",
+)
+
+
+def _quant(hf, tmp_path):
+    from freetoken.models.register import checkpoint_quant_config, get_model_spec
+
+    return checkpoint_quant_config(str(tmp_path), hf, get_model_spec(hf.architectures[0]))
+
+
+def test_block_fp8_dense_schemes(tmp_path):
+    quant = _quant(_hf_config(LOVEDHEART_NVFP4_FP8), tmp_path)
+    # fork: the block-fp8 dense projections are dequantized at load (register._QWEN4_EXP_DEQUANTIZED)
+    for prefix in DENSE_PREFIXES + BF16_PREFIXES:
+        assert quant.scheme_for(prefix) is None, prefix
+    assert str(quant.scheme_for("model.layers.0.mlp.experts").kind) == "nvfp4"
+    assert parse_config(_hf_config(LOVEDHEART_NVFP4_FP8)).expert_quant == "nvfp4"
+
+
+@pytest.mark.parametrize("quantization_config", [RADIXARK_NVFP4, NVIDIA_NVFP4, None], ids=["RadixArk", "nvidia", "bf16"])
+def test_released_checkpoints_keep_the_dense_projections_bf16(quantization_config, tmp_path):
+    quant = _quant(_hf_config(quantization_config), tmp_path)
+    for prefix in DENSE_PREFIXES + BF16_PREFIXES:
+        assert quant.scheme_for(prefix) is None, prefix
+
+
+# Qwen3.8-Flash-Next model card, "Processing Ultra-Long Texts": the 1M-token override.
+MODEL_CARD_YARN = {
+    "mrope_interleaved": True,
+    "mrope_section": [11, 11, 10],
+    "rope_type": "yarn",
+    "rope_theta": 10000000,
+    "partial_rotary_factor": 0.25,
+    "factor": 4.0,
+    "original_max_position_embeddings": 262144,
+}
+
+
+def _write_checkpoint_config(path, **fields) -> None:
+    import json
+
+    text = {k: v for k, v in vars(_text_config()).items()}
+    config = {
+        "model_type": "qwen4_exp",
+        "architectures": ["Qwen4ExpForConditionalGeneration"],
+        "image_token_id": 248056,
+        "text_config": text,
+        "quantization_config": RADIXARK_NVFP4,
+        **fields,
+    }
+    (path / "config.json").write_text(json.dumps(config))
+
+
+def test_the_engine_serves_the_model_card_1m_recipe(tmp_path):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+    from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig
+
+    _write_checkpoint_config(tmp_path)
+    config = EngineConfig(
+        model_path=str(tmp_path),
+        tp_info=DistributedInfo(rank=0, size=1),
+        dtype=torch.bfloat16,
+        hf_overrides={"text_config": {"rope_parameters": MODEL_CARD_YARN}},
+        mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)),
+    )
+    rotary = config.model_config.rotary_config
+    assert rotary.scaling["rope_type"] == "yarn" and rotary.scaling["factor"] == 4.0 and rotary.mrope_section is None
+    assert rotary.max_position == 262144 and rotary.rotary_dim == 64 and rotary.base == 10000000
+    assert config.max_seq_len == 4 * 262144
+    plain = EngineConfig(model_path=str(tmp_path), tp_info=DistributedInfo(rank=0, size=1), dtype=torch.bfloat16,
+                         mm=MultimodalConfig(disabled_encoders=frozenset(ENCODER_KINDS)))
+    assert plain.model_config.rotary_config.scaling is None and plain.max_seq_len == 262144

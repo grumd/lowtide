@@ -23,7 +23,7 @@ class _FakeTokenizer:
 
 def _m(tok: int, finished: bool = False) -> DetokenizeMsg:
     return DetokenizeMsg(
-        uid=0, next_token=tok, finished=finished,
+        uid=0, next_tokens=[tok], finished=finished,
         finish_reason=("stop" if finished else None), matched_stop=None, stop_strs=None,
     )
 

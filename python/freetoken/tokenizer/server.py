@@ -23,11 +23,16 @@ from freetoken.message import (
     DecodeTuneResultMsg,
     DetokenizeMsg,
     ErrorReplyMsg,
+    FlushCacheBackendMsg,
+    FlushCacheMsg,
+    FlushCacheReply,
+    FlushCacheResultMsg,
     PromptAdmittedMsg,
     TokenizeMsg,
     UserMsg,
     UserReply,
 )
+from freetoken.mm.config import MultimodalConfig
 from freetoken.utils import (
     ZmqPullQueue,
     ZmqPushQueue,
@@ -88,30 +93,17 @@ def _tokenize_requests(
     tokenize_manager: Any,
     messages: List[TokenizeMsg],
     logger: Any,
-    vision_processor: Any = None,
-) -> tuple[List[TokenizeMsg], List[torch.Tensor], List[Any], List[UserReply]]:
+) -> tuple[List[UserMsg], List[UserReply]]:
     """Tokenize independently, returning backend work plus terminal frontend errors.
 
     Successful tokenization deliberately emits no prompt-token reply: accounting starts
     only when the scheduler later confirms first-prefill admission.
-
-    A request carrying images also gets its ``<|image_pad|>`` placeholder expanded to the
-    vision tower's soft-token count, plus the raw processor outputs (see tokenizer.vision).
     """
-    ok_msgs: List[TokenizeMsg] = []
-    ok_tensors: List[torch.Tensor] = []
-    ok_vision: List[Any] = []
+    backend: List[UserMsg] = []
     errors: List[UserReply] = []
     for msg in messages:
         try:
-            tokens = tokenize_manager.tokenize([msg])[0]
-            vision = None
-            if vision_processor is not None:
-                from .vision import expand_image_tokens, preprocess_messages
-
-                vision = preprocess_messages(vision_processor, msg.text)
-                if vision is not None and vision.image_token_id is not None:
-                    tokens = expand_image_tokens(tokens, vision.tokens_per_image, vision.image_token_id)
+            user_msg = tokenize_manager.tokenize([msg])[0]
         except Exception as exc:  # noqa: BLE001 — isolate, never crash the worker
             logger.warning(f"tokenization failed for request {msg.uid}: {exc!r}")
             errors.append(
@@ -125,7 +117,7 @@ def _tokenize_requests(
             continue
         # A zero-token prompt would trip the scheduler's input_len > 0 invariant and
         # crash the worker; reject it here as a terminal error instead.
-        if tokens.numel() == 0:
+        if user_msg.input_ids.numel() == 0:
             errors.append(
                 UserReply(
                     uid=msg.uid,
@@ -135,10 +127,8 @@ def _tokenize_requests(
                 )
             )
             continue
-        ok_msgs.append(msg)
-        ok_tensors.append(tokens)
-        ok_vision.append(vision)
-    return ok_msgs, ok_tensors, ok_vision, errors
+        backend.append(user_msg)
+    return backend, errors
 
 
 @torch.inference_mode()
@@ -153,21 +143,21 @@ def tokenize_worker(
     tokenizer_id: int = -1,
     model_source: str = "huggingface",
     ack_queue: mp.Queue[str] | None = None,
+    mm: MultimodalConfig | None = None,
 ) -> None:
     send_backend = ZmqPushQueue(backend_addr, create=False, encoder=BaseBackendMsg.encoder)
     send_frontend = ZmqPushQueue(frontend_addr, create=False, encoder=BaseFrontendMsg.encoder)
     recv_listener = ZmqPullQueue(addr, create=create, decoder=BatchTokenizerMsg.decoder)
     assert local_bs > 0
     tokenizer = load_tokenizer(tokenizer_path)
-    from .vision import load_online_vision
-
-    vision_processor = load_online_vision(tokenizer_path)
     logger = init_logger(__name__, f"tokenizer_{tokenizer_id}")
+
+    from freetoken.mm.processor import get_mm_processor
 
     from .detokenize import DetokenizeManager
     from .tokenize import TokenizeManager
 
-    tokenize_manager = TokenizeManager(tokenizer)
+    tokenize_manager = TokenizeManager(tokenizer, get_mm_processor(tokenizer_path, mm))
     detokenize_manager = DetokenizeManager(
         tokenizer, load_eos_token_ids(tokenizer_path, tokenizer)
     )
@@ -226,11 +216,27 @@ def tokenize_worker(
                             error=m.error,
                         )
                     )
+                elif isinstance(m, FlushCacheMsg):
+                    send_backend.put(
+                        FlushCacheBackendMsg(request_id=m.request_id, timeout=m.timeout)
+                    )
+                elif isinstance(m, FlushCacheResultMsg):
+                    send_frontend.put(
+                        FlushCacheReply(request_id=m.request_id, status=m.status, error=m.error)
+                    )
             n_control = sum(
                 isinstance(
                     m,
-                    (CacheRebuildMsg, CacheRebuildResultMsg, DecodeTuneMsg, DecodeTuneResultMsg,
-                     ErrorReplyMsg, PromptAdmittedMsg),
+                    (
+                        CacheRebuildMsg,
+                        CacheRebuildResultMsg,
+                        DecodeTuneMsg,
+                        DecodeTuneResultMsg,
+                        FlushCacheMsg,
+                        FlushCacheResultMsg,
+                        ErrorReplyMsg,
+                        PromptAdmittedMsg,
+                    ),
                 )
                 for m in pending_msg
             )
@@ -248,7 +254,7 @@ def tokenize_worker(
                         finished=msg.finished,
                         finish_reason=msg.finish_reason,
                         matched_stop=msg.matched_stop,
-                        completion_tokens_delta=1,
+                        completion_tokens_delta=len(msg.next_tokens),
                         kv_used_pages=msg.kv_used_pages,
                         kv_total_pages=msg.kv_total_pages,
                         mamba_used_slots=msg.mamba_used_slots,
@@ -259,6 +265,7 @@ def tokenize_worker(
                         mtp_enabled=msg.mtp_enabled,
                         mtp_drafted=msg.mtp_drafted,
                         mtp_accepted=msg.mtp_accepted,
+                        timings=msg.timings,
                     )
                     for msg, reply in zip(detokenize_msg, replies, strict=True)
                 ]
@@ -281,24 +288,12 @@ def tokenize_worker(
                 # Tokenize per-message so a single un-renderable request (e.g. a chat template
                 # that rejects the message layout) becomes a terminal error reply for THAT uid
                 # instead of an uncaught exception that kills the worker and bricks the server.
-                ok_msgs, ok_tensors, ok_vision, errors = _tokenize_requests(
-                    tokenize_manager, tokenize_msg, logger, vision_processor
-                )
+                backend, errors = _tokenize_requests(tokenize_manager, tokenize_msg, logger)
                 if errors:
                     send_frontend.put(
                         errors[0] if len(errors) == 1 else BatchFrontendMsg(data=errors)
                     )
-                if ok_msgs:
-                    backend = [
-                        UserMsg(
-                            uid=msg.uid,
-                            input_ids=t,
-                            sampling_params=msg.sampling_params,
-                            pixel_values=(v.pixel_values if v is not None else None),
-                            image_grid_thw=(v.image_grid_thw if v is not None else None),
-                        )
-                        for msg, t, v in zip(ok_msgs, ok_tensors, ok_vision, strict=True)
-                    ]
+                if backend:
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
             if len(abort_msg) > 0:
                 batch_output = BatchBackendMsg(

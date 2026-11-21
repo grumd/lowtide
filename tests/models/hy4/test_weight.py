@@ -117,10 +117,10 @@ def test_resident_experts_fill_the_fused_layer(monkeypatch):
     config = parsed_config(moe_strategy="fused")
     sd = meta_model(config).state_dict()
     experts = dict(_iter_resident_experts(ListingSource(listing()), config, META))
-    want = {k for k in sd if ".mlp.experts." in k}
-    assert set(experts) == want == {"model.layers.1.mlp.experts.gate_up_proj", "model.layers.1.mlp.experts.down_proj"}
-    for name, t in experts.items():
-        assert (t.shape, t.dtype) == (sd[name].shape, sd[name].dtype)
+    assert set(experts) == {"model.layers.1.mlp.experts.gate_up_proj", "model.layers.1.mlp.experts.down_proj"}
+    # since FlashML #601 a fused layer takes its experts as resident banks (Engine._load_resident_experts),
+    # not as state-dict params; the dense stream above is the reference models' source
+    assert not {k for k in sd if ".mlp.experts." in k}
 
 
 def test_engram_sources_record_rows_and_seed_ids():

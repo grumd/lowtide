@@ -48,6 +48,10 @@ def ct_set(patterns: tuple[str, ...], *, class_names: bool, exact: bool = False)
     ``targets`` keep the subtree match: MoE checkpoints target the ``...mlp.experts`` container.
     """
     plain = tuple(p for p in patterns if not p.startswith("re:") and p != "Linear")
+    # a class name other than Linear cannot be matched from a module name alone; fail here rather than serve the module bf16
+    unknown = [p for p in plain if "." not in p and p[:1].isupper()] if class_names else []
+    if unknown:
+        raise NotImplementedError(f"compressed-tensors target class {unknown[0]!r} is not supported; only Linear is")
     literal = frozenset(plain).__contains__ if exact else name_set(plain)
     regexes = [p[3:] for p in patterns if p.startswith("re:")]
     rx = re.compile("|".join(f"(?:{r})" for r in regexes)) if regexes else None

@@ -43,7 +43,7 @@ def load_extension():
         name="freetoken_wna16_cpu_prefill",
         sources=[str(_SRC / "wna16_prefill_ext.cpp")],
         extra_include_paths=[str(_SRC)],
-        extra_cflags=["-O3", "-march=native", "-std=c++17", "-pthread"],
+        extra_cflags=["-O3", "-march=native", "-std=c++20", "-pthread"],
         verbose=False,
     )
 
@@ -56,7 +56,7 @@ def load_nvfp4_extension():
         name="freetoken_nvfp4_cpu_prefill",
         sources=[str(_SRC / "nvfp4_prefill_ext.cpp")],
         extra_include_paths=[str(_SRC)],
-        extra_cflags=["-O3", "-march=native", "-std=c++17", "-pthread"],
+        extra_cflags=["-O3", "-march=native", "-std=c++20", "-pthread"],
         verbose=False,
     )
 

@@ -15,6 +15,7 @@ from .base import (
     MatchResult,
     SizeInfo,
 )
+from .format import NONE, KVFormat
 
 
 class CacheManagerCreator(Protocol):
@@ -34,7 +35,7 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     specs_fn = getattr(model_config, "kv_cache_group_specs", None)
     if specs_fn is None:
         if getattr(model_config, "dsv4_args", None) is not None:
-            from .dsv4_paged_pool import DSV4PagedKVCache
+            from .dsv4.v4_pool import DSV4PagedKVCache
 
             return DSV4PagedKVCache
         from .mha_pool import MHAKVCache
@@ -43,7 +44,7 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     specs = list(specs_fn())
     types = {spec.attn_type for spec in specs}
     if AttnType.DSV4 in types:
-        from .dsv4_paged_pool import DSV4PagedKVCache
+        from .dsv4.v4_pool import DSV4PagedKVCache
 
         return DSV4PagedKVCache
     hy4 = getattr(model_config, "hy4_args", None)
@@ -51,6 +52,10 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
         from .hy4_pool import Hy4KVCache, Hy4WindowKVCache
 
         return Hy4WindowKVCache if hy4.swa_ring else Hy4KVCache
+    if AttnType.DSV41 in types:
+        from .dsv4.v41_pool import DSV41PagedKVCache
+
+        return DSV41PagedKVCache
     if AttnType.SWA in types:
         from .hybrid_swa_pool import HybridSWAKVCache
 
@@ -85,9 +90,9 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
     the pool). Single factory entry for all pool families, DSV4 included."""
-    from .dsv4_cost_model import _dsv4_pool_sizes
+    from .dsv4.v4_cost_model import _dsv4_pool_sizes
     from .hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens
-    from .dsv4_paged_pool import DSV4PagedKVCache
+    from .dsv4.v4_pool import DSV4PagedKVCache
 
     model_config = config.model_config
     if resolve_pool_class(model_config) is DSV4PagedKVCache:
@@ -100,6 +105,21 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             device=device,
             dtype=dtype,
             P=model_config.dsv4_args.window_size,
+            n_scratch=config.max_running_req + 1,
+        )
+        pool._init_paged_state(config.max_running_req, config.cache_type != "naive")
+        return pool
+    if getattr(model_config, "dsv41_args", None) is not None:
+        from .dsv4.v41_cost_model import _dsv41_pool_sizes
+        from .dsv4.v41_pool import DSV41PagedKVCache
+
+        # Same route as DSV4: the generic CacheManager over the shared page table; the pool is the
+        # swa_pool plug-in (window tier + per-source packed main / index pools + state rings).
+        pool = DSV41PagedKVCache(
+            sizes=_dsv41_pool_sizes(config, num_pages + 1),  # +1 for dummy page
+            args=model_config.dsv41_args,
+            device=device,
+            dtype=dtype,
             n_scratch=config.max_running_req + 1,
         )
         pool._init_paged_state(config.max_running_req, config.cache_type != "naive")
@@ -140,6 +160,8 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
         kv_tier_cells=kv_tier_cells_for(config),
+        num_speculative_tokens=getattr(config, "decode_rows_per_req", 1) - 1,
+        kv_format=getattr(config, "kv_format", NONE),
     )
 
 
@@ -152,6 +174,8 @@ def create_kvcache_pool(
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
     kv_tier_cells: int = 0,
+    num_speculative_tokens: int = 0,
+    kv_format: KVFormat = NONE,
 ) -> BaseKVCachePool:
     hy4 = getattr(model_config, "hy4_args", None)
     if hy4 is not None and hy4.swa_ring:
@@ -187,6 +211,7 @@ def create_kvcache_pool(
             num_swa_tokens=num_swa_tokens,
             device=device,
             dtype=dtype,
+            kv_format=kv_format,
         )
 
     from .mha_pool import MHAKVCache
@@ -199,6 +224,8 @@ def create_kvcache_pool(
     # slabs.
     layer_ids: tuple[int, ...] | None = None
     kv_specs = [s for s in model_config.kv_cache_group_specs() if s.num_layers > 0]
+    if any(s.shared_layers for s in kv_specs):
+        raise NotImplementedError("KV-shared layers are only mapped by the hybrid full/SWA pool")
     if model_config.has_linear_attention:
         assert len(kv_specs) == 1, (
             f"hybrid-linear models support one paged-KV group, got "
@@ -226,6 +253,7 @@ def create_kvcache_pool(
             device=device,
             index_head_dim=spec.index_head_dim,
             num_index_layers=spec.num_index_layers,
+            kv_format=kv_format,
         )
 
     # QSA (Qwen3.8-Flash-Next): the same GQA group, but it stores one index key per
@@ -261,10 +289,13 @@ def create_kvcache_pool(
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
             ring_capacity=QSAKVCache.ring_capacity_for(
-                spec.index_ratio, QSAKVCache.speculative_depth(model_config)
+                spec.index_ratio,
+                max(num_speculative_tokens, QSAKVCache.speculative_depth(model_config)),
             ),
             layer_ids=spec.layer_ids,
             kv_tier_cells=kv_tier_cells,
+            mrope=model_config.model_is_mrope,
+            kv_format=kv_format,
         )
     if kv_tier_cells:
         raise ValueError("--kv-tier serves QSA (Qwen3.8-Flash-Next) pools only")
@@ -287,6 +318,7 @@ def create_kvcache_pool(
                 index_head_dim=spec.index_head_dim,
                 num_index_layers=spec.num_index_layers,
                 layer_ids=layer_ids,
+                kv_format=kv_format,
             )
             if spec.index_ratio > 1:
                 # kpool tail rings are keyed by Req.table_idx; + 1 covers the dummy request row.
@@ -310,6 +342,7 @@ def create_kvcache_pool(
             dtype=dtype,
             device=device,
             layer_ids=layer_ids,
+            kv_format=kv_format,
         )
 
     spec = kv_specs[0] if len(kv_specs) == 1 else None
@@ -322,6 +355,7 @@ def create_kvcache_pool(
         device=device,
         dtype=dtype,
         layer_ids=layer_ids,
+        kv_format=kv_format,
     )
 
 

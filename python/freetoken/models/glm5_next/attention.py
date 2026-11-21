@@ -31,6 +31,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from freetoken.layers.quantization import without_online
 from freetoken.core import get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.layers import (
@@ -149,14 +150,14 @@ class Glm5NextAttention(BaseOP):
                 self.kv_lora_rank,
                 self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
                 has_bias=False,
-                quant_config=config.quant, prefix=f"{prefix}.kv_b_proj",
+                quant_config=without_online(config.quant), prefix=f"{prefix}.kv_b_proj",
             )
             if self._tp_size == 1
             else LinearColParallelMerged(
                 self.kv_lora_rank,
                 [self.num_heads * (self.qk_nope_head_dim + self.v_head_dim)],
                 has_bias=False,
-                quant_config=config.quant, prefix=f"{prefix}.kv_b_proj",
+                quant_config=without_online(config.quant), prefix=f"{prefix}.kv_b_proj",
             )
         )
         assert self.kv_b_proj.quant_method.kind is QuantKind.NONE, f"{prefix}.kv_b_proj: a quantized kv_b_proj needs a dequantized copy for the MLA absorption"
@@ -205,26 +206,31 @@ class Glm5NextAttention(BaseOP):
 
         c_kv = self.kv_a_layernorm.forward(self.kv_a_proj_with_mqa.forward(x))
 
-        # Absorb kv_b's k-part into the query: q_nope[H,T,nope] @ W_uk[H,nope,lora].
-        q_absorbed = torch.bmm(q_nope.transpose(0, 1).contiguous(), w_uk).transpose(0, 1)
-
         indexer_inputs = (
             self.indexer.compute(x, q_a_resid)
             if getattr(ctx.attn_backend, "dsa_enabled", False)
             else None
         )
 
+        # Absorb kv_b's k-part into the query: q_nope[H,T,nope] @ W_uk[H,nope,lora].
+        # The [H,T,lora] output serves downstream as a transposed view; the dels free
+        # the q_b_proj output, the next-widest transient, before attention runs.
+        q_absorbed = torch.bmm(q_nope.transpose(0, 1), w_uk)
+        del q, q_nope, q_a_resid
+
         # Zero-width rope halves: cat/scatter no-ops in the backend.
-        q_pe = q.new_empty(t, h, 0)
-        k_rope = q.new_empty(t, 0)
+        q_pe = q_absorbed.new_empty(t, h, 0)
+        k_rope = q_absorbed.new_empty(t, 0)
         o_latent = ctx.attn_backend.mla_forward(
-            q_absorbed.contiguous(), q_pe, c_kv.contiguous(), k_rope,
+            q_absorbed.transpose(0, 1), q_pe, c_kv, k_rope,
             self.layer_id, ctx.batch, indexer_inputs=indexer_inputs,
         )  # [T, h, kv_lora_rank]
+        del q_absorbed
 
         # Absorb kv_b's v-part onto the output: o_latent[H,T,lora] @ W_uv_t[H,lora,v].
-        o = torch.bmm(o_latent.transpose(0, 1).contiguous(), w_uv).transpose(0, 1)
-        return self.o_proj.forward(o.reshape(t, h * self.v_head_dim))
+        o = torch.bmm(o_latent.transpose(0, 1), w_uv)
+        del o_latent
+        return self.o_proj.forward(o.transpose(0, 1).reshape(t, h * self.v_head_dim))
 
 
 __all__ = ["Glm5NextAttention", "Glm5NextIndexer"]

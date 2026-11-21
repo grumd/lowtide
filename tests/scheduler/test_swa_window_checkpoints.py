@@ -95,7 +95,7 @@ class Rig:
         for i in range(n_decode):
             final.append_host(torch.tensor([50_000 + int(ids[-1]) * 7 + i], dtype=torch.int32))
             final.decode_batch_idx = i + 1
-            self.cm.maybe_free_swa_out_of_window([final], forward_iter=i + 1)
+            self.cm.maybe_free_swa_out_of_window([final])
             self.cm.allocate_paged([final])
             self._forward(final)
             final.complete_one()

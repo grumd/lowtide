@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import collections
-import json
 import os
 import re
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Collection
 
 import safetensors
 import torch
@@ -39,6 +38,28 @@ def _ingest_global(spec: "Nvfp4ExpertSourceSpec", tensor: torch.Tensor) -> torch
     if spec.global_reciprocal:
         tensor = 1.0 / tensor.float()
     return tensor.to(torch.float32)
+
+
+def _activation_scale():
+    """The checkpoint tensor of the NVFP4 static activation scale under the installed dialect, or None."""
+    from freetoken.layers.quantization import QuantKind, get_quant_config
+
+    try:
+        quant = get_quant_config()
+    except RuntimeError:
+        return None
+    if quant is None or QuantKind.NVFP4 not in quant.STORAGE:
+        return None
+    return quant.stored_tensors(QuantKind.NVFP4).get("input_scale")
+
+
+def _ingest(spec: "Nvfp4ExpertSourceSpec", act, role: str, tensor: torch.Tensor) -> torch.Tensor:
+    if role.endswith("_global"):
+        return _ingest_global(spec, tensor)
+    if role.endswith("_input"):
+        tensor = tensor.float()
+        return 1.0 / tensor if act.reciprocal else tensor
+    return tensor
 
 
 def _num_moe_layers(config) -> int:
@@ -112,6 +133,7 @@ def iter_nvfp4_expert_pieces(
     config,
     spec: Nvfp4ExpertSourceSpec,
     *,
+    layers: Collection[int] | None = None,
     parallel: bool = False,
     workers: int = 8,
     chunk: int = 8 << 20,
@@ -120,10 +142,12 @@ def iter_nvfp4_expert_pieces(
 ):
     """One piece per routed expert: ``gate`` / ``up`` / ``down`` codes plus their ``_scale``
     (fp8 block scales) and ``_global`` (the per-tensor scale, reciprocal for quant-side dialects,
-    fp16) companions, straight from the safetensors shards.
+    fp32) companions, straight from the safetensors shards. When every expert also stores the
+    dialect's static activation scale, the pieces carry it as fp32 ``_input`` (dequant side).
 
     Serial reads walk the shards in order; ``parallel`` uses the chunked O_DIRECT reader. Either
     way tensors of one expert may span shards, so they are grouped by (layer, expert) as they land.
+    ``layers`` (bank layer ids, default all) reads only those layers' experts.
 
     TP: every piece is pre-sliced to the rank's intermediate shard (_tp_expert_geometry),
     so the banks built from method.layout()'s local_intermediate hold exactly the
@@ -131,15 +155,16 @@ def iter_nvfp4_expert_pieces(
     full experts per rank (and double-counting through the layer all_reduce).
     """
     from freetoken.models.loader import drop_page_cache as _drop
+    from freetoken.models.loader import safetensors_weight_map
+    from freetoken.models.nvfp4_csf import CsfPairBuffer
     from freetoken.moe.expert_pieces import per_expert_pieces
 
     drop = drop_page_cache or _drop
     folder = download_hf_weight(model_path)
-    with open(os.path.join(folder, "model.safetensors.index.json"), encoding="utf-8") as f:
-        weight_map = json.load(f)["weight_map"]
+    weight_map = safetensors_weight_map(folder)
 
-    from freetoken.models.nvfp4_csf import CsfPairBuffer
-
+    keep = None if layers is None else set(layers)
+    act = _activation_scale()
     wanted: dict[str, tuple[int, int, str]] = {}
     # CSF-compressed scales arrive as two streams per weight_scale; both are read, the
     # decoded scale is yielded under the stem (``...weight_scale``) key.
@@ -155,7 +180,7 @@ def iter_nvfp4_expert_pieces(
         if match is None:
             continue
         bank_layer = _bank_layer(spec, int(match.group("layer")), config)
-        if bank_layer is None:
+        if bank_layer is None or (keep is not None and bank_layer not in keep):
             continue
         proj = match.group("proj")
         if proj not in spec.proj_to_role:
@@ -164,9 +189,20 @@ def iter_nvfp4_expert_pieces(
         if kind not in ("weight", "weight_scale", "weight_scale_2"):
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
         wanted[name] = (bank_layer, int(match.group("expert")), spec.proj_to_role[proj] + _kind_suffix(kind))
-    expected = _num_moe_layers(config) * config.num_experts * 9
-    if len(wanted) != expected:
-        raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {expected}")
+        if kind == "weight" and act is not None:
+            act_name = name[: match.start("kind")] + act.name
+            if act_name in weight_map:
+                wanted[act_name] = (bank_layer, int(match.group("expert")), spec.proj_to_role[proj] + "_input")
+    experts = (_num_moe_layers(config) if keep is None else len(keep)) * config.num_experts
+    acts = [name for name, (_, _, role) in wanted.items() if role.endswith("_input")]
+    # a partial set serves no W4A4 kernel; the pieces then carry none
+    if len(acts) != experts * 3:
+        for name in acts:
+            del wanted[name]
+        acts = []
+    per_expert = 12 if acts else 9
+    if len(wanted) != experts * per_expert:
+        raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {experts * per_expert}")
 
     _, _, lo, hi = _tp_expert_geometry(config)
     csf = CsfPairBuffer()
@@ -177,10 +213,10 @@ def iter_nvfp4_expert_pieces(
             if decoded is None:
                 return
             name, tensor = decoded
-        if wanted[name][2].endswith("_global"):
-            tensor = _ingest_global(spec, tensor)
-        else:
-            tensor = _tp_slice_piece(wanted[name][2], tensor, lo, hi)
+        role = wanted[name][2]
+        tensor = _ingest(spec, act, role, tensor)
+        if not role.endswith(("_global", "_input")):
+            tensor = _tp_slice_piece(role, tensor, lo, hi)
         yield name, tensor
 
     def _serial():
@@ -206,7 +242,7 @@ def iter_nvfp4_expert_pieces(
             yield from _place(name, tensor)
         csf.assert_empty()
 
-    return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
+    return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=per_expert)
 
 
 __all__ = ["Nvfp4ExpertSourceSpec", "iter_nvfp4_expert_pieces"]

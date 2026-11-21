@@ -91,7 +91,7 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
-        # Processed ONE msg at a time: a speculative round delivers several msgs for
+        # Processed ONE msg at a time: our MTP / n-gram rounds deliver several msgs for
         # the same uid in one batch (accepted drafts + bonus EOS), and the incremental
         # `surr_offset`/`read_offset` bookkeeping only advances inside this loop. A
         # batched first pass would read the pre-batch offsets for the 2nd+ msg and
@@ -107,8 +107,10 @@ class DetokenizeManager:
                     sent_offset=0,
                 )
             s = self.decode_map[msg.uid]
-            if not (msg.finished and msg.next_token in self.eos_token_ids):
-                s.decoded_ids.append(msg.next_token)
+            tokens = msg.next_tokens
+            if msg.finished and tokens and tokens[-1] in self.eos_token_ids:
+                tokens = tokens[:-1]
+            s.decoded_ids.extend(tokens)
             read_str = self.tokenizer.decode(s.decoded_ids[s.surr_offset :])
             surr_str = self.tokenizer.decode(s.decoded_ids[s.surr_offset : s.read_offset])
             new_text = read_str[len(surr_str) :]
