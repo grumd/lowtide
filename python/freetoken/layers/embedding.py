@@ -51,24 +51,6 @@ class VocabParallelEmbedding(BaseOP):
         self._embed_scale_t: torch.Tensor | None = None
         self._comm = DistributedCommunicator()
 
-    def move_to_host(self) -> int:
-        """Keep the vocab shard in pinned host memory; the GPU gathers its rows over PCIe.
-
-        A step reads one row per token (5 KB for a 2560-wide bf16 table), so the shard's
-        VRAM is better spent elsewhere (the MoE expert cache) than on holding it. Returns
-        the bytes moved."""
-        from freetoken.kernel.pinned import alloc_pinned_tensor
-        from freetoken.layers.quantization import QuantKind
-
-        # only a plain table: a quantized one (gguf, df11) is not a row-gatherable bf16 shard
-        w = getattr(self, "weight", None)
-        if w is None or not w.is_cuda or self.quant_method is None or self.quant_method.kind is not QuantKind.NONE:
-            return 0
-        host = alloc_pinned_tensor(*w.shape, dtype=w.dtype)
-        host.copy_(w)
-        self.weight = host
-        return host.numel() * host.element_size()
-
     @nvtx_annotate("Embedding")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w = getattr(self, "weight", None)

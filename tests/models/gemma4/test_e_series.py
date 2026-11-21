@@ -350,3 +350,15 @@ def test_read_only_draft_view_routes_to_the_shared_target_slabs(release, overrid
     target = parse_config(_hf_config(release, **overrides))
     view = ReadOnlyTargetKVView(_SlabProbe(), _draft_view_config(target), target)
     assert [view.k_cache(i) for i in range(4)] == expected
+
+
+def test_embed_weights_auto_moves_the_untied_table_and_keeps_a_tied_one():
+    """auto: host where a plain untied table exists, otherwise gpu without an error."""
+    from freetoken.engine.engine import _host_embedding_keys
+
+    config = parse_config(_hf_config(E2B))
+    assert _host_embedding_keys(_meta_model(config), SimpleNamespace(embed_weights="auto", model_config=config)) == {
+        "model.embed_tokens_per_layer.weight"
+    }
+    tied = parse_config(_hf_config(E4B, hidden_size_per_layer_input=0, num_kv_shared_layers=0))
+    assert _host_embedding_keys(_meta_model(tied), SimpleNamespace(embed_weights="auto", model_config=tied)) == frozenset()

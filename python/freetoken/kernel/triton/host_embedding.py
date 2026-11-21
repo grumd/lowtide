@@ -1,4 +1,4 @@
-"""Embedding gather from a pinned host table (``VocabParallelEmbedding.move_to_host``).
+"""Embedding gather from a pinned host table (``--embed-weights host`` / ``auto``).
 
 Registered host memory is device-addressable on Linux, so the kernel reads the rows it
 needs straight over PCIe; ids outside this rank's vocab shard produce zero rows, which the

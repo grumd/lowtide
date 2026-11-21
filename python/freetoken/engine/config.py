@@ -61,8 +61,9 @@ class EngineConfig:
     quant_backend: str | None = None
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
-    # --embed-weights: "gpu" (default) keeps the input embedding tables in VRAM; "host" keeps the untied ones in pinned host RAM, read zero-copy by the lookup.
-    embed_weights: str = "gpu"
+    # --embed-weights: "host" keeps the untied input embedding tables in pinned host RAM, read zero-copy by the lookup; "gpu" keeps them in VRAM;
+    # "auto" (default) is "host" where a plain untied table exists and "gpu" otherwise.
+    embed_weights: str = "auto"
     # --online-quant: a QuantKind the layers this checkpoint stores bf16 are converted to at load (df11)
     online_quant: str | None = None
     # --online-quant-modules: checkpoint module names / globs that limit --online-quant to those modules

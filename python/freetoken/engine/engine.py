@@ -361,8 +361,10 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
 
 
 def _host_embedding_keys(model, config: EngineConfig) -> frozenset[str]:
-    """State-dict keys of the tables --embed-weights host keeps in pinned host RAM."""
-    if config.embed_weights != "host":
+    """State-dict keys of the tables --embed-weights host / auto keeps in pinned host RAM. A step reads one
+    row per token, so the table's VRAM is better spent on the expert cache and KV; auto skips quietly
+    where only a tied or online-quantized table exists."""
+    if config.embed_weights == "gpu":
         return frozenset()
     # a tied LM head reads its whole table every step, so that table stays on the GPU
     tied = {id(op.tied_embedding) for op in iter_ops(model) if isinstance(op, ParallelLMHead) and op.tied_embedding is not None}
@@ -370,6 +372,8 @@ def _host_embedding_keys(model, config: EngineConfig) -> frozenset[str]:
         id(op.weight) for op in iter_ops(model) if type(op) is VocabParallelEmbedding and id(op) not in tied and not op.quant_method.online
     }
     keys = frozenset(key for key, t in model.state_dict().items() if id(t) in tables)
+    if config.embed_weights == "auto":
+        return keys
     if not keys and tied:
         raise ValueError(
             "--embed-weights host: this model's embedding table is tied to its LM head, which reads the whole table "
@@ -706,13 +710,6 @@ class Engine:
         if ENV.MTP_EXPERTS_FP4:
             freed = sum(op.quantize_experts_fp4() for op in _iter_ops(self.model) if hasattr(op, "quantize_experts_fp4"))
             logger.info_rank0(f"--mtp-experts-fp4: MTP draft experts quantized to NVFP4, {mem_GB(freed)} of bf16 released per rank")
-        embed = getattr(getattr(self.model, "model", None), "embed_tokens", None)
-        if (
-            embed is not None and hasattr(embed, "move_to_host")
-            and not getattr(config.model_config, "tie_word_embeddings", True)
-        ):
-            moved = embed.move_to_host()
-            logger.info_rank0(f"Token embedding resident in pinned host RAM ({mem_GB(moved)} per rank)")
         torch.cuda.empty_cache()  # hand the freed bf16 weights back before the budget below
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
@@ -756,7 +753,7 @@ class Engine:
         ]
         self._host_tables_bytes = sum(op.weight.nbytes for op in host_embeds)
         if host_embeds:
-            logger.info_rank0(f"Embedding tables in pinned host RAM (--embed-weights host): {mem_GB(self._host_tables_bytes)}")
+            logger.info_rank0(f"Embedding tables in pinned host RAM (--embed-weights {config.embed_weights}): {mem_GB(self._host_tables_bytes)}")
         if hasattr(self.model, "load_host_tables"):
             with _weight_load_context():
                 self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)
