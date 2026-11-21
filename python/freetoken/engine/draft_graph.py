@@ -59,6 +59,9 @@ class _DraftBatch:
         self.phase = "prefill"
         self.attn_metadata = None
 
+    def get_attn_positions(self) -> torch.Tensor:
+        return self.positions
+
     @property
     def padded_reqs(self) -> List[_DraftReq]:
         return self.reqs

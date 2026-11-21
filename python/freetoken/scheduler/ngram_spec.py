@@ -358,7 +358,8 @@ class NgramSpecManager:
     # ------------------------------------------------------------------ drafting
 
     def eligible(self, r: Req) -> bool:
-        return r.table_idx != -1 and not r.aborted and r.remain_len >= 2
+        # the verify rows carry 1-D positions: exact for mrope only without a delta (no image shift)
+        return r.table_idx != -1 and not r.aborted and r.remain_len >= 2 and getattr(r, "mrope_delta", 0) == 0
 
     def _drafter(self, r: Req) -> SuffixDrafter:
         d = self._drafters.get(r.uid)

@@ -108,6 +108,9 @@ class _SynthBatch:
         self.phase = "prefill"
         self.attn_metadata = None
 
+    def get_attn_positions(self) -> torch.Tensor:
+        return self.positions
+
     @property
     def padded_reqs(self) -> List[_DraftReq]:
         return self.reqs
@@ -223,7 +226,8 @@ class MTPManager:
             self.enabled
             and req.table_idx != -1
             and not req.aborted
-            and req.mm is None
+            # its draft and verify rows carry 1-D positions: exact for mrope only without a delta
+            and getattr(req, "mrope_delta", 0) == 0
             and req.mtp_streams_row is not None
             # room for k drafts + the bonus token within max_device_len
             and req.remain_len >= self.k + 1
@@ -259,7 +263,7 @@ class MTPManager:
         offsets = torch.zeros(len(batch.reqs) + 1, dtype=torch.int64)
         zero_row = torch.zeros(self.width, dtype=streams.dtype, device=eng.device)
         for i, (r, (s, e)) in enumerate(zip(batch.reqs, pre_lens)):
-            if r.mm is not None or r.table_idx == -1:
+            if getattr(r, "mm_items", None) or getattr(r, "mrope_delta", 0) != 0 or r.table_idx == -1:
                 offsets[i + 1] = offsets[i]
                 continue
             if e <= s:

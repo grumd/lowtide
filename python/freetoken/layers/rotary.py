@@ -151,6 +151,10 @@ class MRotaryEmbedding(RotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if positions.dim() == 1:
+            # a text-only batch from a runner that builds no mrope rows (MTP / n-gram verify and
+            # drafts, which serve requests with mrope_delta == 0 only): t = h = w = the sequence index
+            positions = positions.unsqueeze(0).expand(3, -1)
         assert positions.dim() == 2, "mrope models feed [3, n] positions"
         if self._section_table.device != query.device:
             self._section_table = self._section_table.to(query.device)
