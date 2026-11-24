@@ -74,7 +74,7 @@ def _fp8b_gemv_m_kernel(
     x_ptr, w_ptr, s_ptr, y_ptr, N, K, stride_wn, stride_sn, stride_xm, stride_ym,
     M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ROUND: tl.constexpr,
 ):
-    # gemv._gemv_m_kernel (M <= 4 rows off one load of each weight tile), K % BLOCK_K == 0
+    # gemv._gemv_m_kernel (M <= 8 rows off one load of each weight tile), K % BLOCK_K == 0
     rows = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     rmask = rows < N
     cols = tl.arange(0, BLOCK_K)
@@ -88,6 +88,10 @@ def _fp8b_gemv_m_kernel(
     acc1 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
     acc2 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
     acc3 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    acc4 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    acc5 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    acc6 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    acc7 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
     for k0 in range(0, K, BLOCK_K):
         v = tl.load(w_ptrs, mask=rmask[:, None], other=0, eviction_policy="evict_first")
         s = tl.load(s_ptrs + k0 // 128).to(tl.float32)
@@ -99,6 +103,14 @@ def _fp8b_gemv_m_kernel(
             acc2 = _fp8b_gemv_m_acc(acc2, w, x_ptr + 2 * stride_xm, k0, cols)
         if M > 3:
             acc3 = _fp8b_gemv_m_acc(acc3, w, x_ptr + 3 * stride_xm, k0, cols)
+        if M > 4:
+            acc4 = _fp8b_gemv_m_acc(acc4, w, x_ptr + 4 * stride_xm, k0, cols)
+        if M > 5:
+            acc5 = _fp8b_gemv_m_acc(acc5, w, x_ptr + 5 * stride_xm, k0, cols)
+        if M > 6:
+            acc6 = _fp8b_gemv_m_acc(acc6, w, x_ptr + 6 * stride_xm, k0, cols)
+        if M > 7:
+            acc7 = _fp8b_gemv_m_acc(acc7, w, x_ptr + 7 * stride_xm, k0, cols)
         w_ptrs += BLOCK_K
     ty = y_ptr.dtype.element_ty
     tl.store(y_ptr + rows, tl.sum(acc0, axis=1).to(ty), mask=rmask)
@@ -108,6 +120,14 @@ def _fp8b_gemv_m_kernel(
         tl.store(y_ptr + 2 * stride_ym + rows, tl.sum(acc2, axis=1).to(ty), mask=rmask)
     if M > 3:
         tl.store(y_ptr + 3 * stride_ym + rows, tl.sum(acc3, axis=1).to(ty), mask=rmask)
+    if M > 4:
+        tl.store(y_ptr + 4 * stride_ym + rows, tl.sum(acc4, axis=1).to(ty), mask=rmask)
+    if M > 5:
+        tl.store(y_ptr + 5 * stride_ym + rows, tl.sum(acc5, axis=1).to(ty), mask=rmask)
+    if M > 6:
+        tl.store(y_ptr + 6 * stride_ym + rows, tl.sum(acc6, axis=1).to(ty), mask=rmask)
+    if M > 7:
+        tl.store(y_ptr + 7 * stride_ym + rows, tl.sum(acc7, axis=1).to(ty), mask=rmask)
 
 
 @triton.jit
@@ -173,10 +193,10 @@ def gemv_rows_fp8_block(x: torch.Tensor, weight: torch.Tensor, scale_inv: torch.
     N, _ = _check(weight, scale_inv)
     if out is None:
         out = torch.empty((M, N), dtype=x.dtype, device=x.device)
-    bn, bk, warps = _gemv_tiles(N, K, _config_m)
     w = weight.view(torch.uint8)
     for m0 in range(0, M, _ROWS_PER_LAUNCH):
         m = min(_ROWS_PER_LAUNCH, M - m0)
+        bn, bk, warps = _gemv_tiles(N, K, lambda n, k, _m=m: _config_m(n, k, _m))
         _fp8b_gemv_m_kernel[(triton.cdiv(N, bn),)](
             x[m0:], w, scale_inv, out[m0:], N, K, weight.stride(0), scale_inv.stride(0), x.stride(0), out.stride(0),
             M=m, BLOCK_N=bn, BLOCK_K=bk, ROUND=round_bf16, num_warps=warps,

@@ -128,6 +128,7 @@ class MoELayer(BaseOP):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        reduce: bool = True,
     ) -> torch.Tensor:
         """Expert compute for an externally computed routing decision (``TopK``).
 
@@ -140,7 +141,7 @@ class MoELayer(BaseOP):
         that.
         """
         out = self._resident_gemm(hidden_states, topk_weights, topk_ids)
-        return self._maybe_all_reduce(out)
+        return self._maybe_all_reduce(out) if reduce else out
 
     def forward(
         self,
@@ -263,6 +264,7 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        reduce: bool = True,
     ) -> torch.Tensor:
         """Expert compute for an externally computed routing decision (``TopK``).
 
@@ -276,7 +278,7 @@ class OffloadMoELayer(MoELayer):
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)
-        return self._maybe_all_reduce(out)
+        return self._maybe_all_reduce(out) if reduce else out
 
     def decode_forward(
         self,

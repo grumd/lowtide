@@ -39,6 +39,20 @@ def rope_inv_freq(theta: float, dim: int) -> torch.Tensor:
 def apply_rope(x: torch.Tensor, positions: torch.Tensor, inv_freq: torch.Tensor) -> torch.Tensor:
     """Rotate the trailing ``2 * len(inv_freq)`` dims of ``x [N, ..., D]`` as interleaved
     pairs at ``positions [N]``; leading dims pass through. Returns a new tensor."""
+    if (
+        x.is_cuda
+        and positions.is_cuda
+        and inv_freq.is_cuda
+        and x.dim() >= 2
+        and positions.dim() == 1
+        and inv_freq.dim() == 1
+        and positions.shape[0] == x.shape[0]
+        and inv_freq.numel() <= 512
+        and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+    ):
+        from freetoken.kernel.triton.hy4_rope import hy4_apply_rope_triton
+
+        return hy4_apply_rope_triton(x, positions, inv_freq)
     r = 2 * inv_freq.numel()
     freqs = positions.to(torch.float32)[:, None] * inv_freq
     shape = (x.shape[0],) + (1,) * (x.dim() - 2) + (r // 2,)

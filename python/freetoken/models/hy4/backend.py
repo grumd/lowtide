@@ -371,6 +371,10 @@ class Hy4AttnBackend(Glm5NextDSABackend):
         own = (q_pos // self.kpool).to(torch.int64)
         if k == 0:
             return own.new_empty(*own.shape, 0)
+        if scores.is_cuda and own.is_cuda and k <= 1024 and n < (1 << 30):
+            from freetoken.kernel.triton.hy4_topk import hy4_pick_groups
+
+            return hy4_pick_groups(scores, own, k)
         grp = torch.arange(n, device=scores.device, dtype=torch.int64)
         scores = scores.masked_fill(grp >= own[..., None], float("-inf"))
         picks = order_key(scores).topk(k, dim=-1).indices
