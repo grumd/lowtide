@@ -142,10 +142,14 @@ class Hy4AttnBackend(Glm5NextDSABackend):
 
     def _attend(self, q_cat, layer_id, sel, cnt, sinks=None) -> torch.Tensor:
         from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
+        from freetoken.kvcache.format import NONE
 
+        kv_format = getattr(self.kvcache, "kv_format", NONE)
+        scale = self.kvcache.latent_scale(layer_id) if kv_format.quantized else None
         return glm_dsa_sparse_attn(
             q_cat, self.kvcache.latent_rows(layer_id), sel, self.sm_scale,
             counts=cnt, d_v=self.kv_lora_rank, sinks=sinks,
+            kv_format=kv_format, scale=scale,
         )
 
     # ----- index store -------------------------------------------------------------------
@@ -324,12 +328,16 @@ class Hy4AttnBackend(Glm5NextDSABackend):
         # one query per program row with a single decode step's split: each row reduces in
         # the same order as that step would
         from freetoken.kernel.triton.glm_dsa_sparse import _split_count, glm_dsa_sparse_attn
+        from freetoken.kvcache.format import NONE
 
         sel = sel.expand(n, t, sel.shape[-1]).reshape(total, 1, -1)
         splits = _split_count(1, 1, h, sel.shape[-1], q_cat.device)
+        kv_format = getattr(self.kvcache, "kv_format", NONE)
+        scale = self.kvcache.latent_scale(layer_id) if kv_format.quantized else None
         o = glm_dsa_sparse_attn(
             q_cat.view(total, 1, h, d), self.kvcache.latent_rows(layer_id), sel, self.sm_scale,
             counts=cnt.reshape(total, 1), d_v=self.kv_lora_rank, sinks=sinks, force_splits=splits,
+            kv_format=kv_format, scale=scale,
         )
         return o.view(total, h, self.kv_lora_rank)
 
@@ -340,12 +348,15 @@ class Hy4AttnBackend(Glm5NextDSABackend):
         block's own latents, causal inside the block. The block rows live in a per-call buffer,
         never in the shared cache. ``q_cat [n*t, H, 576]``; returns ``[n*t, H, 512]``."""
         from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
+        from freetoken.kvcache.format import NONE
 
         n, w = hist.shape
         total, h, d = q_cat.shape
         t = total // n
         pool = self.kvcache.latent_rows(layer_id)
-        blk = torch.cat([c_kv, k_rope], dim=-1).to(pool.dtype).view(n, t, d)
+        kv_format = getattr(self.kvcache, "kv_format", NONE)
+        scale = self.kvcache.latent_scale(layer_id) if kv_format.quantized else None
+        blk = torch.cat([c_kv, k_rope], dim=-1).to(q_cat.dtype).view(n, t, d)
         if hist_cnt is None:
             if w == 0:
                 hist_cnt = torch.zeros(n, dtype=torch.int32, device=hist.device)
@@ -357,6 +368,7 @@ class Hy4AttnBackend(Glm5NextDSABackend):
         o = glm_dsa_sparse_attn(
             q_cat.view(n, t, h, d), pool, hist.view(n, 1, w), self.sm_scale,
             counts=hist_cnt.view(n, 1), d_v=self.kv_lora_rank, sinks=sinks, extra_kv=blk,
+            kv_format=kv_format, scale=scale,
         )
         return o.view(total, h, self.kv_lora_rank)
 

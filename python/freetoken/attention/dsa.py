@@ -203,10 +203,14 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
     ) -> torch.Tensor:
         """Gathered-KV MLA over latent rows: q [b, m, H, 576] -> [b, m, H, 512]."""
         from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
+        from freetoken.kvcache.format import NONE
 
+        kv_format = getattr(self.kvcache, "kv_format", NONE)
+        scale = self.kvcache.latent_scale(layer_id) if kv_format.quantized else None
         return glm_dsa_sparse_attn(
             q_cat, self.kvcache.latent_rows(layer_id), sel, self.sm_scale,
             counts=cnt, d_v=self.kv_lora_rank,
+            kv_format=kv_format, scale=scale,
         )
 
     def mla_forward(

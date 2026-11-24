@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
+from freetoken.kvcache.format import NONE, ROW_SCALE_FORMATS
 from freetoken.utils import Registry, init_logger
 
 from .base import AttentionSpec, AttnType, BaseAttnBackend, BaseAttnMetadata, HybridBackend
@@ -33,6 +34,8 @@ class BackendInfo:
     # Whether forward() honors a per-call AttentionSpec (window/sm_scale/sinks).
     # Non-consumers raise on a non-None spec instead of silently dropping it.
     consumes_attn_spec: bool = False
+    # KV storage formats forward() can read natively (kvcache/format.py names)
+    kv_formats: frozenset[str] = frozenset({"none"})
 
 
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
@@ -108,7 +111,7 @@ def create_dsv4_sparse_backend(config: ModelConfig):
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
     "dsa",
-    BackendInfo(supported_types=frozenset({AttnType.MLA, AttnType.DSA})),
+    BackendInfo(supported_types=frozenset({AttnType.MLA, AttnType.DSA}), kv_formats=ROW_SCALE_FORMATS),
 )
 def create_dsa_backend(config: ModelConfig):
     # Hy4 also groups its index (ratio 4), so it must branch before the kpool check.
@@ -192,6 +195,11 @@ def create_attention_backend(
         backend = p_backend  # both are the same, fall through to single backend
         logger.warning(f"P/D attention backends are the same: {backend}, using single backend.")
 
+    from freetoken.core import get_global_ctx
+
+    kv_format = getattr(get_global_ctx().kv_cache, "kv_format", NONE)
+    if kv_format.name not in attention_backend_info(backend).kv_formats:
+        raise ValueError(f"attention backend {backend!r} cannot read {kv_format.name} KV")
     return SUPPORTED_ATTENTION_BACKENDS[backend](config)
 
 

@@ -28,6 +28,7 @@ from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
+from freetoken.kvcache.format import NONE, KVFormat
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
     _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
@@ -99,9 +100,10 @@ def _required_attn_types(model_config) -> frozenset[AttnType]:
     return types or frozenset({AttnType.FULL})
 
 
-def _backend_parts_serve(name: str, required: frozenset[AttnType]) -> bool:
+def _backend_parts_serve(name: str, required: frozenset[AttnType], kv_format: KVFormat = NONE) -> bool:
     return all(
         required <= attention_backend_info(part).supported_types
+        and kv_format.name in attention_backend_info(part).kv_formats
         for part in name.split(",")
     )
 
@@ -119,7 +121,7 @@ def _backend_requirements_met(name: str) -> bool:
     return True
 
 
-def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
+def _resolve_auto_attention_backend(required: frozenset[AttnType], kv_format: KVFormat = NONE) -> str:
     """First candidate (in per-type priority order) whose arch condition holds,
     whose packages are installed, and whose every comma part serves ALL required
     types. Reproduces the historical hardware tree for FULL-only models:
@@ -145,15 +147,34 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
     for name, arch_ok in candidates:
         if not arch_ok:
             continue
-        if not _backend_parts_serve(name, required):
+        if not _backend_parts_serve(name, required, kv_format):
             continue
         if not _backend_requirements_met(name):
             continue
         return name
     raise RuntimeError(
         "No attention backend can serve attention types "
-        f"{sorted(t.value for t in required)} on this machine."
+        f"{sorted(t.value for t in required)} with KV format {kv_format.name} on this machine."
     )
+
+
+def _validate_kv_format(config, model_config) -> None:
+    kv_format = getattr(config, "kv_format", NONE)
+    if not kv_format.quantized:
+        return
+    pool_cls = resolve_pool_class(model_config)
+    if kv_format.name not in pool_cls.kv_formats:
+        raise ValueError(
+            f"--kv-cache-dtype {kv_format.name}: {pool_cls.__name__} only stores {sorted(pool_cls.kv_formats)}"
+        )
+    if config.dtype != torch.bfloat16:
+        raise ValueError(
+            f"--kv-cache-dtype {kv_format.name} needs --dtype bfloat16, got {config.dtype}"
+        )
+    if config.tp_info.size != 1 and not getattr(pool_cls, "kv_formats_tp", False):
+        raise ValueError(
+            f"--kv-cache-dtype {kv_format.name} does not support tensor parallelism for {pool_cls.__name__} yet"
+        )
 
 
 def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
@@ -188,6 +209,12 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 f"{getattr(model_config, 'model_type', 'model')} uses {missing_names} "
                 f"attention, which backend {part!r} does not support; valid backends: "
                 f"{', '.join(valid)} (or auto), got {config.attention_backend!r}."
+            )
+        kv_format = getattr(config, "kv_format", NONE)
+        if kv_format.name not in info.kv_formats:
+            raise ValueError(
+                f"--kv-cache-dtype {kv_format.name}: backend {part!r} cannot read that format, "
+                f"got {config.attention_backend!r}."
             )
         if AttnType.SWA in required and not info.consumes_attn_spec:
             # SWA models drive window/sinks/sm_scale through the per-call AttentionSpec;
@@ -2452,10 +2479,11 @@ def _adjust_config(config: EngineConfig):
             "--dtype float16 with MXFP8 resident weights is unsupported (the "
             "W8A16 fold is only validated exact in bfloat16); use bfloat16."
         )
+    _validate_kv_format(config, model_config)
     if config.attention_backend == "auto":
         override(
             "attention_backend",
-            _resolve_auto_attention_backend(required_attn_types),
+            _resolve_auto_attention_backend(required_attn_types, getattr(config, "kv_format", NONE)),
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)

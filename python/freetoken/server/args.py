@@ -226,6 +226,7 @@ def parse_args(
     """
     from freetoken.attention import validate_attn_backend
     from freetoken.kvcache import SUPPORTED_CACHE_MANAGER
+    from freetoken.kvcache.format import KV_FORMATS, NONE
     from freetoken.moe import MOE_STRATEGIES
 
     def _parse_quant_backend(value: str) -> str:
@@ -596,6 +597,16 @@ def parse_args(
         choices=SUPPORTED_CACHE_MANAGER.supported_names(),
         help="KV cache strategy (naive | radix). For hybrid GDN models 'radix' is materialized "
         "as a GDN-aware radix (cross-request GDN-state prefix reuse); pass 'naive' to opt out.",
+    )
+
+    parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        default=ServerArgs.kv_cache_dtype,
+        choices=["auto", *(name for name in KV_FORMATS if name != NONE.name)],
+        help="How K and V are stored. 'auto' keeps the compute dtype. The per_token_head formats store 8 bits per "
+        "element plus one scale per token and head (two per MLA latent row); the dsa attention backend reads them. "
+        "Needs --dtype bfloat16.",
     )
 
     parser.add_argument(

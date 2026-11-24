@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, List
 
 import torch
 from freetoken.distributed import DistributedInfo
+from freetoken.kvcache.format import KVFormat, resolve_kv_format
 from freetoken.models.register import _load_attr, get_model_spec
 from freetoken.utils import cached_load_hf_config, init_logger
 from freetoken.utils.hf import optional_hf_file
@@ -51,6 +52,8 @@ class EngineConfig:
     dtype: torch.dtype
     max_running_req: int = 4
     attention_backend: str = "auto"
+    # --kv-cache-dtype: "auto" stores K and V in the compute dtype
+    kv_cache_dtype: str = "auto"
     moe_strategy: str = "auto"
     # old name of moe_strategy; __post_init__ folds it in
     moe_backend: str | None = field(default=None, repr=False)
@@ -190,6 +193,10 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+
+    @property
+    def kv_format(self) -> KVFormat:
+        return resolve_kv_format(self.kv_cache_dtype)
 
     def __post_init__(self):
         if self.moe_backend is None:

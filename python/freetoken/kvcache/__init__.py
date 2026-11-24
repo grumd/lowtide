@@ -15,6 +15,7 @@ from .base import (
     MatchResult,
     SizeInfo,
 )
+from .format import NONE, KVFormat
 
 
 class CacheManagerCreator(Protocol):
@@ -116,6 +117,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             device=device,
             dtype=dtype,
             num_req_slots=config.max_running_req + 1,
+            kv_format=getattr(config, "kv_format", NONE),
         )
         pool.configure_checkpoints(config)
         return pool
@@ -140,6 +142,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
         kv_tier_cells=kv_tier_cells_for(config),
+        kv_format=getattr(config, "kv_format", NONE),
     )
 
 
@@ -152,6 +155,7 @@ def create_kvcache_pool(
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
     kv_tier_cells: int = 0,
+    kv_format: KVFormat = NONE,
 ) -> BaseKVCachePool:
     hy4 = getattr(model_config, "hy4_args", None)
     if hy4 is not None and hy4.swa_ring:
@@ -173,6 +177,7 @@ def create_kvcache_pool(
             num_window_tokens=num_swa_tokens,
             num_req_slots=num_req_slots,
             index_ratio=hy4.index_ratio,
+            kv_format=kv_format,
         )
     if kv_tier_cells and model_config.has_swa_attention:
         raise ValueError("--kv-tier serves QSA (Qwen3.8-Flash-Next) pools only")
@@ -287,6 +292,7 @@ def create_kvcache_pool(
                 index_head_dim=spec.index_head_dim,
                 num_index_layers=spec.num_index_layers,
                 layer_ids=layer_ids,
+                kv_format=kv_format,
             )
             if spec.index_ratio > 1:
                 # kpool tail rings are keyed by Req.table_idx; + 1 covers the dummy request row.
@@ -310,6 +316,7 @@ def create_kvcache_pool(
             dtype=dtype,
             device=device,
             layer_ids=layer_ids,
+            kv_format=kv_format,
         )
 
     spec = kv_specs[0] if len(kv_specs) == 1 else None
