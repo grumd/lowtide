@@ -109,7 +109,7 @@ class Hy4Model(BaseOP):
             assert store.layers == [layer._layer_id for layer in self._engram_layers], store.layers
         self._engram_store = store
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, batch=None) -> torch.Tensor:
         streams = hc_expand(self.embed_tokens.forward(input_ids), self._n)
         engram = None
         if self._engram_layers:
