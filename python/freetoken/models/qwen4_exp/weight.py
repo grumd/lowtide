@@ -650,14 +650,19 @@ def repack_ple_nvfp4(paths: list[str], out_dir: str, *, file_bytes: int = 4 << 3
 def ple_source_folder(model_path: str) -> str:
     """Folder to read the PLE n-gram table from.
 
-    An FTW is self-contained and normally carries its own ``model-plefp8-*`` side
-    tables; an older/partial FTW may not. In that case fall back to the source
-    checkpoint recorded in the FTW index, so the table is read from the raw shards
-    instead of failing the serve."""
+    An FTW is self-contained and normally carries the table in ``engram/``; FTWs converted
+    before that keep it next to the shards, and an older/partial FTW may not carry it at all.
+    In that case fall back to the source checkpoint recorded in the FTW index, so the table
+    is read from the raw shards instead of failing the serve."""
     folder = download_hf_weight(model_path)
-    from freetoken.checkpoint.ftw import FTWReader, is_ftw_checkpoint
+    from freetoken.checkpoint.ftw import ENGRAM_DIR, FTWReader, is_ftw_checkpoint
 
-    if not is_ftw_checkpoint(folder) or _has_ple_shards(folder):
+    if not is_ftw_checkpoint(folder):
+        return folder
+    own = os.path.join(folder, ENGRAM_DIR)
+    if os.path.isdir(own) and _has_ple_shards(own):
+        return own
+    if _has_ple_shards(folder):
         return folder
     try:
         source = FTWReader(folder).meta("source_model_path")

@@ -76,8 +76,6 @@ EXPERTS_PER_PIECE = 32
 # attention linears the release stores as block FP8 on layers >= 1 (module names)
 FP8_ATTENTION = ("q_b_proj", "gate_proj", "o_proj")
 EXPERT_QUANT_ENV = "FREETOKEN_HY4_EXPERT_QUANT"
-# an FTW's own Engram tables: release-format shards and their index (ftw_engram_files)
-ENGRAM_DIR = "engram"
 SAFETENSORS_INDEX = "model.safetensors.index.json"
 
 _LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
@@ -153,13 +151,18 @@ def _read_header(path: str) -> tuple[dict, int]:
 
 
 class CheckpointSource(TensorSource):
-    """Lazy reader over a sharded safetensors checkpoint directory (CPU tensors)."""
+    """Lazy reader over a sharded safetensors checkpoint directory (CPU tensors). Without a
+    ``model.safetensors.index.json`` the tensors are found by reading every shard's header."""
 
     def __init__(self, folder: str):
         super().__init__()
         self.folder = folder
-        with open(os.path.join(folder, SAFETENSORS_INDEX), encoding="utf-8") as fh:
-            self._weight_map: dict[str, str] = json.load(fh)["weight_map"]
+        index = os.path.join(folder, SAFETENSORS_INDEX)
+        if os.path.isfile(index):
+            with open(index, encoding="utf-8") as fh:
+                self._weight_map: dict[str, str] = json.load(fh)["weight_map"]
+        else:
+            self._weight_map = _scan_weight_map(folder)
         self._headers: dict[str, tuple[dict, int]] = {}
         self._handles: dict[str, object] = {}
 
@@ -811,17 +814,35 @@ def engram_sources(src: TensorSource, config) -> list[EngramTableSource]:
     return out
 
 
+def _scan_weight_map(folder: str) -> dict[str, str]:
+    weight_map: dict[str, str] = {}
+    for name in sorted(os.listdir(folder)):
+        if not name.endswith(".safetensors"):
+            continue
+        for key in _read_header(os.path.join(folder, name))[0]:
+            if key == "__metadata__":
+                continue
+            if key in weight_map:
+                raise ValueError(f"{folder}: {key} is in both {weight_map[key]} and {name}; remove one of them")
+            weight_map[key] = name
+    return weight_map
+
+
+def _has_safetensors(folder: str) -> bool:
+    return os.path.isdir(folder) and any(n.endswith(".safetensors") for n in os.listdir(folder))
+
+
 def source_checkpoint(model_path: str) -> str:
     """The folder the Engram tables are read from: ``model_path`` itself for a raw checkpoint. An
     FTW carries no tables among its entries: its own ``engram/`` directory (``ft checkpoint
     --include-engram``), else the ``source_model_path`` its index records."""
-    from freetoken.checkpoint.ftw import FTWReader, is_ftw_checkpoint
+    from freetoken.checkpoint.ftw import ENGRAM_DIR, FTWReader, is_ftw_checkpoint
 
     folder = download_hf_weight(model_path)
     if not is_ftw_checkpoint(folder):
         return folder
     own = os.path.join(folder, ENGRAM_DIR)
-    if os.path.isfile(os.path.join(own, SAFETENSORS_INDEX)):
+    if _has_safetensors(own):
         return own
     source = FTWReader(folder).meta("source_model_path")
     if not (isinstance(source, str) and os.path.isfile(os.path.join(source, SAFETENSORS_INDEX))):
@@ -876,17 +897,21 @@ def _write_table_file(table: EngramTableSource, dst: str, chunk: int = 64 << 20)
 
 def ftw_engram_files(model_path: str, out_dir: str) -> list[str]:
     """``ft checkpoint --include-engram``: give the FTW at ``out_dir`` its own Engram tables in
-    ``engram/``, a release-format folder (original keys and bytes, its own safetensors index) the
-    server reads in place exactly like the source's. A shard holding only tables is hardlinked
-    (copied when the link fails, e.g. across filesystems), so it costs no disk on the same
-    filesystem; a table that shares its shard with other tensors gets a file of its own. Returns
-    the written paths relative to ``out_dir``."""
+    ``engram/`` (original keys and bytes, no index), read in place like the source's. A shard
+    holding only tables is hardlinked under its release name (copied when the link fails, e.g.
+    across filesystems), so it costs no disk on the same filesystem; a table that shares its shard
+    with other tensors gets a file of its own. Returns the written paths relative to ``out_dir``."""
+    from freetoken.checkpoint.ftw import ENGRAM_DIR
+
     config = parse_config(cached_load_hf_config(model_path))
     src = CheckpointSource(source_checkpoint(model_path))
     tables = engram_sources(src, config)
     keys = {t.key for t in tables}
     dest = os.path.join(out_dir, ENGRAM_DIR)
     os.makedirs(dest, exist_ok=True)
+    stale_index = os.path.join(dest, SAFETENSORS_INDEX)
+    if os.path.lexists(stale_index):  # an index would take precedence over the header scan
+        os.unlink(stale_index)
     weight_map: dict[str, str] = {}
     for t in tables:
         header, _ = _read_header(t.path)
@@ -899,12 +924,7 @@ def ftw_engram_files(model_path: str, out_dir: str) -> list[str]:
             _write_table_file(t, os.path.join(dest, name))
         weight_map[t.key] = name
     total = sum(t.rows * t.row_bytes for t in tables)
-    index = os.path.join(dest, SAFETENSORS_INDEX)
-    if os.path.lexists(index):
-        os.unlink(index)
-    with open(index, "w", encoding="utf-8") as fh:
-        json.dump({"metadata": {"total_size": total}, "weight_map": dict(sorted(weight_map.items()))}, fh, indent=2)
-    files = sorted(set(weight_map.values())) + [SAFETENSORS_INDEX]
+    files = sorted(set(weight_map.values()))
     logger.info("FTW Engram: %d table(s), %.1f GiB in %s/", len(tables), total / 2**30, ENGRAM_DIR)
     return [f"{ENGRAM_DIR}/{f}" for f in files]
 
@@ -936,7 +956,6 @@ __all__ = [
     "EXPERT_QUANT_ENV",
     "REQUANT_MARKER",
     "CheckpointSource",
-    "ENGRAM_DIR",
     "EngramTableSource",
     "TensorSource",
     "adjust_hf_config",
