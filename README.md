@@ -1,14 +1,23 @@
-# FreeToken fork for Qwen3.8-Flash-Next on 1-2 GPUs
+# Lowtide
 
-Optimized for **Qwen3.8-Flash-Next** if you have 96GB+ RAM and one or two RTX 3080 20 GB-class GPUs.
+**Low** - for low VRAM machines. **Tide** - uuh eeh idk, maybe for how MoE experts come and go between VRAM and RAM.
 
-Recommended to use with Nvidia's [QAD FP4 quant](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local). But it also supports Intel's [INT4 W4A16](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound)
+The philosophy: VRAM is precious and limited, and how much of the model fits in it decides the inference speed you'll get.
+Lowtide tries to minimize wasted VRAM through a few tricks:
+- As much VRAM as possible is gives to MoE expert cache to improve the decode speed.
+- Experts not in VRAM cache are partially computed on the CPU, partially streamed via PCIe. The ratio is dynamically set based on live measurements on your specific hardware.
+- More KV cache is only allocated when context actually grows, leaving more space for expert cache.
+- Prefill compute buffers are only initialized during prefill and freed during decode to give more space for expert cache.
+- Engram is read from the disk.
+- If you're short on RAM, experts that are already cached on VRAM are dropped from RAM (costs 4-5% decode speed).
 
-MoE experts are pinned to host RAM. There's no setting for context length. As a session's used context grows, it dynamically allocates more KV cache. All the remaining free VRAM is used for MoE expert cache to speed up decode. 
+Models supported so far:
+- **Qwen3.8-Flash-Next** - [grumd0/Qwen3.8-Flash-Next-FP4-Local-Lowtide](https://huggingface.co/grumd0/Qwen3.8-Flash-Next-FP4-Local-Lowtide) converted from Nvidia's FP4-Local QAD quant, with a BF16 PLE table; 
+- **Hy4-flash** - [grumd0/Hy4-flash-NVFP4-Lowtide](https://huggingface.co/grumd0/Hy4-flash-NVFP4-Lowtide) - quantized to NVFP4 from the official FP8 checkpoint
 
-## Benchmarks
+## Qwen3.8-Flash-Next
 
-Nvidia FP4, `scripts/serve.sh` defaults.
+NVIDIA FP4 + BF16 PLE table, `scripts/serve.sh` defaults.
 
 | Setup | Decode | + MTP | 16k prefill (first / warm) | Max context |
 |---|---|---|---|---|
@@ -35,21 +44,21 @@ The checkpoint's MTP head drafts tokens and the model checks them in one pass; t
 
 ### Compared with llama.cpp and Strata
 
-Single request, 262k context with a 16-bit KV cache. FreeToken runs NVIDIA's FP4; [llama.cpp](https://github.com/ggml-org/llama.cpp) (build 12428) and [Strata](https://github.com/Niko1221/Strata) (0.2.9) run unsloth's [UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) GGUF.
+Single request, 262k context with a 16-bit KV cache. Lowtide runs NVIDIA's FP4; [llama.cpp](https://github.com/ggml-org/llama.cpp) (build 12428) and [Strata](https://github.com/Niko1221/Strata) (0.2.9) run unsloth's [UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) GGUF.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/bench/decode-dark.png">
-  <img src="assets/bench/decode.png" alt="Decode speed vs context depth for FreeToken and Strata with and without MTP, and llama.cpp, on two and one RTX 3080">
+  <img src="assets/bench/decode.png" alt="Decode speed vs context depth for Lowtide and Strata with and without MTP, and llama.cpp, on two and one RTX 3080">
 </picture>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/bench/prefill-dark.png">
-  <img src="assets/bench/prefill.png" alt="Prefill speed vs context depth for FreeToken, llama.cpp and Strata on two and one RTX 3080">
+  <img src="assets/bench/prefill.png" alt="Prefill speed vs context depth for Lowtide, llama.cpp and Strata on two and one RTX 3080">
 </picture>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/bench/agent-dark.png">
-  <img src="assets/bench/agent.png" alt="Prefill speed of agent turns by new prompt tokens for FreeToken, llama.cpp and Strata on two and one RTX 3080">
+  <img src="assets/bench/agent.png" alt="Prefill speed of agent turns by new prompt tokens for Lowtide, llama.cpp and Strata on two and one RTX 3080">
 </picture>
 
 **Quality:** KL divergence from the BF16 model's logits ([jyohukuchan/qwen38-flash-next-bf16-logits](https://huggingface.co/datasets/jyohukuchan/qwen38-flash-next-bf16-logits)).
@@ -57,68 +66,42 @@ Single request, 262k context with a 16-bit KV cache. FreeToken runs NVIDIA's FP4
 | Engine · quant | KLD | Same top token |
 |---|---|---|
 | Strata · UD-Q4_K_XL | 0.078 | 92.6% |
-| FreeToken · NVIDIA FP4 + BF16 PLE table (benchmarked above) | 0.096 | 91.4% |
+| Lowtide · NVIDIA FP4 + BF16 PLE table (benchmarked above) | 0.096 | 91.4% |
 | llama.cpp · UD-Q4_K_XL | 0.100 | 91.9% |
-| FreeToken · NVIDIA FP4 + included PLE table | 0.109 | 91.0% |
+| Lowtide · NVIDIA FP4 + included PLE table | 0.109 | 91.0% |
 | Strata · UD-Q3_K_XL | 0.116 | 90.1% |
 | Strata · UD-IQ4_XS | 0.118 | 90.3% |
 
-- FreeToken with MTP scores the same as without (0.095).
-- The PLE table is a per-layer token embedding read from disk; NVIDIA's checkpoint stores it in NVFP4, the benchmarks above swap in the BF16 table from Intel's checkpoint.
+- Lowtide with MTP scores the same as without (0.095).
+- The PLE table is a per-layer token embedding read from disk; NVIDIA's checkpoint stores it in NVFP4, the benchmarks above use the BF16 table from Intel's checkpoint.
 
 **Settings**
-- **FreeToken:** `scripts/serve.sh` defaults, `GPUS=1` for one GPU; MTP with the flags above.
+- **Lowtide:** `scripts/serve.sh` defaults, `GPUS=0` for one GPU; MTP with the flags above.
 - **llama.cpp on 2 GPUs:** `-cmoe --moe-cache-mib 16000 --moe-cache-cpu-share 0.9 -ub 4096 -b 4096 -ts 1,1 -fa on -lm none`. Without `--moe-cache-cpu-share` it decoded at 42 instead of 52-54 tok/s.
 - **llama.cpp on 1 GPU:** `-cmoe --moe-cache-mib 5000 --moe-cache-cpu-share 0.9 -ub 2048 -b 2048 -fa on -lm none`.
-- **Strata:** setup's config for the unsloth files: every expert in RAM, KV beyond 32k streamed from RAM, `--spec 4` with its prompt-lookup drafts (FreeToken's `--ngram-spec` is on too), `STRATA_ROUTE_TAIL_SKIP=0` (the default skips some experts: faster, lower quality).
+- **Strata:** setup's config for the unsloth files: every expert in RAM, KV beyond 32k streamed from RAM, `--spec 4` with its prompt-lookup drafts (Lowtide's `--ngram-spec` is on too), `STRATA_ROUTE_TAIL_SKIP=0` (the default skips some experts: faster, lower quality).
   - MTP: setup's draft layer (`--mtp <draft layer> --spec 4 --spec-min-p 0.5`).
+
+## Hy4-flash
+
+[Tencent Hy4-flash](https://huggingface.co/tencent/Hy4-flash) (220B total parameters including 63.5B of Engram tables, ~11.3B active) on two GPUs. The Engram tables (118 GiB) are read from disk row by row, so keep the checkpoint on a fast NVMe drive.
+
+- **Decode:** 26-32 tok/s on 2x RTX 3080 20 GB at 4k context. `--mtp on` turns on the checkpoint's DFly2 drafter: 1.35x on average across chat, code and tool-call tasks.
+- **Quality:** KL divergence vs the FP8 original is 0.019-0.048 depending on the text ([model card](https://huggingface.co/grumd0/Hy4-flash-NVFP4-Lowtide)).
+- **RAM:** the NVFP4 experts take 78 GiB; on a 96 GB machine the engine's RAM saver drops the RAM copy of experts cached in VRAM. Text only.
 
 ## Quick start
 
 Linux, CUDA 13 with `nvcc`, 96 GB of RAM; an AVX-512 BF16 CPU speeds up prefill ([details](scripts/README.md#requirements)).
 
 ```bash
-git clone https://github.com/grumd/freetoken && cd freetoken
+git clone https://github.com/grumd/lowtide && cd lowtide
 uv venv && source .venv/bin/activate
 uv pip install -e ".[accel]"
 
-hf download nvidia/Qwen3.8-Flash-Next-FP4-Local --local-dir ~/models/q38-fp4-hf
-ft checkpoint --model ~/models/q38-fp4-hf --out ~/models/ftw/q38-fp4   # one-time fast-load conversion
-MODEL=~/models/ftw/q38-fp4 scripts/serve.sh                      # API on :8080, chat page at /
+hf download grumd0/Qwen3.8-Flash-Next-FP4-Local-Lowtide
+MODEL=<path-to-model> scripts/serve.sh
 ```
-
-For INT4, download `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` instead (169 GB; FP4 is faster).
-
-## Configuration
-
-The defaults fit most setups. Context and expert cache size themselves to your free VRAM; there is no context-length setting.
-
-| To | Do |
-|---|---|
-| Pick GPUs | `GPUS=1 scripts/serve.sh` (default: every GPU, up to two) |
-| Decode faster with MTP | add the flags for your setup from [MTP speculative decoding](#mtp-speculative-decoding) |
-| Tune CPU-assisted decode (one GPU) | run `scripts/calibrate.sh` once (~12 min) and pass the flags it prints |
-| Keep old chats in RAM (128 GB machines) | `PREFIX_CACHE_RAM_GB=16 scripts/serve.sh` |
-| Trade a little accuracy for +5% decode (one GPU) | `scripts/serve.sh --dense-mxfp8-groups lm_head` (lossy, off by default) |
-
-Prefill chunks: `--prefill-batch-min` (2048) tokens of activation VRAM are always reserved. Longer prompts borrow what their chunk needs from the expert cache, up to `--prefill-batch-max` (16384) tokens, and give it back before decoding.
-
-Every setting: [`scripts/README.md`](scripts/README.md).
-
-## What this fork adds
-
-- Experts in pinned host RAM behind a VRAM expert cache that grows and shrinks with the live context
-- Hybrid prefill: chunks up to 4096 tokens (3072 on two GPUs) load only their routed experts, and the CPU computes part of the cache misses while the GPU fetches the rest
-- Prefill takes only the VRAM each prompt needs and keeps decode's experts cached, so agent turns start fast
-- CPU-assisted decode on one GPU: the CPU computes most VRAM-cache misses instead of copying them over PCIe, with a one-time calibration script for the split
-- MTP speculative decoding with the checkpoint's own head (opt-in, `--mtp on`): sampled drafts, CUDA-graphed draft/verify/commit, lossless; +17-24% decode at temperature 1.0
-- Prompt-lookup speculative decoding (`--ngram-spec`, on in `serve.sh`): lossless, no draft model; +55-61% decode when the reply repeats its context (code edits), about even on prose
-- Opt-in MXFP8 for more dense layers (`--dense-mxfp8-groups lm_head`): +5% decode on one GPU, KLD within run-to-run noise; off by default because it rounds the weights
-- W4A16 and NVFP4 kernels tuned for RTX 30-series, and a two-GPU all-reduce over P2P or shared host memory
-- NVIDIA's FP4-Local checkpoint, the vision tower on the CPU, and a chat page at `/`
-- An optional host-RAM tier for old conversations' prefixes
-
-Each change with its commit and measured effect: [`docs/fork-changes.md`](docs/fork-changes.md).
 
 ## For contributors
 
@@ -129,7 +112,7 @@ Each change with its commit and measured effect: [`docs/fork-changes.md`](docs/f
 
 ## Citation & Acknowledgment
 
-FreeToken (upstream). Please cite the original paper:
+Lowtide is built on [FreeToken](https://github.com/FlashML-org/FreeToken) by FlashML, through [anon761/freetoken](https://github.com/anon761/freetoken), which laid the Qwen3.8-Flash-Next groundwork (vision, MTP, tensor parallelism, W4A16 experts). Please cite the FreeToken paper:
 
 ```bibtex
 @article{yang2026freetoken,
