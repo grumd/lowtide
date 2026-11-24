@@ -582,6 +582,120 @@ float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float
 #endif  // avx512vnni available
 #endif
 
+// --------------- NVFP4 multi-token expert-tiled AVX-512-BF16 -----------------
+// Uses vdpbf16ps to compute M <= 8 routes sharing the same expert in one pass
+// (unpacking each 64-K weight chunk once for all M routes). Mirrors nvfp4_cpu.h
+// (CPU prefill) with per-function target attributes so this TU stays portable
+// without global -march.
+constexpr int NVFP4_MT = 8;
+constexpr int NVFP4_IBLK = 64;
+constexpr int NVFP4_HBLK = 64;
+
+// Pack bf16 activations [K] (K % 64 == 0) into lane pairs for vdpbf16ps:
+// lane j in [0..15] of chunk c covers k in [64c+4j, 64c+4j+3] (one 16-K scale
+// block per 4 lanes): lo takes (k, k+2), hi takes (k+1, k+3).
+inline void nvfp4_pack_pairs(const bf16_t* x, int K, uint32_t* lo, uint32_t* hi) {
+  for (int c = 0; c < K / 64; ++c) {
+    for (int j = 0; j < 16; ++j) {
+      const bf16_t* b = x + 64 * c + 4 * j;
+      lo[16 * c + j] = static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[2]) << 16);
+      hi[16 * c + j] = static_cast<uint32_t>(b[1]) | (static_cast<uint32_t>(b[3]) << 16);
+    }
+  }
+}
+
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512BF16)
+__attribute__((target("avx512bf16,avx512vl,avx512bw,avx512f,fma,f16c")))
+static inline __m512i nvfp4_e2m1_bf16_lut() {
+  // index = 4-bit e2m1 code -> exact bf16 value (repeated twice: vpermw reads 5 bits)
+  return _mm512_set_epi16(
+      int16_t(0xC0C0), int16_t(0xC080), int16_t(0xC040), int16_t(0xC000), int16_t(0xBFC0),
+      int16_t(0xBF80), int16_t(0xBF00), int16_t(0x8000), 0x40C0, 0x4080, 0x4040, 0x4000,
+      0x3FC0, 0x3F80, 0x3F00, 0x0000,
+      int16_t(0xC0C0), int16_t(0xC080), int16_t(0xC040), int16_t(0xC000), int16_t(0xBFC0),
+      int16_t(0xBF80), int16_t(0xBF00), int16_t(0x8000), 0x40C0, 0x4080, 0x4040, 0x4000,
+      0x3FC0, 0x3F80, 0x3F00, 0x0000);
+}
+
+// Four e4m3 scale bytes -> 16 fp32 lanes (lane j gets byte j/4) scaled by 2^-8.
+// Exact for all 256 OCP e4m3fn encodings (including subnormals); caller scales by 256.
+__attribute__((target("avx512bf16,avx512vl,avx512bw,avx512f,fma,f16c")))
+static inline __m512 nvfp4_scale_lanes(const uint8_t* s4) {
+  const __m128i spread = _mm_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+  uint32_t v;
+  std::memcpy(&v, s4, 4);
+  const __m512i b =
+      _mm512_cvtepu8_epi32(_mm_shuffle_epi8(_mm_cvtsi32_si128(static_cast<int>(v)), spread));
+  const __m512i h = _mm512_or_si512(
+      _mm512_slli_epi32(_mm512_and_si512(b, _mm512_set1_epi32(0x80)), 8),
+      _mm512_slli_epi32(_mm512_and_si512(b, _mm512_set1_epi32(0x7F)), 7));
+  return _mm512_cvtph_ps(_mm512_cvtepi32_epi16(h));
+}
+
+// out[m * ld + r] = G[r] * sum_k W[r, k] * x_m[k] for rows [0, rows), K = 64 * nchunks.
+template <int M>
+__attribute__((target("avx512bf16,avx512vl,avx512bw,avx512f,fma,f16c")))
+static void nvfp4_rows_dot_bf16(const uint8_t* P, const uint8_t* S, const float* G, int rows,
+                                int nchunks, const uint32_t* const* xlo,
+                                const uint32_t* const* xhi, float* out, int ld) {
+  const __m512i lut = nvfp4_e2m1_bf16_lut();
+  const __m512i low4 = _mm512_set1_epi16(0xF);
+  const int64_t prow = static_cast<int64_t>(nchunks) * 32;
+  const int64_t srow = static_cast<int64_t>(nchunks) * 4;
+  const int pfb = nvfp4_pf_blocks();
+  const int64_t pf_bytes = (pfb < 0) ? 1024 : static_cast<int64_t>(pfb) * 8;
+  const int64_t pf_s_bytes = (pfb < 0) ? 128 : static_cast<int64_t>(pfb);
+  const uint8_t* const p_end = P + static_cast<int64_t>(rows) * prow;
+  const uint8_t* const s_end = S + static_cast<int64_t>(rows) * srow;
+  for (int r = 0; r < rows; ++r) {
+    const uint8_t* pr = P + r * prow;
+    const uint8_t* sr = S + r * srow;
+    __m512 acc[M];
+    for (int m = 0; m < M; ++m) acc[m] = _mm512_setzero_ps();
+    for (int c = 0; c < nchunks; ++c) {
+      if (pf_bytes > 0 && (c & 1) == 0) {
+        const uint8_t* ppf = pr + 32 * c + pf_bytes;
+        if (ppf < p_end) _mm_prefetch(reinterpret_cast<const char*>(ppf), _MM_HINT_T0);
+        if ((c & 15) == 0) {
+          const uint8_t* spf = sr + 4 * c + pf_s_bytes;
+          if (spf < s_end) _mm_prefetch(reinterpret_cast<const char*>(spf), _MM_HINT_T0);
+        }
+      }
+      const __m512i w =
+          _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(pr + 32 * c)));
+      const __m512bh wlo = (__m512bh)_mm512_permutexvar_epi16(_mm512_and_si512(w, low4), lut);
+      const __m512bh whi = (__m512bh)_mm512_permutexvar_epi16(_mm512_srli_epi16(w, 4), lut);
+      const __m512 sv = nvfp4_scale_lanes(sr + 4 * c);
+#pragma GCC unroll 8
+      for (int m = 0; m < M; ++m) {
+        __m512 t = _mm512_dpbf16_ps(_mm512_setzero_ps(), wlo,
+                                    (__m512bh)_mm512_loadu_si512(xlo[m] + 16 * c));
+        t = _mm512_dpbf16_ps(t, whi, (__m512bh)_mm512_loadu_si512(xhi[m] + 16 * c));
+        acc[m] = _mm512_fmadd_ps(t, sv, acc[m]);
+      }
+    }
+    const float g = G[r] * 256.0f;
+    for (int m = 0; m < M; ++m) out[m * ld + r] = _mm512_reduce_add_ps(acc[m]) * g;
+  }
+}
+
+static inline void nvfp4_rows_dot_bf16_dispatch(int M, const uint8_t* P, const uint8_t* S,
+                                                const float* G, int rows, int nchunks,
+                                                const uint32_t* const* xlo,
+                                                const uint32_t* const* xhi, float* out, int ld) {
+  switch (M) {
+    case 1: nvfp4_rows_dot_bf16<1>(P, S, G, rows, nchunks, xlo, xhi, out, ld); break;
+    case 2: nvfp4_rows_dot_bf16<2>(P, S, G, rows, nchunks, xlo, xhi, out, ld); break;
+    case 3: nvfp4_rows_dot_bf16<3>(P, S, G, rows, nchunks, xlo, xhi, out, ld); break;
+    case 4: nvfp4_rows_dot_bf16<4>(P, S, G, rows, nchunks, xlo, xhi, out, ld); break;
+    case 5: nvfp4_rows_dot_bf16<5>(P, S, G, rows, nchunks, xlo, xhi, out, ld); break;
+    case 6: nvfp4_rows_dot_bf16<6>(P, S, G, rows, nchunks, xlo, xhi, out, ld); break;
+    case 7: nvfp4_rows_dot_bf16<7>(P, S, G, rows, nchunks, xlo, xhi, out, ld); break;
+    default: nvfp4_rows_dot_bf16<8>(P, S, G, rows, nchunks, xlo, xhi, out, ld); break;
+  }
+}
+#endif
+
 // =====================================================================================
 // CUDA stream memory operations (driver API, resolved via dlopen -- no link-time or
 // toolchain dependence). The GPU side of the flag handshake: submit = WRITE_VALUE
@@ -737,6 +851,20 @@ nvdot_fn select_nvdot() {
 #endif
   (void)t;
   return dot_nvfp4_scalar;
+}
+
+inline bool cpu_has_avx512bf16() {
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512BF16)
+  return pick_isa() >= ISA_AVX512BF16 &&
+         __builtin_cpu_supports("avx512bf16") &&
+         __builtin_cpu_supports("avx512vl") &&
+         __builtin_cpu_supports("avx512bw") &&
+         __builtin_cpu_supports("avx512f") &&
+         __builtin_cpu_supports("f16c") &&
+         __builtin_cpu_supports("fma");
+#else
+  return false;
+#endif
 }
 
 // AVX-VNNI (VEX-256 VPDPBUSD) availability: Alder/Raptor Lake, Sapphire Rapids+, Zen5.
@@ -1387,6 +1515,7 @@ struct CpuMoeExecutor {
   nvdot_fn nvdot;
   nvi8dot_fn nvi8dot = nullptr;  // AVX-VNNI W4A8 nvfp4 dot (nullptr -> use fp32 nvdot)
   bool use_vnni = false;         // nvfp4 + AVX-VNNI: decode via int8 VPDPBUSD (W4A8)
+  bool use_nvfp4_tiled = false;  // nvfp4 + AVX-512-BF16: multi-token expert-tiled vdpbf16ps
   bool use_q4a8 = false;       // q4_0: always W4A8 (llama.cpp Q4_0 x Q8_0); int8 pre-quant
   bool simd_prep = false;      // AVX-512 deinterleave / int8 quant of the activations
   std::string isa_base;
@@ -1421,6 +1550,24 @@ struct CpuMoeExecutor {
   // w4a16: the activations as bf16 pairs (w4_pack_pairs), input [max_tokens*H/2] and
   // intermediate [..*top_k*I/2]
   std::vector<uint32_t> xp_scratch, gp_scratch;
+  // nvfp4 tiled AVX-512-BF16: activations as (lo, hi) bf16 lane pairs (nvfp4_pack_pairs)
+  std::vector<uint32_t> xlo_bf16, xhi_bf16;  // [max_tokens * (H/4)]
+  std::vector<uint32_t> glo_bf16, ghi_bf16;  // [max_tokens * top_k * (I/4)]
+  // Active-route compaction (all formats) and expert grouping (nvfp4 tiled).
+  // expert_slot is sized to num_experts and kept all -1 outside submit() by resetting
+  // only the num_unique_experts touched entries.
+  std::vector<int> active_routes;
+  std::vector<int> active_tokens;
+  std::vector<int> tok_pos;
+  std::vector<int> expert_slot;
+  std::vector<int> slot_expert_raw;
+  std::vector<int> slot_count_raw;
+  std::vector<int> cnt_bucket;
+  std::vector<int> slot_expert;
+  std::vector<int> expert_start;
+  std::vector<int> grp_cursor;
+  std::vector<int> grouped_routes;
+  int num_unique_experts = 0;
   std::string isa_str;
 
   std::vector<std::thread> workers;
@@ -1459,6 +1606,7 @@ struct CpuMoeExecutor {
   std::atomic<int64_t> prt_next{0};  // ds_fp4 intermediate fp8 round-trip phase
   int64_t p1_total = 0, p2_total = 0, prt_total = 0;
   int n_iblk = 0, n_hblk = 0;
+  int nvfp4_hblk = NVFP4_HBLK;
   std::atomic<int> done_count{0};
   std::atomic<int> bar_count{0};
   std::atomic<int> bar_sense{0};
@@ -1575,6 +1723,7 @@ struct CpuMoeExecutor {
     // / scalar for the tier, so the tag reflects which of those q4dot resolved to.
     nvi8dot = select_nvi8dot();
     use_vnni = (weight_format == WF_NVFP4) && (nvi8dot != nullptr);
+    use_nvfp4_tiled = can_nvfp4_tiled();
     use_q4a8 = (weight_format == WF_Q4_0);
     const char* q4tag = use_q4a8 ? (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)" : "+q4_0-w4a8") : "";
     const char* vnni_tag =
@@ -1587,6 +1736,10 @@ struct CpuMoeExecutor {
     // e8m0 (mxfp4 block scale) = 2^(s-127); the GPU GEMV clamps s to [0,254].
     for (int i = 0; i < 256; ++i) e8m0_lut[i] = std::ldexp(1.0f, std::min(i, 254) - 127);
     g_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
+    expert_slot.assign(static_cast<size_t>(num_experts), -1);
+    active_routes.reserve(static_cast<size_t>(max_tokens) * top_k);
+    active_tokens.reserve(static_cast<size_t>(max_tokens));
+    tok_pos.assign(static_cast<size_t>(max_tokens), -1);
     // Row-major fp4 (nvfp4/ds_fp4) pre-deinterleaves activations to fp32 even/odd.
     needs_di = (fmt == WF_NVFP4 || fmt == WF_DSFP4);
     if (needs_di) {
@@ -1600,6 +1753,12 @@ struct CpuMoeExecutor {
         xas_scratch.assign(static_cast<size_t>(max_tokens) * (H / 16), 0);
         gi8_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
         gas_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 16), 0);
+      }
+      if (use_nvfp4_tiled) {
+        xlo_bf16.assign(static_cast<size_t>(max_tokens) * (H / 4), 0);
+        xhi_bf16.assign(static_cast<size_t>(max_tokens) * (H / 4), 0);
+        glo_bf16.assign(static_cast<size_t>(max_tokens) * top_k * (I / 4), 0);
+        ghi_bf16.assign(static_cast<size_t>(max_tokens) * top_k * (I / 4), 0);
       }
     }
     // q4_0 W4A8: per-32-block Q8_0 activations (int8 + fp32 scale) for input + intermediate.
@@ -1780,6 +1939,10 @@ struct CpuMoeExecutor {
   }
 
   void do_pass1(const MoeTask* t, int64_t p) {
+    if (use_nvfp4_tiled) {
+      do_pass1_nvfp4_tiled(t, p);
+      return;
+    }
     if (fmt == WF_MXFP4) {
       do_pass1_mxfp4(t, p);
       return;
@@ -1793,12 +1956,10 @@ struct CpuMoeExecutor {
       return;
     }
     const int64_t ib = p % n_iblk;
-    const int64_t tk = p / n_iblk;
-    const int k = static_cast<int>(tk % top_k);
-    const int tok = static_cast<int>(tk / top_k);
-    const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
-    if (e < 0 || e >= num_experts) return;
-    const float w_in = apply_on_input ? t->w[static_cast<size_t>(tok) * top_k + k] : 1.0f;
+    const int r = active_routes[static_cast<size_t>(p / n_iblk)];
+    const int tok = r / top_k;
+    const int e = t->ids[r];
+    const float w_in = apply_on_input ? t->w[r] : 1.0f;
     // Resolve this task's layer base once; row indexing below is layer-local (e).
     const bf16_t* gate_up_l = reinterpret_cast<const bf16_t*>(tbl_at(gate_up_tbl, t->layer_id));
     const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
@@ -1813,7 +1974,7 @@ struct CpuMoeExecutor {
     const float* xas = use_vnni ? xas_scratch.data() + (size_t)tok * (H / 16)
                      : use_q4a8 ? xas_scratch.data() + (size_t)tok * (H / 32)
                                   : nullptr;
-    bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
+    bf16_t* g_row = g_scratch.data() + static_cast<size_t>(r) * I;
     const int i0 = static_cast<int>(ib) * IBLK;
     const int i1 = std::min(I, i0 + IBLK);
     const bool clamped = act == ACT_SWIGLUOAI || act == ACT_SWIGLU_CLAMP;
@@ -1840,7 +2001,150 @@ struct CpuMoeExecutor {
     }
   }
 
+  void do_pass1_nvfp4_tiled(const MoeTask* t, int64_t p) {
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512BF16)
+    const int64_t ib = p % n_iblk;
+    const int u = static_cast<int>(p / n_iblk);
+    const int e = slot_expert[u];
+    const int r_begin = expert_start[u];
+    const int r_end = expert_start[u + 1];
+    const int i0 = static_cast<int>(ib) * NVFP4_IBLK;
+    const int ni = std::min(NVFP4_IBLK, I - i0);
+    const int nchunks = H / 64;
+    const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
+    const uint8_t* gu_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, t->layer_id));
+    const float* gu_global_l =
+        reinterpret_cast<const float*>(tbl_at(gu_global_tbl, t->layer_id));
+    const size_t gate_row = static_cast<size_t>(e) * (2 * I) + i0;
+    const size_t up_row = gate_row + I;
+    const uint8_t* p_gate = gu_packed_l + gate_row * static_cast<size_t>(H / 2);
+    const uint8_t* s_gate = gu_scale_l + gate_row * static_cast<size_t>(H / 16);
+    const float* g_gate = gu_global_l + gate_row;
+    const uint8_t* p_up = gu_packed_l + up_row * static_cast<size_t>(H / 2);
+    const uint8_t* s_up = gu_scale_l + up_row * static_cast<size_t>(H / 16);
+    const float* g_up = gu_global_l + up_row;
+    alignas(64) float gate_buf[NVFP4_MT * NVFP4_IBLK];
+    alignas(64) float up_buf[NVFP4_MT * NVFP4_IBLK];
+    const bool clamped = act == ACT_SWIGLUOAI || act == ACT_SWIGLU_CLAMP;
+    const float up_bias = act == ACT_SWIGLUOAI ? 1.0f : 0.0f;
+    const float lim = swiglu_limit, alpha = swiglu_alpha;
+    for (int off = r_begin; off < r_end; off += NVFP4_MT) {
+      const int M = std::min(NVFP4_MT, r_end - off);
+      const uint32_t* xl[NVFP4_MT];
+      const uint32_t* xh[NVFP4_MT];
+      for (int m = 0; m < M; ++m) {
+        const int tok = grouped_routes[off + m] / top_k;
+        xl[m] = xlo_bf16.data() + static_cast<size_t>(tok) * (H / 4);
+        xh[m] = xhi_bf16.data() + static_cast<size_t>(tok) * (H / 4);
+      }
+      nvfp4_rows_dot_bf16_dispatch(M, p_gate, s_gate, g_gate, ni, nchunks, xl, xh, gate_buf, ni);
+      nvfp4_rows_dot_bf16_dispatch(M, p_up, s_up, g_up, ni, nchunks, xl, xh, up_buf, ni);
+      for (int m = 0; m < M; ++m) {
+        const int r = grouped_routes[off + m];
+        const float w_in = apply_on_input ? t->w[r] : 1.0f;
+        bf16_t* g_dst = g_scratch.data() + static_cast<size_t>(r) * I + i0;
+        const float* gm = gate_buf + m * ni;
+        const float* um = up_buf + m * ni;
+        if (clamped) {
+          for (int j = 0; j < ni; ++j) {
+            float gate = gm[j] * w_in;
+            float up = um[j] * w_in;
+            if (gate > lim) gate = lim;
+            if (up > lim) up = lim;
+            else if (up < -lim) up = -lim;
+            const float glu = gate / (1.0f + std::exp(-gate * alpha));
+            g_dst[j] = f32_to_bf16(glu * (up + up_bias));
+          }
+        } else if (act == ACT_SILU) {
+          for (int j = 0; j < ni; ++j) {
+            const float gate = gm[j] * w_in;
+            const float up = um[j] * w_in;
+            g_dst[j] = f32_to_bf16((gate / (1.0f + std::exp(-gate))) * up);
+          }
+        } else {
+          for (int j = 0; j < ni; ++j) {
+            const float gate = gm[j] * w_in;
+            const float up = um[j] * w_in;
+            g_dst[j] = f32_to_bf16(act_apply(act, gate) * up);
+          }
+        }
+      }
+    }
+#else
+    (void)t;
+    (void)p;
+#endif
+  }
+
+  void do_pass2_nvfp4_tiled(const MoeTask* t, int64_t p) {
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512BF16)
+    const int h0 = static_cast<int>(p) * nvfp4_hblk;
+    const int nh = std::min(nvfp4_hblk, H - h0);
+    const int n_at = static_cast<int>(active_tokens.size());
+    const int nchunks = I / 64;
+    constexpr int kStackTok = 16;
+    alignas(64) float acc_stack[kStackTok * NVFP4_HBLK];
+    std::vector<float> acc_heap;
+    float* acc_base = acc_stack;
+    if (n_at > kStackTok) {
+      acc_heap.resize(static_cast<size_t>(n_at) * nh);
+      acc_base = acc_heap.data();
+    }
+    std::memset(acc_base, 0, sizeof(float) * static_cast<size_t>(n_at) * nh);
+    const uint8_t* dn_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id));
+    const uint8_t* dn_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(dn_scale_tbl, t->layer_id));
+    const float* dn_global_l =
+        reinterpret_cast<const float*>(tbl_at(dn_global_tbl, t->layer_id));
+    alignas(64) float dn_buf[NVFP4_MT * NVFP4_HBLK];
+    for (int u = 0; u < num_unique_experts; ++u) {
+      const int e = slot_expert[u];
+      const int r_begin = expert_start[u];
+      const int r_end = expert_start[u + 1];
+      const size_t row_base = static_cast<size_t>(e) * H + h0;
+      const uint8_t* p_dn = dn_packed_l + row_base * static_cast<size_t>(I / 2);
+      const uint8_t* s_dn = dn_scale_l + row_base * static_cast<size_t>(I / 16);
+      const float* g_dn = dn_global_l + row_base;
+      for (int off = r_begin; off < r_end; off += NVFP4_MT) {
+        const int M = std::min(NVFP4_MT, r_end - off);
+        const uint32_t* gl[NVFP4_MT];
+        const uint32_t* gh[NVFP4_MT];
+        for (int m = 0; m < M; ++m) {
+          const int r = grouped_routes[off + m];
+          gl[m] = glo_bf16.data() + static_cast<size_t>(r) * (I / 4);
+          gh[m] = ghi_bf16.data() + static_cast<size_t>(r) * (I / 4);
+        }
+        nvfp4_rows_dot_bf16_dispatch(M, p_dn, s_dn, g_dn, nh, nchunks, gl, gh, dn_buf, nh);
+        for (int m = 0; m < M; ++m) {
+          const int r = grouped_routes[off + m];
+          const int tp = tok_pos[r / top_k];
+          const float w_out = apply_on_input ? 1.0f : t->w[r];
+          float* dst = acc_base + static_cast<size_t>(tp) * nh;
+          const float* src = dn_buf + m * nh;
+          for (int c = 0; c < nh; ++c) dst[c] += w_out * src[c];
+        }
+      }
+    }
+    for (int tp = 0; tp < n_at; ++tp) {
+      const int tok = active_tokens[tp];
+      const float* src = acc_base + static_cast<size_t>(tp) * nh;
+      if (t->y32) {
+        std::memcpy(t->y32 + static_cast<size_t>(tok) * H + h0, src, sizeof(float) * nh);
+      } else {
+        bf16_t* dst = t->y + static_cast<size_t>(tok) * H + h0;
+        for (int c = 0; c < nh; ++c) dst[c] = f32_to_bf16(src[c]);
+      }
+    }
+#else
+    (void)t;
+    (void)p;
+#endif
+  }
+
   void do_pass2(const MoeTask* t, int64_t p) {
+    if (use_nvfp4_tiled) {
+      do_pass2_nvfp4_tiled(t, p);
+      return;
+    }
     if (fmt == WF_MXFP4) {
       do_pass2_mxfp4(t, p);
       return;
@@ -1854,7 +2158,7 @@ struct CpuMoeExecutor {
       return;
     }
     const int64_t hb = p % n_hblk;
-    const int tok = static_cast<int>(p / n_hblk);
+    const int tok = active_tokens[static_cast<size_t>(p / n_hblk)];
     const int h0 = static_cast<int>(hb) * HBLK;
     const int h1 = std::min(H, h0 + HBLK);
     // Resolve this task's layer base once; row indexing below is layer-local (e).
@@ -1905,11 +2209,9 @@ struct CpuMoeExecutor {
   void do_pass1_w4a16(const MoeTask* t, int64_t p) {
 #ifdef CPU_MOE_HAS_W4A16
     const int64_t ib = p % n_iblk;
-    const int64_t tk = p / n_iblk;
-    const int k = static_cast<int>(tk % top_k);
-    const int tok = static_cast<int>(tk / top_k);
-    const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
-    if (e < 0 || e >= num_experts) return;
+    const int r = active_routes[static_cast<size_t>(p / n_iblk)];
+    const int tok = r / top_k;
+    const int e = t->ids[r];
     const int N1 = 2 * I;
     const int32_t* qw = reinterpret_cast<const int32_t*>(tbl_at(gate_up_tbl, t->layer_id)) +
                         (size_t)e * (H / 8) * N1;
@@ -1922,7 +2224,7 @@ struct CpuMoeExecutor {
     float gate[W4_COLS], up[W4_COLS];
     w4a16_cols64(qw, qz, sc, N1, i0, H, 0, xp, gate);
     w4a16_cols64(qw, qz, sc, N1, I + i0, H, 0, xp, up);
-    bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
+    bf16_t* g_row = g_scratch.data() + static_cast<size_t>(r) * I;
     // the GPU's expression (wna16_decode._reduce_silu_mul_kernel)
     for (int c = 0; c < W4_COLS; ++c) g_row[i0 + c] = f32_to_bf16(gate[c] / (1.0f + std::exp(-gate[c])) * up[c]);
 #else
@@ -1933,7 +2235,7 @@ struct CpuMoeExecutor {
   void do_pass2_w4a16(const MoeTask* t, int64_t p) {
 #ifdef CPU_MOE_HAS_W4A16
     const int64_t hb = p % n_hblk;
-    const int tok = static_cast<int>(p / n_hblk);
+    const int tok = active_tokens[static_cast<size_t>(p / n_hblk)];
     const int h0 = static_cast<int>(hb) * W4_COLS;
     const int32_t* qw_l = reinterpret_cast<const int32_t*>(tbl_at(down_tbl, t->layer_id));
     const int32_t* qz_l = reinterpret_cast<const int32_t*>(tbl_at(dn_global_tbl, t->layer_id));
@@ -1969,11 +2271,9 @@ struct CpuMoeExecutor {
 
   void do_pass1_mxfp4(const MoeTask* t, int64_t p) {
     const int64_t ib = p % n_iblk;
-    const int64_t tk = p / n_iblk;
-    const int k = static_cast<int>(tk % top_k);
-    const int tok = static_cast<int>(tk / top_k);
-    const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
-    if (e < 0 || e >= num_experts) return;
+    const int r = active_routes[static_cast<size_t>(p / n_iblk)];
+    const int tok = r / top_k;
+    const int e = t->ids[r];
     // Resolve this task's layer base once; row indexing below is layer-local (e).
     const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
     const uint8_t* gu_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, t->layer_id));
@@ -1991,7 +2291,7 @@ struct CpuMoeExecutor {
     float gu[2 * IBLK];
     mxgemv(gu, blk_e + col0, scl_e + col0, x_row, Hh, N2, ncol, e2m1_lut, e8m0_lut);
     const bf16_t* bias_e = gu_bias_l + (size_t)e * N2 + col0;
-    bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
+    bf16_t* g_row = g_scratch.data() + static_cast<size_t>(r) * I;
     const float lim = swiglu_limit, alpha = swiglu_alpha;
     for (int j = 0; j < nunit; ++j) {
       float gate = gu[2 * j] + bf16_to_f32(bias_e[2 * j]);
@@ -2006,7 +2306,7 @@ struct CpuMoeExecutor {
 
   void do_pass2_mxfp4(const MoeTask* t, int64_t p) {
     const int64_t hb = p % n_hblk;
-    const int tok = static_cast<int>(p / n_hblk);
+    const int tok = active_tokens[static_cast<size_t>(p / n_hblk)];
     const int Ih = I / 2;            // packed-K rows
     const int h0 = static_cast<int>(hb) * HBLK;
     const int h1 = std::min(H, h0 + HBLK);
@@ -2040,11 +2340,9 @@ struct CpuMoeExecutor {
 
   void do_pass1_dsfp4(const MoeTask* t, int64_t p) {
     const int64_t ib = p % n_iblk;
-    const int64_t tk = p / n_iblk;
-    const int k = static_cast<int>(tk % top_k);
-    const int tok = static_cast<int>(tk / top_k);
-    const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
-    if (e < 0 || e >= num_experts) return;
+    const int r = active_routes[static_cast<size_t>(p / n_iblk)];
+    const int tok = r / top_k;
+    const int e = t->ids[r];
     // Resolve this task's layer base once; row indexing below is layer-local (e).
     const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
     const uint8_t* gu_scale_l = reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, t->layer_id));
@@ -2054,7 +2352,7 @@ struct CpuMoeExecutor {
     const float* xo = xo_scratch.data() + (size_t)tok * (H / 2);
     const uint8_t* gp = gu_packed_l + (size_t)e * N2 * Hh;
     const uint8_t* gs = gu_scale_l + (size_t)e * N2 * Hs;
-    bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
+    bf16_t* g_row = g_scratch.data() + static_cast<size_t>(r) * I;
     const int i0 = static_cast<int>(ib) * IBLK;
     const int i1 = std::min(I, i0 + IBLK);
     const float lim = swiglu_limit;
@@ -2084,46 +2382,62 @@ struct CpuMoeExecutor {
     deinterleave_bf16_f32(src, even, odd, K);
   }
 
-  // Switch the nvfp4 GEMV between W4A8 (int8 activations, VNNI) and the fp32-activation dot.
-  // Call before the first task.
+  bool can_nvfp4_tiled() const {
+    return fmt == WF_NVFP4 && !use_vnni && H % 64 == 0 && I % 64 == 0 && cpu_has_avx512bf16();
+  }
+
+  // Switch the nvfp4 GEMV between W4A8 (int8 activations, VNNI) and the fp32-activation dot
+  // (or AVX-512-BF16 multi-token tiled path when supported). Call before the first task.
   void set_w4a8(bool on) {
     const bool want = on && fmt == WF_NVFP4 && nvi8dot != nullptr;
     use_vnni = want;
+    use_nvfp4_tiled = can_nvfp4_tiled();
     if (want) {
       xi8_scratch.resize(xe_scratch.size() * 2);
       xas_scratch.resize(xe_scratch.size() / 8);
       gi8_scratch.resize(ge_scratch.size() * 2);
       gas_scratch.resize(ge_scratch.size() / 8);
     }
+    if (use_nvfp4_tiled && xlo_bf16.size() < xe_scratch.size() / 2) {
+      xlo_bf16.assign(xe_scratch.size() / 2, 0);
+      xhi_bf16.assign(xe_scratch.size() / 2, 0);
+      glo_bf16.assign(ge_scratch.size() / 2, 0);
+      ghi_bf16.assign(ge_scratch.size() / 2, 0);
+    }
     isa_str = isa_base + (use_vnni ? (cpu_has_avx512vnni() ? "+avx512vnni(nvfp4-w4a8)" : "+vnni(nvfp4-w4a8)") : "") +
               (fmt == WF_W4A16 ? "(w4a16)" : "");
     isa = isa_str.c_str();
   }
 
-  void prep_g_row(int64_t r) {
-    if (cur_task_ids && cur_task_ids[r] < 0) return;  // a route this task skips
-    bf16_t* g = g_scratch.data() + (size_t)r * I;
+  void prep_g_row(int64_t idx) {
+    const int r = active_routes[static_cast<size_t>(idx)];
+    bf16_t* g = g_scratch.data() + static_cast<size_t>(r) * I;
+    if (use_nvfp4_tiled) {
+      nvfp4_pack_pairs(g, I, glo_bf16.data() + static_cast<size_t>(r) * (I / 4),
+                       ghi_bf16.data() + static_cast<size_t>(r) * (I / 4));
+      return;
+    }
     if (fmt == WF_W4A16) {  // bf16 pairs for the down GEMV's vdpbf16ps
-      w4_pack_pairs(g, I, gp_scratch.data() + (size_t)r * (I / 2));
+      w4_pack_pairs(g, I, gp_scratch.data() + static_cast<size_t>(r) * (I / 2));
       return;
     }
     if (use_q4a8) {  // q4_0 W4A8: Q8_0-quantize the intermediate row for the down GEMV.
-      quant_q8_0(g, I, gi8_scratch.data() + (size_t)r * I,
-                 gas_scratch.data() + (size_t)r * (I / 32));
+      quant_q8_0(g, I, gi8_scratch.data() + static_cast<size_t>(r) * I,
+                 gas_scratch.data() + static_cast<size_t>(r) * (I / 32));
       return;
     }
     if (fmt == WF_DSFP4) fp8_roundtrip_bf16(g, g, I);
-    float* ge = ge_scratch.data() + (size_t)r * (I / 2);
-    float* go = go_scratch.data() + (size_t)r * (I / 2);
+    float* ge = ge_scratch.data() + static_cast<size_t>(r) * (I / 2);
+    float* go = go_scratch.data() + static_cast<size_t>(r) * (I / 2);
     deinterleave(g, ge, go, I);
     if (use_vnni)
-      quant_i8_pg16(ge, go, I, gi8_scratch.data() + (size_t)r * I,
-                    gas_scratch.data() + (size_t)r * (I / 16));
+      quant_i8_pg16(ge, go, I, gi8_scratch.data() + static_cast<size_t>(r) * I,
+                    gas_scratch.data() + static_cast<size_t>(r) * (I / 16));
   }
 
   void do_pass2_dsfp4(const MoeTask* t, int64_t p) {
     const int64_t hb = p % n_hblk;
-    const int tok = static_cast<int>(p / n_hblk);
+    const int tok = active_tokens[static_cast<size_t>(p / n_hblk)];
     const int Ih = I / 2, Is = I / 32;
     const int h0 = static_cast<int>(hb) * HBLK;
     const int h1 = std::min(H, h0 + HBLK);
@@ -2150,6 +2464,7 @@ struct CpuMoeExecutor {
   }
 
   void run_task_body(const MoeTask* t) {
+    if (p1_total == 0) return;
     int local_sense = 0;
     for (;;) {
       int64_t p = p1_next.fetch_add(1, std::memory_order_relaxed);
@@ -2157,10 +2472,11 @@ struct CpuMoeExecutor {
       do_pass1(t, p);
     }
     barrier(local_sense);
-    // Row-major fp4: prepare the intermediate rows (per token,route) before the down
-    // GEMV -- ds_fp4 FP8 round-trips (DSV4 act_quant), both deinterleave to fp32; q4_0
-    // W4A8 Q8_0-quantizes. Needs all of pass1 done (a full row spans every iblk).
-    if (needs_di || use_q4a8 || fmt == WF_W4A16) {
+    // Prepare the intermediate rows (per active route) before the down GEMV:
+    // nvfp4 tiled packs bf16 lane pairs; ds_fp4 FP8 round-trips + deinterleaves;
+    // nvfp4 non-tiled deinterleaves (+ int8 quant for VNNI); q4_0 Q8_0-quantizes;
+    // w4a16 packs bf16 pairs. Needs all of pass1 done (a full row spans every iblk).
+    if (prt_total > 0) {
       for (;;) {
         int64_t r = prt_next.fetch_add(1, std::memory_order_relaxed);
         if (r >= prt_total) break;
@@ -2252,17 +2568,40 @@ struct CpuMoeExecutor {
   void submit(MoeTask* t, bool coordinator_joins = false) {
     cur_active = active_workers.load();
     bar_n = std::max(1, cur_active + (coordinator_joins ? 1 : 0));
-    const int iblk = fmt == WF_W4A16 ? W4_COLS : IBLK, hblk = fmt == WF_W4A16 ? W4_COLS : HBLK;
+    nvfp4_hblk = (H / NVFP4_HBLK >= 2 * bar_n) ? NVFP4_HBLK : 32;
+    const int iblk = (fmt == WF_W4A16) ? W4_COLS : (use_nvfp4_tiled ? NVFP4_IBLK : IBLK);
+    const int hblk = (fmt == WF_W4A16) ? W4_COLS : (use_nvfp4_tiled ? nvfp4_hblk : HBLK);
     n_iblk = (I + iblk - 1) / iblk;
     n_hblk = (H + hblk - 1) / hblk;
-    // Grow the per-token intermediate scratch if a larger batch shows up than the
-    // construction-time hint (CUDA-graph capture warms the largest bs first, so
-    // this happens at most once, before any capture, while the pool is idle).
-    const size_t need = static_cast<size_t>(t->num_tokens) * top_k * I;
-    if (need > g_scratch.size()) g_scratch.resize(need);
-    p1_total = static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
-    p2_total = static_cast<int64_t>(t->num_tokens) * n_hblk;
-    prt_total = (needs_di || use_q4a8 || fmt == WF_W4A16) ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
+    // Active-route compaction (all formats): collect valid routes and tokens with >=1
+    // active route, and zero output rows of tokens with 0 active routes right here so
+    // workers never waste atomic claims on skipped (-1) GPU routes.
+    const int T = t->num_tokens;
+    active_routes.clear();
+    active_tokens.clear();
+    if (static_cast<int>(tok_pos.size()) < T) tok_pos.resize(static_cast<size_t>(T), -1);
+    for (int tok = 0; tok < T; ++tok) {
+      bool has_any = false;
+      const int base = tok * top_k;
+      for (int k = 0; k < top_k; ++k) {
+        const int r = base + k;
+        const int e = t->ids[r];
+        if (e >= 0 && e < num_experts) {
+          active_routes.push_back(r);
+          has_any = true;
+        }
+      }
+      if (has_any) {
+        tok_pos[tok] = static_cast<int>(active_tokens.size());
+        active_tokens.push_back(tok);
+      } else {
+        tok_pos[tok] = -1;
+        if (t->y32)
+          std::memset(t->y32 + static_cast<size_t>(tok) * H, 0, sizeof(float) * H);
+        else
+          std::memset(t->y + static_cast<size_t>(tok) * H, 0, sizeof(bf16_t) * H);
+      }
+    }
     cur_task_ids = t->ids;
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
@@ -2270,60 +2609,141 @@ struct CpuMoeExecutor {
     done_count.store(0, std::memory_order_relaxed);
     bar_count.store(0, std::memory_order_relaxed);
     bar_sense.store(0, std::memory_order_relaxed);
-    // ds_fp4: FP8 round-trip the per-token input once, up front (single-threaded;
-    // tiny for decode, and done before the workers are woken below).
-    if (needs_di) {
-      const size_t xn = static_cast<size_t>(t->num_tokens) * H;
-      if (xn / 2 > xe_scratch.size()) {
-        xe_scratch.resize(xn / 2);
-        xo_scratch.resize(xn / 2);
-        ge_scratch.resize(static_cast<size_t>(t->num_tokens) * top_k * (I / 2));
-        go_scratch.resize(static_cast<size_t>(t->num_tokens) * top_k * (I / 2));
-        if (use_vnni) {
-          xi8_scratch.resize(xn);
-          xas_scratch.resize(xn / 16);
-          gi8_scratch.resize(static_cast<size_t>(t->num_tokens) * top_k * I);
-          gas_scratch.resize(static_cast<size_t>(t->num_tokens) * top_k * (I / 16));
+    if (active_routes.empty()) {
+      num_unique_experts = 0;
+      p1_total = 0;
+      prt_total = 0;
+      p2_total = 0;
+    } else {
+      // Grow the per-token intermediate scratch if a larger batch shows up than the
+      // construction-time hint (CUDA-graph capture warms the largest bs first, so
+      // this happens at most once, before any capture, while the pool is idle).
+      const size_t need = static_cast<size_t>(T) * top_k * I;
+      if (need > g_scratch.size()) g_scratch.resize(need);
+      if (use_nvfp4_tiled) {
+        // Group active routes by expert using expert_slot (resetting only the U touched
+        // slots back to -1 -> O(active_routes + U), fast even when num_experts == 20992).
+        slot_expert_raw.clear();
+        slot_count_raw.clear();
+        for (int r : active_routes) {
+          const int e = t->ids[r];
+          int s = expert_slot[e];
+          if (s < 0) {
+            s = static_cast<int>(slot_expert_raw.size());
+            expert_slot[e] = s;
+            slot_expert_raw.push_back(e);
+            slot_count_raw.push_back(1);
+          } else {
+            ++slot_count_raw[s];
+          }
+        }
+        const int U = static_cast<int>(slot_expert_raw.size());
+        num_unique_experts = U;
+        int max_cnt = 0;
+        for (int s = 0; s < U; ++s) max_cnt = std::max(max_cnt, slot_count_raw[s]);
+        // Counting sort largest-first so heavy multi-token experts start first.
+        cnt_bucket.assign(static_cast<size_t>(max_cnt) + 2, 0);
+        for (int s = 0; s < U; ++s) ++cnt_bucket[static_cast<size_t>(max_cnt - slot_count_raw[s] + 1)];
+        for (int c = 0; c <= max_cnt; ++c) cnt_bucket[c + 1] += cnt_bucket[c];
+        slot_expert.resize(static_cast<size_t>(U));
+        expert_start.resize(static_cast<size_t>(U) + 1);
+        for (int s = 0; s < U; ++s) {
+          const int u = cnt_bucket[static_cast<size_t>(max_cnt - slot_count_raw[s])]++;
+          const int e = slot_expert_raw[s];
+          slot_expert[u] = e;
+          expert_slot[e] = u;
+          expert_start[u + 1] = slot_count_raw[s];
+        }
+        expert_start[0] = 0;
+        for (int u = 0; u < U; ++u) expert_start[u + 1] += expert_start[u];
+        grouped_routes.resize(active_routes.size());
+        grp_cursor.assign(expert_start.begin(), expert_start.begin() + U);
+        for (int r : active_routes) {
+          const int u = expert_slot[t->ids[r]];
+          grouped_routes[grp_cursor[u]++] = r;
+        }
+        for (int u = 0; u < U; ++u) expert_slot[slot_expert[u]] = -1;
+
+        const size_t xn = static_cast<size_t>(T) * (H / 4);
+        if (xn > xlo_bf16.size()) {
+          xlo_bf16.resize(xn);
+          xhi_bf16.resize(xn);
+        }
+        const size_t gn = static_cast<size_t>(T) * top_k * (I / 4);
+        if (gn > glo_bf16.size()) {
+          glo_bf16.resize(gn);
+          ghi_bf16.resize(gn);
+        }
+        for (int tok : active_tokens) {
+          nvfp4_pack_pairs(t->x + static_cast<size_t>(tok) * H, H,
+                           xlo_bf16.data() + static_cast<size_t>(tok) * (H / 4),
+                           xhi_bf16.data() + static_cast<size_t>(tok) * (H / 4));
+        }
+        p1_total = static_cast<int64_t>(U) * n_iblk;
+        prt_total = static_cast<int64_t>(active_routes.size());
+        p2_total = static_cast<int64_t>(n_hblk);
+      } else {
+        p1_total = static_cast<int64_t>(active_routes.size()) * n_iblk;
+        p2_total = static_cast<int64_t>(active_tokens.size()) * n_hblk;
+        prt_total = (needs_di || use_q4a8 || fmt == WF_W4A16)
+                        ? static_cast<int64_t>(active_routes.size())
+                        : 0;
+        // ds_fp4: FP8 round-trip the per-token input once, up front (single-threaded;
+        // tiny for decode, and done before the workers are woken below).
+        if (needs_di) {
+          const size_t xn = static_cast<size_t>(T) * H;
+          if (xn / 2 > xe_scratch.size()) {
+            xe_scratch.resize(xn / 2);
+            xo_scratch.resize(xn / 2);
+            ge_scratch.resize(static_cast<size_t>(T) * top_k * (I / 2));
+            go_scratch.resize(static_cast<size_t>(T) * top_k * (I / 2));
+          }
+          if (use_vnni && xn > xi8_scratch.size()) {
+            xi8_scratch.resize(xn);
+            xas_scratch.resize(xn / 16);
+            gi8_scratch.resize(static_cast<size_t>(T) * top_k * I);
+            gas_scratch.resize(static_cast<size_t>(T) * top_k * (I / 16));
+          }
+          const bool ds = (fmt == WF_DSFP4) && !input_prequant;
+          if (ds && xn > xq_scratch.size()) xq_scratch.resize(xn);
+          for (int tok : active_tokens) {
+            const bf16_t* src = t->x + (size_t)tok * H;
+            if (ds) {  // DSV4 FP8-round-trips the input before the gate_up GEMV
+              bf16_t* xq = xq_scratch.data() + (size_t)tok * H;
+              fp8_roundtrip_bf16(src, xq, H);
+              src = xq;
+            }
+            float* xe = xe_scratch.data() + (size_t)tok * (H / 2);
+            float* xo = xo_scratch.data() + (size_t)tok * (H / 2);
+            deinterleave(src, xe, xo, H);
+            if (use_vnni)
+              quant_i8_pg16(xe, xo, H, xi8_scratch.data() + (size_t)tok * H,
+                            xas_scratch.data() + (size_t)tok * (H / 16));
+          }
+        }
+        if (fmt == WF_W4A16) {  // the input as bf16 pairs, once (single-threaded, tiny for decode)
+          const size_t xn = static_cast<size_t>(T) * (H / 2);
+          if (xn > xp_scratch.size()) {
+            xp_scratch.resize(xn);
+            gp_scratch.resize(static_cast<size_t>(T) * top_k * (I / 2));
+          }
+          for (int tok : active_tokens)
+            w4_pack_pairs(t->x + (size_t)tok * H, H, xp_scratch.data() + (size_t)tok * (H / 2));
+        }
+        // q4_0 W4A8: Q8_0-quantize the per-token input once (single-threaded, tiny for decode).
+        if (use_q4a8) {
+          const size_t xn = static_cast<size_t>(T) * H;
+          if (xn > xi8_scratch.size()) {
+            xi8_scratch.resize(xn);
+            xas_scratch.resize(xn / 32);
+            gi8_scratch.resize(static_cast<size_t>(T) * top_k * I);
+            gas_scratch.resize(static_cast<size_t>(T) * top_k * (I / 32));
+          }
+          for (int tok : active_tokens)
+            quant_q8_0(t->x + (size_t)tok * H, H, xi8_scratch.data() + (size_t)tok * H,
+                       xas_scratch.data() + (size_t)tok * (H / 32));
         }
       }
-      const bool ds = (fmt == WF_DSFP4) && !input_prequant;
-      if (ds && xn > xq_scratch.size()) xq_scratch.resize(xn);
-      for (int tok = 0; tok < t->num_tokens; ++tok) {
-        const bf16_t* src = t->x + (size_t)tok * H;
-        if (ds) {  // DSV4 FP8-round-trips the input before the gate_up GEMV
-          bf16_t* xq = xq_scratch.data() + (size_t)tok * H;
-          fp8_roundtrip_bf16(src, xq, H);
-          src = xq;
-        }
-        float* xe = xe_scratch.data() + (size_t)tok * (H / 2);
-        float* xo = xo_scratch.data() + (size_t)tok * (H / 2);
-        deinterleave(src, xe, xo, H);
-        if (use_vnni)
-          quant_i8_pg16(xe, xo, H, xi8_scratch.data() + (size_t)tok * H,
-                        xas_scratch.data() + (size_t)tok * (H / 16));
-      }
-    }
-    if (fmt == WF_W4A16) {  // the input as bf16 pairs, once (single-threaded, tiny for decode)
-      const size_t xn = static_cast<size_t>(t->num_tokens) * (H / 2);
-      if (xn > xp_scratch.size()) {
-        xp_scratch.resize(xn);
-        gp_scratch.resize(static_cast<size_t>(t->num_tokens) * top_k * (I / 2));
-      }
-      for (int tok = 0; tok < t->num_tokens; ++tok)
-        w4_pack_pairs(t->x + (size_t)tok * H, H, xp_scratch.data() + (size_t)tok * (H / 2));
-    }
-    // q4_0 W4A8: Q8_0-quantize the per-token input once (single-threaded, tiny for decode).
-    if (use_q4a8) {
-      const size_t xn = static_cast<size_t>(t->num_tokens) * H;
-      if (xn > xi8_scratch.size()) {
-        xi8_scratch.resize(xn);
-        xas_scratch.resize(xn / 32);
-        gi8_scratch.resize(static_cast<size_t>(t->num_tokens) * top_k * I);
-        gas_scratch.resize(static_cast<size_t>(t->num_tokens) * top_k * (I / 32));
-      }
-      for (int tok = 0; tok < t->num_tokens; ++tok)
-        quant_q8_0(t->x + (size_t)tok * H, H, xi8_scratch.data() + (size_t)tok * H,
-                   xas_scratch.data() + (size_t)tok * (H / 32));
     }
     cur_task = t;
     const uint64_t g = cur_gen.load() + 1;
