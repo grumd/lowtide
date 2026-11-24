@@ -81,6 +81,17 @@ class DraftVocabHead:
             from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
 
             logits = fp8_pertensor_linear(x, self.w, self.scale)
+        elif (
+            x.is_cuda
+            and x.dtype == torch.bfloat16
+            and self.w.dtype == torch.bfloat16
+            and x.shape[0] == 1
+            and x.is_contiguous()
+            and self.w.stride(1) == 1
+        ):
+            from freetoken.kernel.triton.gemv import gemv
+
+            logits = gemv(x, self.w, out_dtype=torch.float32)
         else:
             logits = torch.nn.functional.linear(x, self.w)
         return logits.float().masked_fill(self.ids < 0, float("-inf"))

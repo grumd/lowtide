@@ -138,11 +138,16 @@ def _config_m(N: int, K: int) -> tuple[int, int, int]:
     return _config(N, K)
 
 
-def gemv(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+def gemv(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    out: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
     """``x`` [1, K] bf16 contiguous, ``w`` [N, K] with unit inner stride -> [1, N]."""
     N, K = w.shape
     if out is None:
-        out = torch.empty((1, N), dtype=x.dtype, device=x.device)
+        out = torch.empty((1, N), dtype=out_dtype or x.dtype, device=x.device)
     bn, bk, warps = _config(N, K)
     _gemv_kernel[(triton.cdiv(N, bn),)](
         x, w, out, N, K, w.stride(0),

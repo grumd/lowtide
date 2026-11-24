@@ -38,11 +38,12 @@ MIN_TILES_PER_SPLIT = 4
 
 @triton.jit
 def _glm_dsa_sparse_kernel(
-    q_ptr, pool_ptr, o_ptr, idx_ptr, cnt_ptr, sink_ptr,
+    q_ptr, pool_ptr, extra_ptr, o_ptr, idx_ptr, cnt_ptr, sink_ptr,
     scale,
     H, TOPK,
     stride_qb, stride_qm, stride_qh, stride_qd,
     stride_pn, stride_pd,
+    stride_eb, stride_em, stride_ed,
     stride_ob, stride_om, stride_oh, stride_od,
     stride_ib, stride_im, stride_it,
     stride_nb, stride_nm,
@@ -53,6 +54,7 @@ def _glm_dsa_sparse_kernel(
     HAS_COUNTS: tl.constexpr,
     HAS_ROPE: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -74,23 +76,45 @@ def _glm_dsa_sparse_kernel(
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_H, D_V), dtype=tl.float32)
 
-    n_active = TOPK
+    n_hist = TOPK
     if HAS_COUNTS:
-        n_active = tl.load(cnt_ptr + pid_b * stride_nb + pid_m * stride_nm)
+        n_hist = tl.load(cnt_ptr + pid_b * stride_nb + pid_m * stride_nm)
+    if HAS_EXTRA:
+        n_hist = tl.minimum(n_hist, TOPK)
+        n_active = n_hist + pid_m + 1
+    else:
+        n_active = n_hist
 
     idx_base = idx_ptr + pid_b * stride_ib + pid_m * stride_im
     for t in range(0, tl.cdiv(n_active, BLOCK_T)):
-        offs_t = t * BLOCK_T + tl.arange(0, BLOCK_T)
+        start = t * BLOCK_T
+        offs_t = start + tl.arange(0, BLOCK_T)
         t_mask = offs_t < n_active
-        idxs = tl.load(idx_base + offs_t * stride_it, mask=t_mask, other=-1)
-        valid = idxs >= 0
-        kv_base = pool_ptr + idxs[:, None] * stride_pn
-        kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
+        if HAS_EXTRA:
+            is_hist = offs_t < n_hist
+            is_extra = (offs_t >= n_hist) & t_mask
+            idxs = tl.load(idx_base + offs_t * stride_it, mask=is_hist, other=-1)
+            valid_hist = idxs >= 0
+            valid = valid_hist | is_extra
+            extra_pos = tl.maximum(offs_t - n_hist, 0)
+            pool_rows = pool_ptr + tl.maximum(idxs, 0).to(tl.int64) * stride_pn
+            extra_rows = extra_ptr + pid_b * stride_eb + extra_pos.to(tl.int64) * stride_em
+            kv_base = tl.where(is_extra, extra_rows, pool_rows)[:, None]
+            kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
+            scores = tl.dot(q_v, tl.trans(kv_v))
+            if HAS_ROPE:
+                kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
+                scores += tl.dot(q_r, tl.trans(kv_r))
+        else:
+            idxs = tl.load(idx_base + offs_t * stride_it, mask=t_mask, other=-1)
+            valid = idxs >= 0
+            kv_base = pool_ptr + idxs[:, None] * stride_pn
+            kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
 
-        scores = tl.dot(q_v, tl.trans(kv_v))
-        if HAS_ROPE:
-            kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
-            scores += tl.dot(q_r, tl.trans(kv_r))
+            scores = tl.dot(q_v, tl.trans(kv_v))
+            if HAS_ROPE:
+                kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
+                scores += tl.dot(q_r, tl.trans(kv_r))
         scores = scores * scale
         scores = tl.where(valid[None, :], scores, -float("inf"))
 
@@ -209,11 +233,12 @@ def glm_dsa_decode_logits(
 
 @triton.jit
 def _glm_dsa_splitk_kernel(
-    q_ptr, pool_ptr, mid_o_ptr, mid_lse_ptr, idx_ptr, cnt_ptr,
+    q_ptr, pool_ptr, extra_ptr, mid_o_ptr, mid_lse_ptr, idx_ptr, cnt_ptr,
     scale,
     H, TOPK,
     stride_qb, stride_qm, stride_qh, stride_qd,
     stride_pn, stride_pd,
+    stride_eb, stride_em, stride_ed,
     stride_mb, stride_mm, stride_mh, stride_ms, stride_md,
     stride_lb, stride_lm, stride_lh, stride_ls,
     stride_ib, stride_im, stride_it,
@@ -225,10 +250,11 @@ def _glm_dsa_splitk_kernel(
     HAS_COUNTS: tl.constexpr,
     HAS_ROPE: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
 ):
     """Stage 1 (decode flash-decoding): each program reduces one BLOCK_T-aligned slice of
     the candidate list and writes a normalized [D_V] partial + log-sum-exp. Same structure
-    as dsv4's split-k stage, with the two-part 512|64 gather and no window half."""
+    as dsv4's split-k stage, with the two-part 512|64 gather and optional causal extra_kv."""
     pid_ms = tl.program_id(0)
     pid_m = pid_ms // NUM_SPLITS
     split_id = pid_ms % NUM_SPLITS
@@ -239,9 +265,14 @@ def _glm_dsa_splitk_kernel(
     h_mask = offs_h < H
     offs_v = tl.arange(0, D_V)
 
-    n_active = TOPK
+    n_hist = TOPK
     if HAS_COUNTS:
-        n_active = tl.load(cnt_ptr + pid_b * stride_nb + pid_m * stride_nm)
+        n_hist = tl.load(cnt_ptr + pid_b * stride_nb + pid_m * stride_nm)
+    if HAS_EXTRA:
+        n_hist = tl.minimum(n_hist, TOPK)
+        n_active = n_hist + pid_m + 1
+    else:
+        n_active = n_hist
 
     per_split = tl.cdiv(tl.cdiv(n_active, NUM_SPLITS), BLOCK_T) * BLOCK_T
     split_start = per_split * split_id
@@ -262,15 +293,31 @@ def _glm_dsa_splitk_kernel(
         for start in range(split_start, split_end, BLOCK_T):
             offs_t = start + tl.arange(0, BLOCK_T)
             t_mask = offs_t < split_end
-            idxs = tl.load(idx_base + offs_t * stride_it, mask=t_mask, other=-1)
-            valid = idxs >= 0
-            kv_base = pool_ptr + idxs[:, None] * stride_pn
-            kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
+            if HAS_EXTRA:
+                is_hist = (offs_t < n_hist) & t_mask
+                is_extra = (offs_t >= n_hist) & t_mask
+                idxs = tl.load(idx_base + offs_t * stride_it, mask=is_hist, other=-1)
+                valid_hist = idxs >= 0
+                valid = valid_hist | is_extra
+                extra_pos = tl.maximum(offs_t - n_hist, 0)
+                pool_rows = pool_ptr + tl.maximum(idxs, 0).to(tl.int64) * stride_pn
+                extra_rows = extra_ptr + pid_b * stride_eb + extra_pos.to(tl.int64) * stride_em
+                kv_base = tl.where(is_extra, extra_rows, pool_rows)[:, None]
+                kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
+                scores = tl.dot(q_v, tl.trans(kv_v))
+                if HAS_ROPE:
+                    kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
+                    scores += tl.dot(q_r, tl.trans(kv_r))
+            else:
+                idxs = tl.load(idx_base + offs_t * stride_it, mask=t_mask, other=-1)
+                valid = idxs >= 0
+                kv_base = pool_ptr + idxs[:, None] * stride_pn
+                kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
 
-            scores = tl.dot(q_v, tl.trans(kv_v))
-            if HAS_ROPE:
-                kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
-                scores += tl.dot(q_r, tl.trans(kv_r))
+                scores = tl.dot(q_v, tl.trans(kv_v))
+                if HAS_ROPE:
+                    kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
+                    scores += tl.dot(q_r, tl.trans(kv_r))
             scores = scores * scale
             scores = tl.where(valid[None, :], scores, -float("inf"))
 
@@ -345,15 +392,15 @@ def _glm_dsa_merge_kernel(
     tl.store(o_ptrs, o.to(o_ptr.dtype.element_ty))
 
 
-def _split_count(b: int, m: int, h: int, topk: int, device) -> int:
-    """0 = single-program kernel; decode splits until SMs are covered (dsv4 policy)."""
-    if m != 1:
+def _split_count(b: int, m: int, h: int, topk: int, device, *, allow_multi_m: bool = False) -> int:
+    """0 = single-program kernel; decode (and small-m DFly2) splits until SMs are covered."""
+    if m != 1 and not allow_multi_m:
         return 0
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     n_splits = min(
         MAX_SPLITS,
         triton.cdiv(topk, MIN_TILES_PER_SPLIT * BLOCK_T),
-        max(1, sm_count // (b * triton.cdiv(h, BLOCK_H))),
+        max(1, sm_count // (b * m * triton.cdiv(h, BLOCK_H))),
     )
     return n_splits if n_splits > 1 else 0
 
@@ -363,10 +410,11 @@ def glm_dsa_sparse_attn(
     pool: torch.Tensor,       # [rows, d_v + d_r]     GLOBAL latent pool slab (this layer)
     topk_idxs: torch.Tensor,  # [b, m|1, topk] int32 global rows, -1 masked
     softmax_scale: float,
-    counts: torch.Tensor | None = None,  # [b, m] int32 live columns per query (device-read)
+    counts: torch.Tensor | None = None,  # [b, m|1] int32 live columns per query (device-read)
     d_v: int = 512,
     force_splits: int | None = None,     # 0 = single-program, N = split-k N (None: by shape)
     sinks: torch.Tensor | None = None,   # [h] fp32 per-head sink logits (Hy4)
+    extra_kv: torch.Tensor | None = None,  # [b, m, d_v + d_r] causal block rows appended after history
 ) -> torch.Tensor:
     """Sparse MLA attention over gathered latent rows; returns ``[b, m, h, d_v]``.
 
@@ -374,6 +422,10 @@ def glm_dsa_sparse_attn(
     list across all queries with STRIDE 0 -- the identity-selection dense path: every
     query reads the same position-ordered row list, causally bounded by its own
     ``counts[q] = position + 1``, with zero per-query index materialization.
+
+    When ``extra_kv`` [b, m, d] is given, query ``pid_m`` attends to ``n_hist = counts[b, pid_m]``
+    history rows from ``pool[topk_idxs]`` followed by ``pid_m + 1`` causal rows from
+    ``extra_kv[b, 0..pid_m]`` (DFly2 zero-copy draft attention).
     """
     b, m, h, d = q.shape
     d_r = d - d_v
@@ -393,24 +445,44 @@ def glm_dsa_sparse_attn(
     else:
         sink = o
 
+    has_extra = extra_kv is not None
+    if has_extra:
+        assert extra_kv.shape == (b, m, d), (extra_kv.shape, (b, m, d))
+        extra = extra_kv.to(pool_2d.dtype).contiguous()
+        stride_eb, stride_em, stride_ed = extra.stride()
+    else:
+        extra, stride_eb, stride_em, stride_ed = pool_2d, 0, 0, 0
+
     has_counts = counts is not None
     if has_counts:
-        cnt = counts.contiguous().to(torch.int32).view(b, m)
-        stride_nb, stride_nm = cnt.stride()
+        cnt = counts.contiguous().to(torch.int32)
+        if cnt.dim() == 1:
+            cnt = cnt.view(b, 1)
+        elif cnt.shape != (b, m):
+            cnt = cnt.view(b, 1) if cnt.numel() == b else cnt.view(b, m)
+        broadcast_cnt_m = cnt.shape[1] == 1 and m > 1
+        stride_nb = cnt.stride(0)
+        stride_nm = 0 if broadcast_cnt_m else cnt.stride(1)
     else:
         cnt, stride_nb, stride_nm = idx, 0, 0
 
-    n_splits = _split_count(b, m, h, topk, q.device) if force_splits is None else force_splits
+    total_cols = topk + m if has_extra else topk
+    n_splits = (
+        _split_count(b, m, h, total_cols, q.device, allow_multi_m=has_extra)
+        if force_splits is None
+        else force_splits
+    )
     if n_splits:
         mid_o = q.new_empty(b, m, h, n_splits, d_v, dtype=torch.float32)
         mid_lse = q.new_empty(b, m, h, n_splits, dtype=torch.float32)
         grid1 = (m * n_splits, b, triton.cdiv(h, BLOCK_H))
         _glm_dsa_splitk_kernel[grid1](
-            q, pool_2d, mid_o, mid_lse, idx, cnt,
+            q, pool_2d, extra, mid_o, mid_lse, idx, cnt,
             float(softmax_scale),
             h, topk,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             pool_2d.stride(0), pool_2d.stride(1),
+            stride_eb, stride_em, stride_ed,
             mid_o.stride(0), mid_o.stride(1), mid_o.stride(2), mid_o.stride(3), mid_o.stride(4),
             mid_lse.stride(0), mid_lse.stride(1), mid_lse.stride(2), mid_lse.stride(3),
             idx.stride(0), 0 if broadcast_m else idx.stride(1), idx.stride(2),
@@ -418,6 +490,7 @@ def glm_dsa_sparse_attn(
             D_V=d_v, D_R=d_r,
             BLOCK_H=BLOCK_H, BLOCK_T=BLOCK_T,
             HAS_COUNTS=has_counts, HAS_ROPE=d_r > 0, NUM_SPLITS=n_splits,
+            HAS_EXTRA=has_extra,
             num_warps=4, num_stages=2,
         )
         grid2 = (m, b, h)
@@ -433,17 +506,19 @@ def glm_dsa_sparse_attn(
 
     grid = (m, b, triton.cdiv(h, BLOCK_H))
     _glm_dsa_sparse_kernel[grid](
-        q, pool_2d, o, idx, cnt, sink,
+        q, pool_2d, extra, o, idx, cnt, sink,
         float(softmax_scale),
         h, topk,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         pool_2d.stride(0), pool_2d.stride(1),
+        stride_eb, stride_em, stride_ed,
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
         idx.stride(0), 0 if broadcast_m else idx.stride(1), idx.stride(2),
         stride_nb, stride_nm,
         D_V=d_v, D_R=d_r,
         BLOCK_H=BLOCK_H, BLOCK_T=BLOCK_T,
         HAS_COUNTS=has_counts, HAS_ROPE=d_r > 0, HAS_SINK=has_sink,
+        HAS_EXTRA=has_extra,
         num_warps=4, num_stages=2,
     )
     return o

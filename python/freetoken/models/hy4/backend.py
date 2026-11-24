@@ -320,7 +320,7 @@ class Hy4AttnBackend(Glm5NextDSABackend):
             picks = self._pick_groups(s.view(n, t, -1), q_pos)
             sel, cnt = self._expand_groups(picks, rows, q_pos)
             if self.dfly_tap is not None:
-                self.dfly_tap.put_sel(layer_id, sel.view(total, -1))
+                self.dfly_tap.put_sel(layer_id, sel.view(total, -1), cnt=cnt.view(total))
         # one query per program row with a single decode step's split: each row reduces in
         # the same order as that step would
         from freetoken.kernel.triton.glm_dsa_sparse import _split_count, glm_dsa_sparse_attn
@@ -334,7 +334,7 @@ class Hy4AttnBackend(Glm5NextDSABackend):
         return o.view(total, h, self.kv_lora_rank)
 
     # ----- DFly2 draft attention ------------------------------------------------------------
-    def dfly_attend(self, q_cat, layer_id, c_kv, k_rope, hist, sinks) -> torch.Tensor:
+    def dfly_attend(self, q_cat, layer_id, c_kv, k_rope, hist, sinks, hist_cnt=None) -> torch.Tensor:
         """A draft layer's attention for ``n`` blocks of ``t`` rows: target layer ``layer_id``'s
         latents at ``hist [n, W]`` (physical rows, ``-1`` = none; all before the block) plus the
         block's own latents, causal inside the block. The block rows live in a per-call buffer,
@@ -345,20 +345,18 @@ class Hy4AttnBackend(Glm5NextDSABackend):
         total, h, d = q_cat.shape
         t = total // n
         pool = self.kvcache.latent_rows(layer_id)
-        blk = torch.cat([c_kv, k_rope], dim=-1).to(pool.dtype).view(n, t, -1)
-        past = pool.index_select(0, hist.clamp_min(0).view(-1).to(torch.int64)).view(n, w, -1)
-        kv = torch.cat([past, blk], dim=1).view(n * (w + t), -1)
-        dev = q_cat.device
-        base = (torch.arange(n, device=dev, dtype=torch.int32) * (w + t)).view(n, 1)
-        idx = torch.cat(
-            [torch.where(hist >= 0, base + torch.arange(w, device=dev, dtype=torch.int32), -1),
-             base + w + torch.arange(t, device=dev, dtype=torch.int32)],
-            dim=1,
-        ).view(n, 1, w + t)
-        # history entries are -1 past the selection, so a count of w + j + 1 is the causal mask
-        counts = (w + 1 + torch.arange(t, device=dev, dtype=torch.int32)).expand(n, t)
+        blk = torch.cat([c_kv, k_rope], dim=-1).to(pool.dtype).view(n, t, d)
+        if hist_cnt is None:
+            if w == 0:
+                hist_cnt = torch.zeros(n, dtype=torch.int32, device=hist.device)
+            else:
+                # hist may contain -1 holes in its first 4 slots (own group): scan up to the
+                # last valid entry so no valid history slot is dropped.
+                pos = torch.arange(1, w + 1, device=hist.device, dtype=torch.int32)
+                hist_cnt = torch.where(hist >= 0, pos, 0).amax(dim=-1)
         o = glm_dsa_sparse_attn(
-            q_cat.view(n, t, h, d), kv, idx, self.sm_scale, counts=counts, d_v=self.kv_lora_rank, sinks=sinks
+            q_cat.view(n, t, h, d), pool, hist.view(n, 1, w), self.sm_scale,
+            counts=hist_cnt.view(n, 1), d_v=self.kv_lora_rank, sinks=sinks, extra_kv=blk,
         )
         return o.view(total, h, self.kv_lora_rank)
 
@@ -438,7 +436,7 @@ class Hy4AttnBackend(Glm5NextDSABackend):
             picks = self._pick_groups(s.view(bs, 1, -1), q_pos)
             sel, cnt = self._expand_groups(picks, rows.unsqueeze(1), q_pos)
             if self.dfly_tap is not None:
-                self.dfly_tap.put_sel(layer_id, sel.view(bs, -1))
+                self.dfly_tap.put_sel(layer_id, sel.view(bs, -1), cnt=cnt.view(bs))
         o = self._attend(q_cat.view(bs, 1, h, d), layer_id, sel, cnt, sinks)
         return o.view(bs, h, self.kv_lora_rank)
 
@@ -489,7 +487,7 @@ class Hy4AttnBackend(Glm5NextDSABackend):
                     self._idx_slot[layer_id], inputs.q[a:b], inputs.w[a:b], rows, q_pos
                 )
                 if self.dfly_tap is not None:
-                    self.dfly_tap.put_sel(layer_id, sel[0, -1:], i)
+                    self.dfly_tap.put_sel(layer_id, sel[0, -1:], i, cnt=cnt[0, -1:])
             o[a:b] = self._attend(q_cat[a:b].view(1, b - a, h, d), layer_id, sel, cnt, sinks).view(
                 b - a, h, self.kv_lora_rank
             )

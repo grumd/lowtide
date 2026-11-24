@@ -48,7 +48,7 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Sequence, Set, Tuple
 import numpy as np
 import torch
 from freetoken.core import Batch, Req
-from freetoken.engine.sample import probs_from_logits
+from freetoken.engine.sample import probs_from_logits, speculative_accept
 from freetoken.env import ENV
 from freetoken.message import DetokenizeMsg
 from freetoken.utils import init_logger
@@ -510,7 +510,17 @@ class NgramSpecManager:
     # ------------------------------------------------------------- scheduler hooks
 
     def draft_prefill(self, batch, pre_lens) -> None:
-        """No draft model to feed: the lookup index reads the host ids when a request decodes."""
+        """Feed prompt tokens into ``draft_vocab`` when configured (the lookup index reads
+        host ids lazily when a request decodes)."""
+        dv = getattr(self.engine, "draft_vocab", None)
+        if dv is None:
+            return
+        toks: List[int] = []
+        for r, (s, e) in zip(batch.reqs, pre_lens):
+            if r.table_idx != -1 and e > s:
+                toks.extend(r.input_ids[s:e].tolist())
+        if toks:
+            dv.observe(toks, generated=False)
 
     def run_round(self) -> None:
         """normal_loop: every decode request is drained here, so plan directly."""
@@ -530,13 +540,14 @@ class NgramSpecManager:
     def run_plans(self, plans: List[Plan]) -> None:
         """One synchronous round over ``plans``; requests with another proposal right after it
         skip this iteration's plain decode step (the next iteration's round takes them)."""
+        draft_q = None
         if any(m == DFLY for _, _, m in plans):
-            plans = self._draft(plans)
+            plans, draft_q = self._draft(plans)
             if not plans:
                 return
         t0 = time.perf_counter()
         width = 1 + max(len(d) for _, d, _ in plans)
-        a_list = self._round(plans)
+        a_list = self._round(plans, draft_q=draft_q)
         ms = (time.perf_counter() - t0) * 1e3
         self.policy.observe_cost(width, ms)
         if self._debug:
@@ -549,8 +560,12 @@ class NgramSpecManager:
         reqs = [r for r, _, _ in plans if r in self.sched.decode_manager.running_reqs]
         self._deferred = {r for r in reqs if self.plan_one(r, probe=False) is not None}
 
-    def _draft(self, plans: List[Plan]) -> List[Plan]:
-        """Fill the drafter's placeholder plans with its greedy drafts (one block pass for all)."""
+    def _draft(self, plans: List[Plan]):
+        """Fill the drafter's placeholder plans with its drafts (one block pass for all).
+        Greedy when every DFly request is greedy; otherwise sampled from the draft head's
+        truncated distribution, returning ``(plans, draft_q)`` where ``draft_q[i]`` is
+        ``(cand_ids [k, DRAFT_K], cand_q [k, DRAFT_K])`` for sampled DFly requests and None
+        for greedy / n-gram lookup requests."""
         eng = self.engine
         dev = eng.device
         t0 = time.perf_counter()
@@ -560,15 +575,40 @@ class NgramSpecManager:
         host = torch.tensor(
             [[r.table_idx, int(r.input_ids[r.cached_len]), r.cached_len] for r in reqs], dtype=torch.int64,
         ).pin_memory().to(dev, non_blocking=True)
-        drafts = eng.model.dfly_draft(host[:, 0], host[:, 1].to(torch.int32), host[:, 2], k).tolist()
+        sampled = any(not r.sampling_params.is_greedy for r in reqs)
+        if sampled:
+            from freetoken.engine.draft_sample import DRAFT_K
+
+            rows = [[], [], []]
+            for r in reqs:
+                sp = r.sampling_params
+                greedy = sp.is_greedy
+                rows[0].append(0.0 if greedy else float(sp.temperature))
+                rows[1].append(1.0 if greedy or sp.top_p >= 1.0 else float(sp.top_p))
+                rows[2].append(float(DRAFT_K if greedy or sp.top_k is None or sp.top_k <= 0 else min(sp.top_k, DRAFT_K)))
+            sp_dev = torch.tensor(rows, dtype=torch.float32).pin_memory().to(dev, non_blocking=True)
+            # Identical across TP ranks: every rank advances the seeded torch generator equally.
+            u = torch.rand((len(reqs), k, DRAFT_K), device=dev)
+            drafts_t, cand_ids, cand_q = eng.model.dfly_draft(
+                host[:, 0], host[:, 1].to(torch.int32), host[:, 2], k,
+                temp=sp_dev[0], top_p=sp_dev[1], top_k=sp_dev[2].to(torch.int64), u=u,
+            )
+        else:
+            res = eng.model.dfly_draft(host[:, 0], host[:, 1].to(torch.int32), host[:, 2], k)
+            drafts_t, cand_ids, cand_q = res if isinstance(res, tuple) else (res, None, None)
+        drafts = drafts_t.tolist()
         self.dfly_ms += (time.perf_counter() - t0) * 1e3
         if self._debug:  # every rank: TP ranks must draft the same tokens
             logger.info(f"dfly drafts: {[(r.uid, r.cached_len, d) for r, d in zip(reqs, drafts)]}")
         out = list(plans)
+        qs: List[Tuple[torch.Tensor, torch.Tensor] | None] | None = [None] * len(plans) if sampled else None
         for j, i in enumerate(idx):
             r, d, _ = plans[i]
             out[i] = (r, self._truncate(drafts[j][: len(d)]), DFLY)
-        return [p for p in out if p[1]]
+            if qs is not None and cand_ids is not None and not r.sampling_params.is_greedy:
+                qs[i] = (cand_ids[j], cand_q[j])
+        kept = [(p, qs[i] if qs is not None else None) for i, p in enumerate(out) if p[1]]
+        return [p for p, _ in kept], ([q for _, q in kept] if qs is not None else None)
 
     def keep_draft_state(self, batch) -> None:
         """After a target prefill / decode forward (engine stream): each request keeps its row's
@@ -594,7 +634,7 @@ class NgramSpecManager:
 
     # ------------------------------------------------------------------ the round
 
-    def _round(self, plans: List[Plan]) -> None:
+    def _round(self, plans: List[Plan], draft_q=None):
         sched, eng = self.sched, self.engine
         dev = eng.device
         reqs = [r for r, _, _ in plans]
@@ -634,14 +674,14 @@ class NgramSpecManager:
         else:
             logits, _ = eng.extend_forward(verify_batch)
 
-        a_list, bonus_list = self._accept(reqs, logits, drafts, real, k, dev)
+        a_list, bonus_list = self._accept(reqs, logits, drafts, real, k, dev, draft_q=draft_q)
         for (_, d, match), a in zip(plans, a_list):
             if match != DFLY:
                 self.policy.observe_round(len(d), a, match)
         self._publish(reqs, C, k, drafts, real, a_list, bonus_list, [m == DFLY for _, _, m in plans])
         return a_list
 
-    def _accept(self, reqs, logits, drafts, real, k, dev):
+    def _accept(self, reqs, logits, drafts, real, k, dev, draft_q=None):
         """Per request (accepted drafts a <= its real draft count, bonus token).
         Row ``i*(k+1)+j`` predicts ``C+j+1``."""
         n = len(reqs)
@@ -649,29 +689,25 @@ class NgramSpecManager:
         greedy = [r.sampling_params.is_greedy for r in reqs]
         am = torch.argmax(logits, dim=-1).view(n, k + 1) if any(greedy) else None
         am_host = am.tolist() if am is not None else None
-        a_list, bonus_list = [], []
+        out: List[Tuple[torch.Tensor, torch.Tensor] | Tuple[int, int]] = []
         for i, r in enumerate(reqs):
             if greedy[i]:
                 row = am_host[i]
                 a = next((j for j in range(real[i]) if row[j] != drafts[i][j]), real[i])
-                a_list.append(a)
-                bonus_list.append(int(row[a]))
+                out.append((a, int(row[a])))
                 continue
-            probs = probs_from_logits(logits[i * (k + 1) : (i + 1) * (k + 1)], r.sampling_params)
-            p_draft = probs[torch.arange(k, device=dev), draft_t[i]]
-            ok = (torch.rand(k, device=dev) < p_draft).tolist()
-            a = next((j for j in range(real[i]) if not ok[j]), real[i])
-            if a < real[i]:
-                resid = probs[a].clone()
-                resid[drafts[i][a]] = 0.0
-                total = float(resid.sum())
-                # the rejected draft held all the mass only if p(d) == 1, which accepts it
-                bonus = torch.multinomial(resid / total, 1).view(()) if total > 0 else probs[a].argmax()
-            else:
-                bonus = torch.multinomial(probs[a], 1).view(())
-            a_list.append(a)
-            bonus_list.append(int(bonus))
-        return a_list, bonus_list
+            ri = real[i]
+            probs = probs_from_logits(logits[i * (k + 1) : i * (k + 1) + ri + 1], r.sampling_params)
+            dq = draft_q[i] if draft_q is not None else None
+            cid = dq[0][:ri] if dq is not None else None
+            cq = dq[1][:ri] if dq is not None else None
+            out.append(speculative_accept(probs, draft_t[i, :ri], cid, cq))
+        dev_pairs = [(i, x) for i, x in enumerate(out) if isinstance(x[0], torch.Tensor)]
+        if dev_pairs:
+            host = torch.stack([torch.stack(x) for _, x in dev_pairs]).tolist()
+            for (i, _), (a, bonus) in zip(dev_pairs, host):
+                out[i] = (int(a), int(bonus))
+        return [a for a, _ in out], [b for _, b in out]
 
     def _publish(self, reqs, C, k, drafts, real, a_list, bonus_list, from_dfly=None) -> None:
         """Publish accepted drafts + bonus, roll back the rejected pages, commit the accepted
@@ -780,6 +816,9 @@ class NgramSpecManager:
                 sched._free_req_resources(r)
                 sched.finished_reqs.add(r)
 
+        dv = getattr(eng, "draft_vocab", None)
+        if dv is not None and reply:
+            dv.observe([m.next_token for m in reply])
         if reply:
             used, total = sched._kv_usage_pages()
             mamba_used, mamba_total = sched._mamba_slot_usage() or (0, 0)
