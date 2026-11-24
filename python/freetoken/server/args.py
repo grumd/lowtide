@@ -604,9 +604,9 @@ def parse_args(
         type=str,
         default=ServerArgs.kv_cache_dtype,
         choices=["auto", *(name for name in KV_FORMATS if name != NONE.name)],
-        help="How K and V are stored. 'auto' keeps the compute dtype. The per_token_head formats store 8 bits per "
-        "element plus one scale per token and head (two per MLA latent row); the dsa attention backend reads them. "
-        "Needs --dtype bfloat16.",
+        help="How K and V are stored. 'auto' keeps the compute dtype. 'fp8_mla' and 'int8_mla' quantize MLA "
+        "ckv in 128-element groups with fp32 scales and keep k_rope in bf16 (656 B vs 1152 B/row, -43% KV VRAM); "
+        "the dsa attention backend reads them. Needs --dtype bfloat16.",
     )
 
     parser.add_argument(

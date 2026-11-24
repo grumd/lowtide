@@ -30,7 +30,7 @@ import torch
 import triton
 import triton.language as tl
 
-from freetoken.kernel.triton.kv_rows import kv_row_scale, kv_tile, kv_tile_staged
+from freetoken.kernel.triton.kv_rows import kv_mla_ckv_tile_staged
 from freetoken.kvcache.format import NONE, KVFormat
 
 BLOCK_H = 16
@@ -100,20 +100,25 @@ def _glm_dsa_sparse_kernel(
         idxs = tl.load(idx_base + offs_t * stride_it, mask=t_mask, other=-1)
         valid = idxs >= 0
         kv_base = pool_ptr + idxs[:, None].to(KV_OFFSET_DTYPE) * stride_pn
-        scale_base = scale_ptr + idxs.to(KV_OFFSET_DTYPE) * stride_ps
         if KV_FMT == "none":
-            kv_v = kv_tile(kv_base + offs_v[None, :] * stride_pd, valid[:, None], KV_FMT).to(tl.float32)
+            kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
+            scores = tl.dot(q_v, tl.trans(kv_v))
+            if HAS_ROPE:
+                kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
+                scores += tl.dot(q_r, tl.trans(kv_r))
         else:
-            kv_v = kv_tile_staged(kv_base + offs_v[None, :] * stride_pd, valid[:, None], KV_FMT)
-        scale_v = kv_row_scale(scale_base, valid, KV_FMT)
-
-        scores = tl.dot(q_v, tl.trans(kv_v)) * scale_v[None, :]
-        if HAS_ROPE:
-            if KV_FMT == "none":
-                kv_r = kv_tile(kv_base + (D_V + offs_r[None, :]) * stride_pd, valid[:, None], KV_FMT).to(tl.float32)
-            else:
-                kv_r = kv_tile_staged(kv_base + (D_V + offs_r[None, :]) * stride_pd, valid[:, None], KV_FMT)
-            scores += tl.dot(q_r, tl.trans(kv_r)) * kv_row_scale(scale_base + 1, valid, KV_FMT)[None, :]
+            scale_base = scale_ptr + idxs[:, None].to(KV_OFFSET_DTYPE) * stride_ps
+            kv_v = kv_mla_ckv_tile_staged(
+                kv_base + offs_v[None, :] * stride_pd,
+                scale_base,
+                valid,
+                BLOCK_T, D_V, 128, KV_FMT,
+            )
+            scores = tl.dot(q_v, tl.trans(kv_v))
+            if HAS_ROPE:
+                rope_base = pool_ptr.to(tl.pointer_type(tl.bfloat16)) + idxs[:, None].to(KV_OFFSET_DTYPE) * (stride_pn // 2)
+                kv_r = tl.load(rope_base + (D_V // 2 + offs_r[None, :]), mask=valid[:, None], other=0.0)
+                scores += tl.dot(q_r, tl.trans(kv_r))
         scores = scores * scale
         scores = tl.where(valid[None, :], scores, -float("inf"))
 
@@ -122,7 +127,7 @@ def _glm_dsa_sparse_kernel(
         alpha = tl.where(m_new == -float("inf"), 1.0, tl.exp(m_i - m_new))
         p = tl.where(valid[None, :], tl.exp(scores - m_new[:, None]), 0.0)
         l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.dot((p * scale_v[None, :]).to(kv_v.dtype), kv_v)
+        acc = acc * alpha[:, None] + tl.dot(p.to(kv_v.dtype), kv_v)
         m_i = m_new
 
     if HAS_EXTRA:
@@ -327,20 +332,25 @@ def _glm_dsa_splitk_kernel(
             idxs = tl.load(idx_base + offs_t * stride_it, mask=t_mask, other=-1)
             valid = idxs >= 0
             kv_base = pool_ptr + idxs[:, None].to(KV_OFFSET_DTYPE) * stride_pn
-            scale_base = scale_ptr + idxs.to(KV_OFFSET_DTYPE) * stride_ps
             if KV_FMT == "none":
-                kv_v = kv_tile(kv_base + offs_v[None, :] * stride_pd, valid[:, None], KV_FMT).to(tl.float32)
+                kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
+                scores = tl.dot(q_v, tl.trans(kv_v))
+                if HAS_ROPE:
+                    kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
+                    scores += tl.dot(q_r, tl.trans(kv_r))
             else:
-                kv_v = kv_tile_staged(kv_base + offs_v[None, :] * stride_pd, valid[:, None], KV_FMT)
-            scale_v = kv_row_scale(scale_base, valid, KV_FMT)
-
-            scores = tl.dot(q_v, tl.trans(kv_v)) * scale_v[None, :]
-            if HAS_ROPE:
-                if KV_FMT == "none":
-                    kv_r = kv_tile(kv_base + (D_V + offs_r[None, :]) * stride_pd, valid[:, None], KV_FMT).to(tl.float32)
-                else:
-                    kv_r = kv_tile_staged(kv_base + (D_V + offs_r[None, :]) * stride_pd, valid[:, None], KV_FMT)
-                scores += tl.dot(q_r, tl.trans(kv_r)) * kv_row_scale(scale_base + 1, valid, KV_FMT)[None, :]
+                scale_base = scale_ptr + idxs[:, None].to(KV_OFFSET_DTYPE) * stride_ps
+                kv_v = kv_mla_ckv_tile_staged(
+                    kv_base + offs_v[None, :] * stride_pd,
+                    scale_base,
+                    valid,
+                    BLOCK_T, D_V, 128, KV_FMT,
+                )
+                scores = tl.dot(q_v, tl.trans(kv_v))
+                if HAS_ROPE:
+                    rope_base = pool_ptr.to(tl.pointer_type(tl.bfloat16)) + idxs[:, None].to(KV_OFFSET_DTYPE) * (stride_pn // 2)
+                    kv_r = tl.load(rope_base + (D_V // 2 + offs_r[None, :]), mask=valid[:, None], other=0.0)
+                    scores += tl.dot(q_r, tl.trans(kv_r))
             scores = scores * scale
             scores = tl.where(valid[None, :], scores, -float("inf"))
 
@@ -348,7 +358,7 @@ def _glm_dsa_splitk_kernel(
             alpha = tl.where(m_new == -float("inf"), 1.0, tl.exp(m_i - m_new))
             p = tl.where(valid[None, :], tl.exp(scores - m_new[:, None]), 0.0)
             l_i = l_i * alpha + tl.sum(p, axis=1)
-            acc = acc * alpha[:, None] + tl.dot((p * scale_v[None, :]).to(kv_v.dtype), kv_v)
+            acc = acc * alpha[:, None] + tl.dot(p.to(kv_v.dtype), kv_v)
             m_i = m_new
 
         if HAS_EXTRA:
@@ -477,14 +487,17 @@ def glm_dsa_sparse_attn(
     b, m, h, d = q.shape
     d_r = d - d_v
     topk = topk_idxs.shape[-1]
-    assert pool.shape[-1] == d, (pool.shape, d)
     q = q.contiguous()
-    pool_2d = pool.reshape(-1, d)
+    expected_row_elems = kv_format.mla_row_elems(d_v, d_r, q.dtype)
+    assert pool.shape[-1] == expected_row_elems, (pool.shape, expected_row_elems)
+    pool_2d = pool.reshape(-1, expected_row_elems)
     assert pool_2d.stride(-1) == 1
     if kv_format.quantized:
+        n_scales = kv_format.mla_scale_dim(d_v, d_r)
         assert scale is not None, f"{kv_format.name} requires a scale tensor"
         assert pool.dtype == kv_format.elem_store_dtype and scale.dtype == kv_format.scale_store_dtype
-        assert scale.shape == (pool_2d.shape[0], 2) and scale.stride(1) == 1
+        assert scale.shape == (pool_2d.shape[0], n_scales) and scale.stride(1) == 1
+        assert pool_2d.stride(0) % 2 == 0 and d_v % 2 == 0
         scale_arg, stride_ps = scale, scale.stride(0)
         scale_span = scale.shape[0] * scale.stride(0)
     else:

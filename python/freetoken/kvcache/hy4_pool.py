@@ -172,14 +172,14 @@ class Hy4WindowKVCache(Hy4KVCache):
         # + one dummy page bound to the full dummy page, + one scratch row for unbound stores
         self._win_slots = self._num_window_tokens + ps
         self._win_buffer = torch.zeros(
-            len(self._swa_layer), self._win_slots + 1, fmt.elem_dim(self._latent_dim),
+            len(self._swa_layer), self._win_slots + 1, self._row_elems,
             dtype=fmt.elem_tensor_dtype(self._dtype), device=self._device,
         )
         self._win_scale_buffer = (
             None
-            if fmt.scale_dtype is None
+            if self._n_scales == 0
             else torch.zeros(
-                len(self._swa_layer), self._win_slots + 1, 2,
+                len(self._swa_layer), self._win_slots + 1, self._n_scales,
                 dtype=fmt.scale_store_dtype, device=self._device,
             )
         )
@@ -223,7 +223,7 @@ class Hy4WindowKVCache(Hy4KVCache):
         args = _window_args(config)
         ps = config.page_size
         fmt = getattr(config, "kv_format", NONE)
-        row = fmt.row_bytes(args.latent_dim, config.dtype, segments=2)
+        row = fmt.mla_row_bytes(args.kv_lora_rank, args.qk_rope_head_dim, config.dtype)
         n_idx = sum(1 for i in args.indexed_layer_ids if i < config.model_config.num_layers)
         n_swa = sum(1 for i in args.sliding_layer_ids if i < config.model_config.num_layers)
         full = n_idx * row + n_idx * args.index_head_dim * 2 // args.index_ratio + 4
@@ -273,7 +273,7 @@ class Hy4WindowKVCache(Hy4KVCache):
         if w is None:
             return super().k_cache(layer_id)
         return self._win_buffer[w, : self._win_slots].view(
-            -1, self._page_size, self.kv_format.elem_dim(self._latent_dim)
+            -1, self._page_size, self._row_elems
         )
 
     def window_slots(self, full_slots: torch.Tensor) -> torch.Tensor:

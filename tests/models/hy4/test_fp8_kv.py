@@ -11,8 +11,8 @@ import torch
 from freetoken.distributed import DistributedInfo, set_tp_info, try_get_tp_info
 from freetoken.engine.config import EngineConfig
 from freetoken.kvcache.format import (
-    FP8_PER_TOKEN_HEAD,
-    INT8_PER_TOKEN_HEAD,
+    FP8_MLA,
+    INT8_MLA,
     NONE,
     ROW_SCALE_FORMATS,
     resolve_kv_format,
@@ -34,14 +34,16 @@ def _ensure_tp1():
 def test_kv_format_resolution_and_row_bytes():
     assert resolve_kv_format("auto") is NONE
     assert resolve_kv_format("none") is NONE
-    assert resolve_kv_format("fp8_per_token_head") is FP8_PER_TOKEN_HEAD
-    assert resolve_kv_format("int8_per_token_head") is INT8_PER_TOKEN_HEAD
+    assert resolve_kv_format("fp8_mla") is FP8_MLA
+    assert resolve_kv_format("int8_mla") is INT8_MLA
     assert not NONE.quantized
-    assert FP8_PER_TOKEN_HEAD.quantized
-    assert INT8_PER_TOKEN_HEAD.quantized
-    assert NONE.row_bytes(576, torch.bfloat16, segments=2) == 576 * 2
-    assert FP8_PER_TOKEN_HEAD.row_bytes(576, torch.bfloat16, segments=2) == 576 + 8
-    assert INT8_PER_TOKEN_HEAD.row_bytes(576, torch.bfloat16, segments=2) == 576 + 8
+    assert FP8_MLA.quantized
+    assert INT8_MLA.quantized
+    assert NONE.mla_row_bytes(512, 64, torch.bfloat16) == 576 * 2
+    assert FP8_MLA.mla_row_elems(512, 64, torch.bfloat16) == 512 + 128
+    assert FP8_MLA.mla_scale_dim(512, 64) == 4
+    assert FP8_MLA.mla_row_bytes(512, 64, torch.bfloat16) == 512 + 128 + 16
+    assert INT8_MLA.mla_row_bytes(512, 64, torch.bfloat16) == 512 + 128 + 16
     with pytest.raises(ValueError, match="unknown --kv-cache-dtype"):
         resolve_kv_format("fp4_magic")
 
@@ -55,13 +57,13 @@ def test_cli_kv_cache_dtype_opt_in(monkeypatch):
     assert args_default.kv_cache_dtype == "auto"
     assert args_default.kv_format is NONE
 
-    args_fp8, _ = parse_args(["--model", "dummy", "--kv-cache-dtype", "fp8_per_token_head"])
-    assert args_fp8.kv_cache_dtype == "fp8_per_token_head"
-    assert args_fp8.kv_format is FP8_PER_TOKEN_HEAD
+    args_fp8, _ = parse_args(["--model", "dummy", "--kv-cache-dtype", "fp8_mla"])
+    assert args_fp8.kv_cache_dtype == "fp8_mla"
+    assert args_fp8.kv_format is FP8_MLA
 
-    args_int8, _ = parse_args(["--model", "dummy", "--kv-cache-dtype", "int8_per_token_head"])
-    assert args_int8.kv_cache_dtype == "int8_per_token_head"
-    assert args_int8.kv_format is INT8_PER_TOKEN_HEAD
+    args_int8, _ = parse_args(["--model", "dummy", "--kv-cache-dtype", "int8_mla"])
+    assert args_int8.kv_cache_dtype == "int8_mla"
+    assert args_int8.kv_format is INT8_MLA
 
     with pytest.raises(SystemExit):
         parse_args(["--model", "dummy", "--kv-cache-dtype", "invalid_fmt"])
@@ -79,14 +81,14 @@ def test_validate_kv_format_hy4_tp1_tp2_and_rejections():
     )
 
     assert attention_backend_info("dsa").kv_formats == ROW_SCALE_FORMATS
-    assert _resolve_auto_attention_backend(frozenset({AttnType.DSA}), FP8_PER_TOKEN_HEAD) == "dsa"
+    assert _resolve_auto_attention_backend(frozenset({AttnType.DSA}), FP8_MLA) == "dsa"
 
     hy4_ring_mc = ring_config(parsed_config())
     hy4_full_mc = full_history_config(parsed_config())
 
     for mc in (hy4_ring_mc, hy4_full_mc):
         for tp in (1, 2):
-            for fmt in (FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD):
+            for fmt in (FP8_MLA, INT8_MLA):
                 cfg = SimpleNamespace(
                     kv_format=fmt,
                     dtype=torch.bfloat16,
@@ -100,7 +102,7 @@ def test_validate_kv_format_hy4_tp1_tp2_and_rejections():
 
     # Reject fp16 compute dtype
     cfg_fp16 = SimpleNamespace(
-        kv_format=FP8_PER_TOKEN_HEAD,
+        kv_format=FP8_MLA,
         dtype=torch.float16,
         tp_info=DistributedInfo(rank=0, size=1),
         model_config=hy4_ring_mc,
@@ -111,7 +113,7 @@ def test_validate_kv_format_hy4_tp1_tp2_and_rejections():
     # Reject unsupported pool (MHA)
     mha_mc = SimpleNamespace(kv_cache_group_specs=lambda: [])
     cfg_mha = SimpleNamespace(
-        kv_format=FP8_PER_TOKEN_HEAD,
+        kv_format=FP8_MLA,
         dtype=torch.bfloat16,
         tp_info=DistributedInfo(rank=0, size=1),
         model_config=mha_mc,
@@ -121,7 +123,7 @@ def test_validate_kv_format_hy4_tp1_tp2_and_rejections():
 
     # Reject unsupported attention backend for quantized KV
     cfg_bad_be = SimpleNamespace(
-        kv_format=FP8_PER_TOKEN_HEAD,
+        kv_format=FP8_MLA,
         dtype=torch.bfloat16,
         tp_info=DistributedInfo(rank=0, size=1),
         attention_backend="triton",
@@ -160,7 +162,7 @@ def _ref_sparse_attn_fp64(q, pool_bf16, idx, scale, counts, d_v, sinks=None, ext
 
 
 @needs_cuda
-@pytest.mark.parametrize("kv_format", [NONE, FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD])
+@pytest.mark.parametrize("kv_format", [NONE, FP8_MLA, INT8_MLA])
 @pytest.mark.parametrize("splits", [0, 8])
 @pytest.mark.parametrize("use_extra", [False, True])
 def test_store_latent_rows_and_glm_dsa_sparse_attn(kv_format, splits, use_extra):
@@ -185,14 +187,19 @@ def test_store_latent_rows_and_glm_dsa_sparse_attn(kv_format, splits, use_extra)
     idx[1, 0, :95] = torch.randint(0, rows, (95,), generator=g, device=DEV, dtype=torch.int32)
     counts = torch.tensor([[200], [95]], dtype=torch.int32, device=DEV)
 
-    # Strided scale tensor matching MLAKVCache's (num_pages, page_size, num_layers, 2) layout
+    # Strided scale tensor matching MLAKVCache's (num_pages, page_size, num_layers, 4) layout
     if kv_format.quantized:
-        pool_q = torch.zeros(rows, d, dtype=kv_format.elem_store_dtype, device=DEV)
-        scale_slab = torch.zeros(rows, 12, 2, dtype=kv_format.scale_store_dtype, device=DEV)
+        row_elems = kv_format.mla_row_elems(d_v, d_r, torch.bfloat16)
+        n_scales = kv_format.mla_scale_dim(d_v, d_r)
+        pool_q = torch.zeros(rows, row_elems, dtype=kv_format.elem_store_dtype, device=DEV)
+        scale_slab = torch.zeros(rows, 12, n_scales, dtype=kv_format.scale_store_dtype, device=DEV)
         scale_view = scale_slab[:, 5, :]
-        assert scale_view.stride() == (24, 1)
+        assert scale_view.stride() == (12 * n_scales, 1)
         out_loc = torch.randperm(rows, generator=g, device=DEV, dtype=torch.int32)
         store_latent_rows(kv_format, c_kv[out_loc.long()], k_rope[out_loc.long()], out_loc, pool_q, scale_view)
+        # k_rope must be stored bit-identically in bf16
+        stored_rope = pool_q[:, d_v:].contiguous().view(torch.bfloat16)
+        assert torch.equal(stored_rope, k_rope)
         pool_arg, scale_arg = pool_q, scale_view
     else:
         pool_arg, scale_arg = pool_bf16, None
@@ -209,14 +216,14 @@ def test_store_latent_rows_and_glm_dsa_sparse_attn(kv_format, splits, use_extra)
     rel_err = (got.double() - ref).norm() / ref.norm()
     if not kv_format.quantized:
         assert rel_err < 2e-3, f"bf16 rel_err={rel_err:.5f}"
-    elif kv_format is FP8_PER_TOKEN_HEAD:
+    elif kv_format is FP8_MLA:
         assert rel_err < 3.5e-2, f"fp8 rel_err={rel_err:.5f}"
     else:
         assert rel_err < 1.5e-2, f"int8 rel_err={rel_err:.5f}"
 
 
 @needs_cuda
-@pytest.mark.parametrize("kv_format", [FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD])
+@pytest.mark.parametrize("kv_format", [FP8_MLA, INT8_MLA])
 def test_extra_kv_stays_bf16_when_pool_quantized(kv_format):
     """When hist_cnt == 0 and pool is quantized, extra_kv is still read directly in BF16 (no quant error)."""
     from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
@@ -224,8 +231,10 @@ def test_extra_kv_stays_bf16_when_pool_quantized(kv_format):
     g = torch.Generator(device=DEV).manual_seed(99)
     b, m, h, d_v, d_r = 1, 5, 16, 512, 64
     d = d_v + d_r
-    pool_q = torch.zeros(64, d, dtype=kv_format.elem_store_dtype, device=DEV)
-    scale_q = torch.zeros(64, 2, dtype=kv_format.scale_store_dtype, device=DEV)
+    row_elems = kv_format.mla_row_elems(d_v, d_r, torch.bfloat16)
+    n_scales = kv_format.mla_scale_dim(d_v, d_r)
+    pool_q = torch.zeros(64, row_elems, dtype=kv_format.elem_store_dtype, device=DEV)
+    scale_q = torch.zeros(64, n_scales, dtype=kv_format.scale_store_dtype, device=DEV)
     q = torch.randn(b, m, h, d, generator=g, device=DEV, dtype=torch.bfloat16) * 0.3
     extra = torch.randn(b, m, d, generator=g, device=DEV, dtype=torch.bfloat16) * 0.5
     sinks = torch.randn(h, generator=g, device=DEV, dtype=torch.float32) * 0.5
@@ -250,7 +259,7 @@ def test_extra_kv_stays_bf16_when_pool_quantized(kv_format):
 
 
 @needs_cuda
-@pytest.mark.parametrize("kv_format", [NONE, FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD])
+@pytest.mark.parametrize("kv_format", [NONE, FP8_MLA, INT8_MLA])
 @pytest.mark.parametrize("ring", [False, True])
 def test_hy4_pools_alloc_cost_unit_bytes_rebuild(kv_format, ring):
     from freetoken.kvcache import create_kvcache_pool
@@ -281,10 +290,10 @@ def test_hy4_pools_alloc_cost_unit_bytes_rebuild(kv_format, ring):
     if kv_format.quantized:
         sc_idx = pool.latent_scale(idx_lid)
         sc_swa = pool.latent_scale(swa_lid)
-        assert sc_idx is not None and sc_idx.shape == (num_pages * page_size, 2) and sc_idx.stride(1) == 1
+        assert sc_idx is not None and sc_idx.shape == (num_pages * page_size, 4) and sc_idx.stride(1) == 1
         assert sc_swa is not None and sc_swa.stride(1) == 1
         if ring:
-            assert sc_swa.shape == (win_tokens + page_size + 1, 2)
+            assert sc_swa.shape == (win_tokens + page_size + 1, 4)
     else:
         assert pool.latent_scale(idx_lid) is None
         assert pool.latent_scale(swa_lid) is None
@@ -313,15 +322,15 @@ def test_hy4_pools_alloc_cost_unit_bytes_rebuild(kv_format, ring):
     pp_bf16, fix_bf16, _, _ = cls.kv_cost(_cfg(NONE))
     pp_fmt, fix_fmt, _, _ = cls.kv_cost(_cfg(kv_format))
     if kv_format.quantized:
-        assert pp_fmt < pp_bf16 * 0.60, (pp_fmt, pp_bf16)
+        assert pp_fmt < pp_bf16 * 0.65, (pp_fmt, pp_bf16)
         if ring:
-            assert fix_fmt < fix_bf16 * 0.55, (fix_fmt, fix_bf16)
+            assert fix_fmt < fix_bf16 * 0.60, (fix_fmt, fix_bf16)
     else:
         assert pp_fmt == pp_bf16 and fix_fmt == fix_bf16
 
     # Verify unit_bytes includes scale buffers
     kv_ub, swa_ub = pool.unit_bytes()
-    expected_row = kv_format.row_bytes(576, torch.bfloat16, segments=2)
+    expected_row = kv_format.mla_row_bytes(512, 64, torch.bfloat16)
     n_idx = sum(1 for i in mc.hy4_args.indexed_layer_ids if i < 6)
     n_swa = sum(1 for i in mc.hy4_args.sliding_layer_ids if i < 6)
     if ring:
@@ -341,9 +350,12 @@ def test_hy4_pools_alloc_cost_unit_bytes_rebuild(kv_format, ring):
     pool.store_kv(c_kv, k_rope, loc, swa_lid)
 
     pool.rebuild(num_pages + 2)
-    assert pool.latent_rows(idx_lid).shape == ((num_pages + 2) * page_size, 576)
+    assert pool.latent_rows(idx_lid).shape == (
+        (num_pages + 2) * page_size,
+        kv_format.mla_row_elems(512, 64, torch.bfloat16),
+    )
     if kv_format.quantized:
-        assert pool.latent_scale(idx_lid).shape == ((num_pages + 2) * page_size, 2)
+        assert pool.latent_scale(idx_lid).shape == ((num_pages + 2) * page_size, 4)
 
 
 @needs_cuda
@@ -365,7 +377,7 @@ def test_hy4_elastic_vram_kv_scale_single_run():
             model_config=mc, num_pages=65, page_size=64,
             dtype=torch.bfloat16, device=DEV,
             num_swa_tokens=1024, num_req_slots=3,
-            kv_format=FP8_PER_TOKEN_HEAD,
+            kv_format=FP8_MLA,
         )
 
     assert pool.elastic is True
@@ -374,17 +386,17 @@ def test_hy4_elastic_vram_kv_scale_single_run():
 
     kv_shape, kv_dtype, kv_iv = by_role["kv"]
     assert kv_dtype == torch.uint8
-    assert kv_shape == (1, 12, 65, 64, 1, 576)
+    assert kv_shape == (1, 12, 65, 64, 1, 640)
     # 12 layers -> 12 runs * 2 intervals (active + dummy) = 24 intervals
     assert len(kv_iv(16)) == 24
 
     sc_shape, sc_dtype, sc_iv = by_role["kv_scale"]
     assert sc_dtype == torch.float32
-    assert sc_shape == (65, 64, 12, 2)
+    assert sc_shape == (65, 64, 12, 4)
     # 1 contiguous run -> 2 intervals (active prefix + dummy page at top)
     ivs = sc_iv(16)
     assert len(ivs) == 2
-    scale_page_bytes = 64 * 12 * 2 * 4
+    scale_page_bytes = 64 * 12 * 4 * 4
     assert ivs[0] == (0, 16 * scale_page_bytes)
     assert ivs[1] == (64 * scale_page_bytes, 65 * scale_page_bytes)
 
@@ -452,7 +464,7 @@ class _Hy4KVFixture:
 
 
 @needs_cuda
-@pytest.mark.parametrize("kv_format", [FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD])
+@pytest.mark.parametrize("kv_format", [FP8_MLA, INT8_MLA])
 @pytest.mark.parametrize("ring", [False, True])
 def test_hy4_backend_e2e_prefill_decode_verify_dfly_and_cuda_graph(kv_format, ring):
     """End-to-end Hy4AttnBackend parity vs BF16 across prefill, decode (eager + CUDA graph),
@@ -480,7 +492,7 @@ def test_hy4_backend_e2e_prefill_decode_verify_dfly_and_cuda_graph(kv_format, ri
             idx_in = Hy4IndexerInputs(q=qi, k=ki, w=wi, pool=lambda m, p: m.mean(dim=1).to(torch.bfloat16))
         return q_nope, q_pe, c_kv, k_rope, sinks, idx_in
 
-    tol = 3.5e-2 if kv_format is FP8_PER_TOKEN_HEAD else 1.5e-2
+    tol = 3.5e-2 if kv_format is FP8_MLA else 1.5e-2
 
     # 1. Prefill (80 tokens)
     b_ref = fx_ref.batch(0, 0, 80, "prefill")
