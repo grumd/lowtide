@@ -36,8 +36,8 @@ Measured on 1–2x RTX 3080 20 GB (PCIe 4.0 x8 with P2P), Ryzen 7 9800X3D, 96 GB
 
 | Setup | Decode | + MTP | 16k prefill | Max context |
 |---|---|---|---|---|
-| 1x RTX 3080 20 GB | 55 tok/s | 60 tok/s | 2,720 tok/s | 262k |
-| 2x RTX 3080 20 GB | 91 tok/s | 102 tok/s | 3,500 tok/s | 262k |
+| 1x RTX 3080 20 GB | 55 tok/s | 62 tok/s | 2,720 tok/s | 262k |
+| 2x RTX 3080 20 GB | 91 tok/s | 112 tok/s | 3,500 tok/s | 262k |
 
 **MTP speculative decoding** (lossless, off by default) — add to `scripts/serve.sh`:
 
@@ -45,6 +45,8 @@ Measured on 1–2x RTX 3080 20 GB (PCIe 4.0 x8 with P2P), Ryzen 7 9800X3D, 96 GB
 |---|---|
 | 1x 20 GB | `--mtp on --mtp-experts-fp4 --mtp-draft-tokens 2` |
 | 2x 20 GB | `--mtp on --mtp-experts-fp4 --mtp-draft-tokens 3 --moe-decode-fetch 0.5` |
+
+- **`--kv-cache-dtype int8_per_token_head`** (or `fp8_per_token_head`, opt-in, off by default) cuts KV VRAM by 48% for extra expert cache slots on low VRAM setups. On 64k prompts it has 0.017 KLD vs BF16 KV; ~15–20% slower long-prompt prefill. Prefer `--kv-tier` if you have spare RAM for a lossless VRAM saving option.
 
 ### Comparison with llama.cpp and Strata
 
