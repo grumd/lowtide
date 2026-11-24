@@ -89,6 +89,7 @@ Single request, 262k context with a 16-bit KV cache. Lowtide runs NVIDIA's FP4; 
 - **Decode:** 26-32 tok/s on 2x RTX 3080 20 GB at 4k context. `--mtp on` turns on the checkpoint's DFly2 drafter: 1.35x on average across chat, code and tool-call tasks.
 - **Quality:** KL divergence vs the FP8 original is 0.019-0.048 depending on the text ([model card](https://huggingface.co/grumd0/Hy4-flash-NVFP4-Lowtide)).
 - **RAM:** the NVFP4 experts take 78 GiB; on a 96 GB machine the engine's RAM saver drops the RAM copy of experts cached in VRAM. Text only.
+- **KV cache quantization (opt-in):** `--kv-cache-dtype int8_mla` or `fp8_mla` (default `auto`, BF16) cuts KV VRAM by 43% (656 B vs 1,152 B per token/layer, adding ~206–306 resident expert slots at 0–40k context). Use these MLA-specific formats with Hy4-flash for optimal KLD: they quantize `ckv` in 128-element groups and keep `k_rope` unquantized in BF16, so median KLD stays flat up to 64k context (`int8_mla` is preferred over `fp8_mla` at the same VRAM and speed: 0.0059 vs 0.0068 median KLD vs BF16 KV, 0.0072 vs 0.0089 mean on code).
 
 ## Quick start
 
