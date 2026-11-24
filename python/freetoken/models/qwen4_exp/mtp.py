@@ -80,7 +80,7 @@ class Qwen4ExpMTPMoE(BaseOP):
         # Router + shared expert before the routed experts: the fused MoE kernel may
         # write into hidden_states in place (HF evaluates the shared expert first too).
         router_logits = self.gate.forward(hidden_states)
-        shared = self.shared_expert.forward(hidden_states)
+        shared = self.shared_expert.forward(hidden_states, reduce=False)
         shared = shared * torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
         topk_weights, topk_ids = fused_topk(
             hidden_states,
@@ -89,10 +89,10 @@ class Qwen4ExpMTPMoE(BaseOP):
             self.experts.renormalize,
         )
         if self._fp4 is not None:
-            routed = self.experts._maybe_all_reduce(self._fp4_routed(hidden_states, topk_weights, topk_ids))
+            routed = self._fp4_routed(hidden_states, topk_weights, topk_ids)
         else:
-            routed = self.experts.routed_forward(hidden_states, topk_weights, topk_ids)
-        return (routed + shared).view(num_tokens, hidden_dim)
+            routed = self.experts.routed_forward(hidden_states, topk_weights, topk_ids, reduce=False)
+        return self.experts._maybe_all_reduce(routed + shared).view(num_tokens, hidden_dim)
 
     _fp4 = None
 

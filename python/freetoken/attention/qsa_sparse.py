@@ -328,6 +328,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
         indices = self._select(index, md, slot)
         if self.tiered:
             return self._tiered_attention(q, k, v, batch.out_loc, indices, md, layer_id)
+        from freetoken.kvcache.format import NONE
+
+        kv_format = getattr(self.kvcache, "kv_format", NONE)
         return qsa_sparse_paged_attention(
             q,
             self.kvcache.k_cache(layer_id),
@@ -336,6 +339,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.block_table,
             md.token_to_req,
             torch.empty_like(q),
+            k_scale=self.kvcache.k_scale(layer_id) if kv_format.quantized else None,
+            v_scale=self.kvcache.v_scale(layer_id) if kv_format.quantized else None,
+            kv_format=kv_format,
         )
 
     # ----- KV tiering -----------------------------------------------------------------------

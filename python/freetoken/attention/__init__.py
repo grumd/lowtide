@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from freetoken.kvcache.format import NONE, ROW_SCALE_FORMATS
+from freetoken.kvcache.format import NONE, QSA_KV_FORMATS, ROW_SCALE_FORMATS
 from freetoken.utils import Registry, init_logger
 
 from .base import AttentionSpec, AttnType, BaseAttnBackend, BaseAttnMetadata, HybridBackend
@@ -152,6 +152,7 @@ def create_m3_sparse_backend(config: ModelConfig):
         # 64-token pages: a 4-token compress group never straddles a page, so the
         # compressed row of a group is page_base // 4 + block-in-page.
         page_sizes=(64,),
+        kv_formats=QSA_KV_FORMATS,
     ),
 )
 def create_qsa_sparse_backend(config: ModelConfig):

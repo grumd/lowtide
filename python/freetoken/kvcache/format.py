@@ -110,12 +110,30 @@ INT8_MLA = KVFormat(
     scale_group=128,
     rope_unquantized=True,
 )
+FP8_PER_TOKEN_HEAD = KVFormat(
+    "fp8_per_token_head",
+    elem_dtype=torch.float8_e4m3fn,
+    elem_store_dtype=torch.uint8,
+    scale_dtype=torch.float32,
+    scale_store_dtype=torch.float32,
+    scale_group=ROW,
+)
+INT8_PER_TOKEN_HEAD = KVFormat(
+    "int8_per_token_head",
+    elem_dtype=torch.int8,
+    elem_store_dtype=torch.int8,
+    scale_dtype=torch.float32,
+    scale_store_dtype=torch.float32,
+    scale_group=ROW,
+)
 
 KV_FORMATS: dict[str, KVFormat] = {
-    fmt.name: fmt for fmt in (NONE, FP8_MLA, INT8_MLA)
+    fmt.name: fmt for fmt in (NONE, FP8_MLA, INT8_MLA, FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD)
 }
 # Formats supported by MLA/DSA pools (group-128 quantized ckv + unquantized bf16 k_rope).
 ROW_SCALE_FORMATS = frozenset({NONE.name, FP8_MLA.name, INT8_MLA.name})
+# Formats supported by QSA GQA pools (one fp32 scale per token per kv head, separately for K and V).
+QSA_KV_FORMATS = frozenset({NONE.name, FP8_PER_TOKEN_HEAD.name, INT8_PER_TOKEN_HEAD.name})
 
 
 def resolve_kv_format(kv_cache_dtype: str) -> KVFormat:

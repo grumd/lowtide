@@ -147,3 +147,109 @@ def store_latent_rows(
         FMT=fmt.name,
         num_warps=4,
     )
+
+
+@triton.jit
+def _encode_head_row(x, FMT: tl.constexpr):
+    """Quantize one ``[HEAD_DIM]`` fp32 head vector -> ``(codes, fp32 scalar scale)``."""
+    amax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-10)
+    if FMT == "fp8_per_token_head":
+        scale = amax / 448.0
+        q = tl.clamp(x / scale, -448.0, 448.0)
+        if e4m3_native_cx():
+            codes = f32_to_e4m3(q).to(tl.uint8, bitcast=True)
+        else:
+            codes = e4m3_f32_to_u8(round_e4m3(q))
+    else:  # int8_per_token_head
+        scale = amax / 127.0
+        q = x / scale
+        codes = tl.clamp(tl.where(q >= 0, q + 0.5, q - 0.5), -128.0, 127.0).to(tl.int8)
+    return codes, scale
+
+
+@triton.jit
+def _kv_per_token_head_store_kernel(
+    k_src,
+    v_src,
+    k_dst,
+    v_dst,
+    ks_dst,
+    vs_dst,
+    slots,
+    stride_kt,
+    stride_kh,
+    stride_vt,
+    stride_vh,
+    stride_kd_slot,
+    stride_kd_h,
+    stride_vd_slot,
+    stride_vd_h,
+    stride_ks_slot,
+    stride_ks_h,
+    stride_vs_slot,
+    stride_vs_h,
+    HEAD_DIM: tl.constexpr,
+    FMT: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    slot = tl.load(slots + token).to(tl.int64)
+    offs = tl.arange(0, HEAD_DIM)
+
+    k = tl.load(k_src + token * stride_kt + head * stride_kh + offs).to(tl.float32)
+    k_codes, k_s = _encode_head_row(k, FMT)
+    tl.store(k_dst + slot * stride_kd_slot + head * stride_kd_h + offs, k_codes)
+    tl.store(ks_dst + slot * stride_ks_slot + head * stride_ks_h, k_s)
+
+    v = tl.load(v_src + token * stride_vt + head * stride_vh + offs).to(tl.float32)
+    v_codes, v_s = _encode_head_row(v, FMT)
+    tl.store(v_dst + slot * stride_vd_slot + head * stride_vd_h + offs, v_codes)
+    tl.store(vs_dst + slot * stride_vs_slot + head * stride_vs_h, v_s)
+
+
+def store_kv_per_token_head(
+    fmt: KVFormat,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out_loc: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+) -> None:
+    """Quantize GQA K and V per ``(token, kv_head)`` into flat ``[slots, H, D]`` caches + ``[slots, H]`` scales."""
+    tokens = out_loc.shape[0]
+    if tokens == 0:
+        return
+    num_heads, head_dim = k_cache.shape[1], k_cache.shape[2]
+    assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
+    k3 = k.view(tokens, num_heads, head_dim)
+    v3 = v.view(tokens, num_heads, head_dim)
+    assert k3.stride(2) == 1 and v3.stride(2) == 1
+    assert k_cache.dtype == v_cache.dtype == fmt.elem_store_dtype
+    assert k_scale.dtype == v_scale.dtype == fmt.scale_store_dtype
+    assert k_cache.stride(2) == 1 and v_cache.stride(2) == 1
+    _kv_per_token_head_store_kernel[(tokens, num_heads)](
+        k3,
+        v3,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        out_loc,
+        k3.stride(0),
+        k3.stride(1),
+        v3.stride(0),
+        v3.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        k_scale.stride(0),
+        k_scale.stride(1),
+        v_scale.stride(0),
+        v_scale.stride(1),
+        HEAD_DIM=head_dim,
+        FMT=fmt.name,
+        num_warps=4,
+    )

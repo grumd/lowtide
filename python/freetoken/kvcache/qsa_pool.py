@@ -34,10 +34,11 @@ from __future__ import annotations
 import functools
 import math
 import operator
-from typing import Sequence
+from typing import ClassVar, Sequence
 
 import torch
 
+from .format import NONE, QSA_KV_FORMATS, KVFormat
 from .mha_pool import MHAKVCache, alloc_tier, paged_run_intervals
 
 # The index tiers are always 2-byte (compute dtype); spec_kv_bytes_per_token budgets the same.
@@ -56,6 +57,9 @@ class QSAKVCache(MHAKVCache):
     ``cmp_scratch_base`` on are the per-request-slot scratch sinks. ``slot`` is the sparse
     layer's order in the attention backend, same convention as BSAKVCache/DSAKVCache.
     """
+
+    kv_formats: ClassVar[frozenset[str]] = QSA_KV_FORMATS
+    kv_formats_tp: ClassVar[bool] = True
 
     # Tiered elastic pool: the host K/V mapping, backed with RAM as pages come into use (else None).
     _host_bank = None
@@ -93,7 +97,14 @@ class QSAKVCache(MHAKVCache):
         ring_capacity: int | None = None,
         layer_ids: Sequence[int] | None = None,
         kv_tier_cells: int = 0,
+        kv_format: KVFormat = NONE,
     ) -> None:
+        if kv_format.name not in self.kv_formats:
+            raise ValueError(
+                f"QSAKVCache does not support KV format {kv_format.name!r}; one of {sorted(self.kv_formats)}"
+            )
+        if kv_format.quantized and kv_tier_cells > 0:
+            raise ValueError("--kv-cache-dtype cannot be combined with --kv-tier")
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
             raise ValueError(
@@ -112,6 +123,8 @@ class QSAKVCache(MHAKVCache):
         assert dtype.itemsize == _INDEX_DTYPE_BYTES, (
             f"QSA index slab budgets 2 bytes/token (spec_kv_bytes_per_token); got {dtype}"
         )
+        self.kv_format = kv_format
+        self._compute_dtype = dtype
         self._index_head_dim = index_head_dim
         self._num_index_layers = num_index_layers
         self._index_ratio = index_ratio
@@ -126,14 +139,43 @@ class QSAKVCache(MHAKVCache):
             head_dim=head_dim,
             num_pages=num_pages,
             page_size=page_size,
-            dtype=dtype,
+            dtype=kv_format.elem_tensor_dtype(dtype),
             device=device,
             layer_ids=layer_ids,
         )
+        self._scale_buffer: torch.Tensor | None = None
+        if kv_format.quantized:
+            self._alloc_scale_tier(num_pages)
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
         if self.tiered:
             self._alloc_tier_cache(num_pages)
+
+    def _alloc_scale_tier(self, num_pages: int) -> None:
+        _, num_storage_layers, _, page_size, local_kv_heads, _ = self._kv_buffer.shape
+        scale_dtype = self.kv_format.scale_store_dtype
+        assert scale_dtype is not None
+        # 1 contiguous run of (num_pages, page_size, 2, num_storage_layers, local_kv_heads):
+        # under elastic VRAM (2 MiB chunks) this maps 1-2 chunks instead of 2*num_layers chunks.
+        page_bytes = page_size * 2 * num_storage_layers * local_kv_heads * scale_dtype.itemsize
+        self._scale_buffer = alloc_tier(
+            "kv_scale",
+            (num_pages, page_size, 2, num_storage_layers, local_kv_heads),
+            scale_dtype,
+            self._device,
+            paged_run_intervals(1, num_pages * page_bytes, page_bytes, page_bytes),
+            zero=True,
+        )
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._compute_dtype
+
+    def k_scale(self, index: int) -> torch.Tensor | None:
+        return None if self._scale_buffer is None else self._scale_buffer[:, :, 0, self._dense(index), :]
+
+    def v_scale(self, index: int) -> torch.Tensor | None:
+        return None if self._scale_buffer is None else self._scale_buffer[:, :, 1, self._dense(index), :]
 
     @property
     def tiered(self) -> bool:
@@ -319,6 +361,21 @@ class QSAKVCache(MHAKVCache):
 
     def store_kv(self, k, v, out_loc, layer_id) -> None:
         if not self.tiered:
+            if self.kv_format.quantized:
+                from freetoken.kernel.triton.kv_rows import store_kv_per_token_head
+
+                dense = self._dense(layer_id)
+                store_kv_per_token_head(
+                    self.kv_format,
+                    k,
+                    v,
+                    out_loc,
+                    self._k_buffer[dense].view(self._storage_shape),
+                    self._v_buffer[dense].view(self._storage_shape),
+                    self._scale_buffer[:, :, 0, dense, :].view(self._storage_shape[:2]),
+                    self._scale_buffer[:, :, 1, dense, :].view(self._storage_shape[:2]),
+                )
+                return
             return super().store_kv(k, v, out_loc, layer_id)
         from freetoken.kernel.kv_tier import kv_tier_store
 
@@ -351,6 +408,8 @@ class QSAKVCache(MHAKVCache):
         # An elastic slab is zeroed chunk by chunk as it is mapped (and most of it is not).
         if not self.elastic and not self.tiered:
             self._kv_buffer.zero_()
+            if self._scale_buffer is not None:
+                self._scale_buffer.zero_()
 
     def _alloc_index_tiers(self, num_pages: int) -> None:
         # ZERO-initialized: the score kernel reads whole rows of blocks unmasked and relies on
@@ -391,7 +450,10 @@ class QSAKVCache(MHAKVCache):
         # cannot drop a live request's pending members.
         self._cmp_k_buffer = None
         self._pending_ring = None
+        self._scale_buffer = None
         super().rebuild(num_pages)
+        if self.kv_format.quantized:
+            self._alloc_scale_tier(num_pages)
         self._zero_kv_slabs()
         try:
             self._alloc_index_tiers(num_pages)
@@ -399,6 +461,7 @@ class QSAKVCache(MHAKVCache):
             self._kv_buffer = None
             self._k_buffer = None
             self._v_buffer = None
+            self._scale_buffer = None
             raise
 
     @classmethod
@@ -409,12 +472,13 @@ class QSAKVCache(MHAKVCache):
 
         num_req_slots = config.max_running_req + 1
         tier_cells = kv_tier_cells_for(config)
+        fmt = getattr(config, "kv_format", NONE)
         per_token = 0
         fixed = 0
         for spec in config.model_config.kv_cache_group_specs():
             if spec.is_swa:
                 continue
-            kv_bytes = spec_kv_bytes_per_token(spec, config)
+            kv_bytes = spec_kv_bytes_per_token(spec, config, fmt)
             if spec.attn_type is AttnType.QSA:
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
@@ -473,6 +537,8 @@ class QSAKVCache(MHAKVCache):
             # the K/V is host RAM; VRAM has the staging buffer, one layer's worth
             kv = 2 * math.prod(self._tier_stage.shape[3:]) * self._tier_stage.element_size()
         tokens = int(self._kv_buffer.shape[2]) * int(self._kv_buffer.shape[3])
+        if self._scale_buffer is not None:
+            kv += int(self._scale_buffer.numel() * self._scale_buffer.element_size()) // tokens
         slab = (
             self._num_index_layers
             * self._cmp_scratch_base
@@ -487,7 +553,10 @@ class QSAKVCache(MHAKVCache):
         slab = self._cmp_k_buffer[:, : pages * rows].unflatten(1, (pages, rows)).permute(1, 0, 2, 3)
         if self.tiered:
             return [slab]  # VRAM tiers only; the host pages move in move_host_pages
-        return super().page_views() + [slab]
+        views = super().page_views() + [slab]
+        if self._scale_buffer is not None:
+            views.append(self._scale_buffer)
+        return views
 
     def cmp_k_cache(self, slot: int) -> torch.Tensor:
         """Compressed index keys of one sparse layer: ``[rows, index_head_dim]``."""

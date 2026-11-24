@@ -270,6 +270,7 @@ def create_kvcache_pool(
             ),
             layer_ids=spec.layer_ids,
             kv_tier_cells=kv_tier_cells,
+            kv_format=kv_format,
         )
     if kv_tier_cells:
         raise ValueError("--kv-tier serves QSA (Qwen3.8-Flash-Next) pools only")

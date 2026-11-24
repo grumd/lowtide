@@ -175,6 +175,10 @@ def _validate_kv_format(config, model_config) -> None:
         raise ValueError(
             f"--kv-cache-dtype {kv_format.name} does not support tensor parallelism for {pool_cls.__name__} yet"
         )
+    if getattr(config, "kv_tier", False):
+        raise ValueError(
+            f"--kv-cache-dtype {kv_format.name} cannot be combined with --kv-tier"
+        )
 
 
 def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
