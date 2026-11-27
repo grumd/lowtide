@@ -343,6 +343,9 @@ def parse_args(
             return "gpt_oss"
         if "hy_v4" in marker or "hyv4" in marker:
             return "hy_v4"
+        # Ling-3.2 writes GLM-4.7's arg_key/arg_value calls with newlines between the parts
+        if "bailing" in marker:
+            return "glm47"
         # M3 first: its marker also contains the bare "minimax" substring, but the
         # namespaced tool grammar is a different protocol from M2's.
         if "minimax_m3" in marker or "minimax-m3" in marker or "minimaxm3" in marker:
@@ -400,6 +403,9 @@ def parse_args(
             return "gpt_oss"
         if "hy_v4" in marker or "hyv4" in marker:
             return "hy_v4"
+        # Ling-3.2: the template opens <think> at the generation prompt, tool calls start with <tool_call>
+        if "bailing" in marker:
+            return "qwen3"
         if "deepseek" in marker and any(
             tag in marker for tag in ("v4", "deepseek_v4", "v3.2", "v32")
         ):
