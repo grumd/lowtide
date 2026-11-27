@@ -3,7 +3,8 @@
 
 A verify window is ``n`` requests x ``t`` rows. Every row is a decode query at its own position over its
 request's position-ordered page-table row, with a single decode step's split, so each row reduces in the
-order that step would; the shapes are static, so a captured verify replays it with staged addressing.
+order that step would; the shapes are static, so a captured verify replays it with staged addressing. A
+captured MTP draft step is the same with ``t = 1`` (``engine/draft_graph.py``).
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ class BailingV3AttnBackend(DSAAttnBackend):
     def __init__(self, config: "ModelConfig") -> None:
         super().__init__(config)
         self._graph_verify: dict | None = None
+        self._graph_draft: dict | None = None
 
     def _model_args(self, config: "ModelConfig"):
         args = config.bailing_args
@@ -32,7 +34,8 @@ class BailingV3AttnBackend(DSAAttnBackend):
 
     def mla_forward(self, q_nope, q_pe, c_kv, k_rope, layer_id, batch, indexer_inputs=None) -> torch.Tensor:
         md = batch.attn_metadata
-        if md.is_decode or not getattr(batch, "mtp_verify", False):
+        # a verify window, or a captured draft step (its metadata carries verify_t = 1)
+        if md.is_decode or not (getattr(batch, "mtp_verify", False) or getattr(md, "verify_t", None)):
             return super().mla_forward(q_nope, q_pe, c_kv, k_rope, layer_id, batch, indexer_inputs)
         if md.rows is None:
             self._stage_eager_verify(md, batch)
@@ -69,38 +72,72 @@ class BailingV3AttnBackend(DSAAttnBackend):
         md.kvlen = md.kv_len_cpu.to(self.device, torch.int32)
         md.verify_t = t
 
-    # ----- captured verify (engine/verify_graph.py) ----------------------------------------
-    def init_capture_verify(self, n_max: int, t: int) -> None:
+    # ----- captured verify (engine/verify_graph.py) and draft steps (engine/draft_graph.py) -----------
+    def _init_store(self, n_max: int, t: int) -> dict:
         width = get_global_ctx().page_table.shape[1]
-        self._graph_verify = {
+        return {
             "n": n_max, "t": t,
             "rows": torch.full((n_max, width), -1, dtype=torch.int32, device=self.device),
             "kvlen": torch.full((n_max,), t, dtype=torch.int32, device=self.device),
         }
 
-    def set_verify_n(self, n: int) -> None:
-        self._graph_verify["n"] = n
-
-    def make_verify_metadata(self) -> DSAMetadata:
-        st = self._graph_verify
+    @staticmethod
+    def _metadata(st: dict) -> DSAMetadata:
         n, t = st["n"], st["t"]
         qo = torch.arange(n + 1, dtype=torch.int32) * t
         md = DSAMetadata(
-            is_decode=False, last_indices=(qo[1:] - 1).to(self.device), qo_indptr_cpu=qo,
+            is_decode=False, last_indices=(qo[1:] - 1).to(st["rows"].device), qo_indptr_cpu=qo,
             kv_len_cpu=torch.full((n,), t, dtype=torch.int32), rows=st["rows"][:n], kvlen=st["kvlen"][:n],
         )
         md.verify_t = t
         return md
 
-    def stage_verify_round(self, table_idx, kvlen, pad_table_idx: int) -> None:
-        st = self._graph_verify
+    def _stage_round(self, st: dict, table_idx, kvlen, pad_table_idx: int) -> None:
         n, t = st["n"], st["t"]
         idx = [int(x) for x in table_idx] + [int(pad_table_idx)] * (n - len(table_idx))
         kv = [int(x) for x in kvlen] + [t] * (n - len(table_idx))
         st["rows"][:n].copy_(get_global_ctx().page_table.index_select(0, torch.tensor(idx).to(self.device)))
         st["kvlen"][:n].copy_(torch.tensor(kv, dtype=torch.int32).to(self.device))
 
+    def init_capture_verify(self, n_max: int, t: int) -> None:
+        self._graph_verify = self._init_store(n_max, t)
+
+    def set_verify_n(self, n: int) -> None:
+        self._graph_verify["n"] = n
+
+    def make_verify_metadata(self) -> DSAMetadata:
+        return self._metadata(self._graph_verify)
+
+    def stage_verify_round(self, table_idx, kvlen, pad_table_idx: int) -> None:
+        self._stage_round(self._graph_verify, table_idx, kvlen, pad_table_idx)
+
     def verify_scratch(self):
+        return nullcontext()
+
+    def init_capture_draft(self, n_max: int) -> None:
+        self._graph_draft = self._init_store(n_max, 1)
+
+    def set_draft_n(self, n: int) -> None:
+        self._graph_draft["n"] = n
+
+    def make_draft_metadata(self) -> DSAMetadata:
+        return self._metadata(self._graph_draft)
+
+    def stage_draft_round(self, table_idx, kvlen, pad_table_idx: int) -> None:
+        self._stage_round(self._graph_draft, table_idx, kvlen, pad_table_idx)
+
+    def can_stage_draft_dev(self) -> bool:
+        return True
+
+    def stage_draft_rows_dev(self, table_idx: torch.Tensor) -> None:
+        st = self._graph_draft
+        st["rows"][: st["n"]].copy_(get_global_ctx().page_table.index_select(0, table_idx))
+
+    def stage_draft_kvlen_dev(self, kvlen: torch.Tensor) -> None:
+        st = self._graph_draft
+        st["kvlen"][: st["n"]].copy_(kvlen)
+
+    def draft_scratch(self):
         return nullcontext()
 
 

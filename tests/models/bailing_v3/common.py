@@ -159,7 +159,9 @@ class ModelRig:
         self.pool = linear_pool(config)
         self.ctx = SimpleNamespace(kv_cache=self.kv, page_table=self.page_table, linear_state_pool=self.pool, attn_backend=None, batch=None)
         for mod in ("freetoken.attention.dsa", "freetoken.models.bailing_v3.kda", "freetoken.models.bailing_v3.attention",
-                    "freetoken.models.bailing_v3.model", "freetoken.layers.embedding", "freetoken.layers.moe"):
+                    "freetoken.models.bailing_v3.model", "freetoken.models.bailing_v3.mtp", "freetoken.models.bailing_v3.backend",
+                    "freetoken.layers.embedding",
+                    "freetoken.layers.moe"):
             monkeypatch.setattr(f"{mod}.get_global_ctx", lambda: self.ctx)
         self.ctx.attn_backend = BailingV3AttnBackend(config)
 

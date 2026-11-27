@@ -23,6 +23,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Tuple
 
 import torch
+from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
 from freetoken.layers.moe import MoELayer
 from freetoken.utils import div_even
@@ -35,6 +36,8 @@ if TYPE_CHECKING:
     from freetoken.core import Batch
     from freetoken.models.config import ModelConfig
 
+# rows up to which the head's experts run the decode kernels (a draft step of up to this many requests)
+_DECODE_ROWS = 8
 # per-projection piece roles of an NVFP4 expert (moe/expert_pieces.py): codes, fp8 block scales, dequant global
 PIECE_ROLES = tuple(f"{p}{s}" for p in ("gate", "up", "down") for s in ("", "_scale", "_global"))
 
@@ -67,6 +70,14 @@ class MTPExperts(MoELayer):
             setattr(self, p, torch.empty(e, rows, cols // 2, dtype=torch.uint8))
             setattr(self, f"{p}_scale", torch.empty(e, rows, cols // 16, dtype=torch.float8_e4m3fn))
             setattr(self, f"{p}_global", torch.empty(e, 1, dtype=torch.float32))
+
+    def _resident_gemm(self, hidden_states, topk_weights, topk_ids):
+        # a draft step is a prefill-phase batch of one row per request: the decode kernels serve it (and are
+        # what a captured draft step may contain); a draft prefill over a prompt takes the prefill kernels
+        is_prefill = get_global_ctx().batch.is_prefill and hidden_states.shape[0] > _DECODE_ROWS
+        return self.quant_method.apply(
+            hidden_states, topk_weights, topk_ids, self.quant_method.resident_view(self), layer=self, is_prefill=is_prefill,
+        )
 
     def pack_experts(self) -> None:
         from freetoken.moe.expert_banks import attach_resident_banks, build_expert_banks

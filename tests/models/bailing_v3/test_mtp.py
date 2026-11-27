@@ -104,3 +104,38 @@ def test_head_input_order_matters(rig, monkeypatch):
     got = _mtp_rows(config, model, monkeypatch, s["final64"][:-1], ids[1:])
     assert rel(got, s["mtp64"][:-1]) > 1.0
 
+
+
+def test_draft_step_metadata_matches_the_prefill_rows(rig, monkeypatch):
+    """A draft step as ``engine/draft_graph.py`` stages it (``t = 1`` metadata: a decode query over the request's
+    page-table row; one row, so the experts take the decode kernels) gives the prefill path's row to rounding."""
+    from types import SimpleNamespace
+
+    config, model = rig
+    s = golden(GOLD)["seqs"][316]
+    ids, h = s["ids"][0], s["final64"]
+    n = 40
+    full = _mtp_rows(config, model, monkeypatch, h[:n], ids[1 : n + 1])  # rows 0..n-1, KV of all n written
+    r = ModelRig(config, model, monkeypatch)
+    # the same request's first n-1 rows again (a fresh rig), then row n-1 alone as a captured draft step runs it
+    be = r.ctx.attn_backend
+    req = SimpleNamespace(table_idx=0, device_len=n - 1, extend_len=n - 1, cached_len=0)
+    pre = SimpleNamespace(phase="prefill", is_prefill=True, is_decode=False, size=1, reqs=[req], padded_reqs=[req],
+                          positions=torch.arange(n - 1, device="cuda"), out_loc=r.page_table[0, : n - 1].long(),
+                          features=None, mm_embeds=None)
+    r.ctx.batch = pre
+    be.prepare_metadata(pre)
+    embed = model.model.embed_tokens.forward
+    model.mtp.draft_step(embed, h[: n - 1].to("cuda", torch.bfloat16), ids[1:n].to("cuda"), pre)
+    be.init_capture_draft(1)
+    be.set_draft_n(1)
+    be.stage_draft_round([0], [n], pad_table_idx=0)
+    step = SimpleNamespace(phase="prefill", is_prefill=True, is_decode=False, size=1, reqs=[req], padded_reqs=[req],
+                           positions=torch.tensor([n - 1], device="cuda"), out_loc=r.page_table[0, n - 1 : n].long(),
+                           features=None, mm_embeds=None)
+    step.attn_metadata = be.make_draft_metadata()
+    r.ctx.batch = step
+    out, _ = model.mtp.draft_step(embed, h[n - 1 : n].to("cuda", torch.bfloat16), ids[n : n + 1].to("cuda"), step)
+    assert rel(out.float().cpu(), full[n - 1 :]) < 2e-2, rel(out.float().cpu(), full[n - 1 :])
+    w = model.lm_head.weight.float().cpu()
+    assert (out.float().cpu() @ w.t()).argmax(-1).item() == (full[n - 1 :] @ w.t()).argmax(-1).item()
