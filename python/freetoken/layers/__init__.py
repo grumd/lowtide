@@ -5,6 +5,7 @@ from .activation import (
     gelu_tanh_and_mul,
     silu_and_mul,
     swiglu_clamp_and_mul,
+    swiglustep_and_mul,
     swigluoai_and_mul,
 )
 from .base import BaseOP, OPList, StateLessOP, iter_ops
@@ -34,6 +35,7 @@ __all__ = [
     "gelu_tanh_and_mul",
     "swigluoai_and_mul",
     "swiglu_clamp_and_mul",
+    "swiglustep_and_mul",
     "gated_act_and_mul",
     "GATED_ACTIVATIONS",
     "BaseOP",

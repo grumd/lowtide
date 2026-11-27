@@ -68,7 +68,14 @@ def swiglu_clamp_and_mul(
     return swiglu_clamp_and_mul(x, out=out, alpha=alpha, limit=limit)
 
 
-GATED_ACTIVATIONS = ("silu", "gelu", "gelu_tanh", "swigluoai", "swiglu_clamp")
+def swiglustep_and_mul(x, out=None, *, limit: float = float("inf")):
+    """Ling-3.2 clamped SwiGLU over UNINTERLEAVED halves, the clamp after the silu: ``min(silu(gate), limit) * clamp(up, +-limit)``."""
+    from freetoken.kernel.triton.activation import swiglustep_and_mul
+
+    return swiglustep_and_mul(x, out=out, limit=limit)
+
+
+GATED_ACTIVATIONS = ("silu", "gelu", "gelu_tanh", "swigluoai", "swiglu_clamp", "swiglustep")
 
 
 def gated_act_and_mul(activation: str, x, out, *, alpha: float = 1.0, limit: float = float("inf")):
@@ -83,6 +90,8 @@ def gated_act_and_mul(activation: str, x, out, *, alpha: float = 1.0, limit: flo
         return swigluoai_and_mul(x, out, alpha=alpha, limit=limit)
     if activation == "swiglu_clamp":
         return swiglu_clamp_and_mul(x, out, alpha=alpha, limit=limit)
+    if activation == "swiglustep":
+        return swiglustep_and_mul(x, out, limit=limit)
     raise ValueError(f"no gated activation {activation!r}; known: {GATED_ACTIVATIONS}")
 
 
@@ -92,6 +101,7 @@ __all__ = [
     "gelu_tanh_and_mul",
     "swigluoai_and_mul",
     "swiglu_clamp_and_mul",
+    "swiglustep_and_mul",
     "gated_act_and_mul",
     "GATED_ACTIVATIONS",
 ]

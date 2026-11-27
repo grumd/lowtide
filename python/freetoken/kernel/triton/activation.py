@@ -34,6 +34,8 @@ GELU_TANH = 2
 SWIGLUOAI = 3
 # GLM-5.3 "swiglu_limit": swigluoai's clamped form WITHOUT the (up + 1) bias.
 SWIGLU_CLAMP = 4
+# Ling-3.2 "swiglustep": the clamp comes AFTER the silu, y = min(silu(gate), limit) * clamp(up, +-limit)
+SWIGLUSTEP = 5
 
 _SQRT_2_OVER_PI = 0.7978845608028654  # sqrt(2/pi)
 _GELU_C = 0.044715
@@ -117,6 +119,10 @@ def _act_and_mul_kernel(
         up = tl.minimum(tl.maximum(up, -limit), limit)
         act = gate / (1.0 + _fast_ex2(-gate * alpha * _LOG2E))
         y = act * up
+    elif ACT == 5:  # SWIGLUSTEP (Ling-3.2): silu first, then gate <= limit and |up| <= limit
+        act = tl.minimum(gate / (1.0 + _fast_ex2(-gate * _LOG2E)), limit)
+        up = tl.minimum(tl.maximum(up, -limit), limit)
+        y = act * up
     else:  # GELU (erf)
         act = 0.5 * gate * (1.0 + libdevice.erf(gate * 0.7071067811865476))
         y = act * up
@@ -190,7 +196,14 @@ def swiglu_clamp_and_mul(
     return _act_and_mul(SWIGLU_CLAMP, x, out, alpha=alpha, limit=limit)
 
 
+def swiglustep_and_mul(x: torch.Tensor, out: torch.Tensor | None = None, *, limit: float = float("inf")) -> torch.Tensor:
+    """Ling-3.2 clamped SwiGLU over UNINTERLEAVED halves, clamping after the silu:
+    ``min(silu(gate), limit) * clamp(up, +-limit)``. At ``limit=inf`` it is ``silu_and_mul`` bit for bit."""
+    return _act_and_mul(SWIGLUSTEP, x, out, limit=limit)
+
+
 __all__ = [
+    "swiglustep_and_mul",
     "silu_and_mul",
     "gelu_and_mul",
     "gelu_tanh_and_mul",

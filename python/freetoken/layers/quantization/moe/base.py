@@ -127,6 +127,8 @@ def gated_epilogue_reason(cfg: "MoEConfig") -> str | None:
         return f"the epilogue has no beta (got {cfg.beta})"
     if cfg.activation in ("silu", "gelu", "gelu_tanh") and (cfg.alpha != 1.0 or cfg.limit is not None):
         return f"{cfg.activation} takes no alpha / limit (got alpha={cfg.alpha}, limit={cfg.limit})"
+    if cfg.activation == "swiglustep" and cfg.alpha != 1.0:
+        return f"swiglustep takes no alpha (got {cfg.alpha})"
     return None
 
 
