@@ -17,7 +17,7 @@ FEATS = [65536, 512, 256, 32768, 512, 256]
 PF_MIN, PF_MAX, PF_BPT = 64, 4096, 4096
 
 
-def _build(cap_pages=1024, spare_mib=16, tp_group=None, kv_tier_cells=0):
+def _build(cap_pages=1024, spare_mib=16, tp_group=None, kv_tier_cells=0, kv_factory=None):
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.engine.elastic import ElasticVram
     from freetoken.kvcache.mha_pool import elastic_tier_allocator
@@ -40,11 +40,14 @@ def _build(cap_pages=1024, spare_mib=16, tp_group=None, kv_tier_cells=0):
         for name, f in zip(_BANK_SCHEMAS["mxfp4_triton"], FEATS)
     })
     with elastic_tier_allocator(el.kv_tier):
-        kv = QSAKVCache(
-            num_kv_heads=1, num_layers=8, head_dim=256, num_pages=cap_pages + 1, page_size=64,
-            dtype=torch.bfloat16, device=dev, index_head_dim=128, num_index_layers=2,
-            index_ratio=4, num_req_slots=2, layer_ids=[1, 3, 5, 7], kv_tier_cells=kv_tier_cells,
-        )
+        if kv_factory is not None:
+            kv = kv_factory(cap_pages + 1, dev)
+        else:
+            kv = QSAKVCache(
+                num_kv_heads=1, num_layers=8, head_dim=256, num_pages=cap_pages + 1, page_size=64,
+                dtype=torch.bfloat16, device=dev, index_head_dim=128, num_index_layers=2,
+                index_ratio=4, num_req_slots=2, layer_ids=[1, 3, 5, 7], kv_tier_cells=kv_tier_cells,
+            )
     assert kv.elastic
     el.finalize(spare_mib << 20, 0, 0, tp_group)
     return el, cache, kv
@@ -404,6 +407,48 @@ def test_warming_the_ensure_kernel_leaves_the_cache_as_it_was():
     _coherent(cache)
 
 
+@CUDA
+@pytest.mark.parametrize("fmt", ["none", "fp8_mla"])
+def test_mla_latent_pages_survive_growth_shrink_and_moves(fmt):
+    """The MLA latent pool (Ling-3.2's 7 of 42 layers) under elastic VRAM: live latent rows and their
+    scales stay put while KV grows into expert slots and back, and a page move carries both tiers."""
+    from freetoken.kvcache.dsa_pool import MLAKVCache
+    from freetoken.kvcache.format import resolve_kv_format
+
+    layers = (2, 5, 8)
+    fmt = resolve_kv_format(fmt)
+
+    def mla(num_pages, dev):
+        return MLAKVCache(576, 9, num_pages, 64, torch.bfloat16, dev, layer_ids=layers, kv_format=fmt, rope_dim=64)
+
+    el, cache, kv = _build(kv_factory=mla)
+    assert kv.elastic and len(kv.page_views()) == (2 if fmt.quantized else 1)
+    with pytest.raises(RuntimeError, match="remapping pages"):
+        kv.rebuild(8)
+    el.kv_pool = kv
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    rows = 64 * 64
+    loc = torch.arange(rows, device="cuda")
+    for layer in layers:
+        kv.store_kv(torch.randn(rows, 512, device="cuda", generator=gen).bfloat16(),
+                    torch.randn(rows, 64, device="cuda", generator=gen).bfloat16(), loc, layer)
+    torch.cuda.synchronize()
+    snap = [v[:64].clone() for v in kv.page_views()]
+    _decode(cache, 3, seed=0)
+    old, new = el.grow(200)
+    assert new > old
+    _decode(cache, 2, seed=1)
+    el.shrink(64)
+    _coherent(cache)
+    for v, want in zip(kv.page_views(), snap):
+        assert torch.equal(v[:64], want)
+    el.move_pages(torch.tensor([60, 61, 63]), torch.tensor([3, 5, 7]))
+    for v, want in zip(kv.page_views(), snap):
+        assert torch.equal(v[[3, 5, 7]], want[[60, 61, 63]])
+        assert torch.equal(v[[60, 4, 6]], want[[60, 4, 6]])
+    _no_leak(el)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_compact_small_weights_releases_interleaved_holes():
     """--dense-mxfp8-groups frees bf16 weights that sit between per-layer tensors that stay; the
@@ -465,14 +510,16 @@ def _pool_from_config(monkeypatch):
 def test_elastic_vram_is_on_exactly_where_it_is_supported(_pool_from_config):
     from freetoken.engine.engine import _elastic_vram
     from freetoken.kvcache.bsa_pool import BSAKVCache
+    from freetoken.kvcache.dsa_pool import DSAKVCache, KpoolDSAKVCache, MLAKVCache
     from freetoken.kvcache.dsv4.v4_pool import DSV4PagedKVCache
+    from freetoken.kvcache.hy4_pool import Hy4KVCache, Hy4WindowKVCache
     from freetoken.kvcache.hybrid_swa_pool import HybridSWAKVCache
     from freetoken.kvcache.mha_pool import MHAKVCache
     from freetoken.kvcache.qsa_pool import QSAKVCache
 
-    assert _elastic_vram(_vram_config(QSAKVCache))
-    assert _elastic_vram(_vram_config(MHAKVCache))
-    for pool in (BSAKVCache, HybridSWAKVCache, DSV4PagedKVCache):
+    for pool in (QSAKVCache, MHAKVCache, MLAKVCache, Hy4KVCache, Hy4WindowKVCache):
+        assert _elastic_vram(_vram_config(pool))
+    for pool in (BSAKVCache, HybridSWAKVCache, DSV4PagedKVCache, DSAKVCache, KpoolDSAKVCache):
         assert not _elastic_vram(_vram_config(pool))
     assert not _elastic_vram(_vram_config(QSAKVCache, strategy="hybrid", decode_target="hybrid"))
     assert not _elastic_vram(_vram_config(QSAKVCache, strategy="cpu", decode_target="cpu"))

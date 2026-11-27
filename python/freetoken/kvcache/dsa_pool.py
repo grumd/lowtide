@@ -37,10 +37,13 @@ class MLAKVCache(BaseKVCachePool):
     contract as MHAKVCache; None keeps the identity mapping.
 
     A quantized row keeps two scales: ckv and kpe have their own ranges.
+
+    Every page-scaled tier goes through ``alloc_tier``, so elastic VRAM may back its pages on demand.
     """
 
     kv_formats: ClassVar[frozenset[str]] = MLA_KV_FORMATS
     kv_formats_tp: ClassVar[bool] = True
+    ELASTIC_VRAM = True
 
     def __init__(
         self,
@@ -54,6 +57,9 @@ class MLAKVCache(BaseKVCachePool):
         kv_format: KVFormat = NONE,
         rope_dim: int | None = None,
     ) -> None:
+        from .mha_pool import _TIER_ALLOC
+
+        self.elastic = _TIER_ALLOC is not None
         self.kv_format = kv_format
         self._latent_dim = latent_dim
         self._rope_dim = latent_dim % 128 if rope_dim is None else int(rope_dim)
@@ -154,6 +160,8 @@ class MLAKVCache(BaseKVCachePool):
     def rebuild(self, num_pages: int) -> None:
         """In-place resize (frees the old slab first; object identity preserved --
         callers re-derive views per forward, same contract as MHAKVCache.rebuild)."""
+        if self.elastic:
+            raise RuntimeError("an elastic KV pool resizes by remapping pages, not rebuild")
         self._kv_buffer = None
         self._scale_buffer = None
         if self._device.type == "cuda":
@@ -183,6 +191,13 @@ class MLAKVCache(BaseKVCachePool):
             total += int(self._scale_buffer.numel() * self._scale_buffer.element_size())
         return total // (self._num_pages * self._page_size), 0
 
+    def page_views(self) -> list[torch.Tensor]:
+        """Every page-scaled tier viewed with the page on dim 0 (elastic compaction, the prefix RAM tier)."""
+        views = [self._kv_buffer.permute(2, 0, 1, 3, 4, 5)]
+        if self._scale_buffer is not None:
+            views.append(self._scale_buffer)
+        return views
+
     # -- pool properties ----------------------------------------------------------
     @property
     def device(self) -> torch.device:
@@ -200,6 +215,11 @@ class MLAKVCache(BaseKVCachePool):
 class DSAKVCache(MLAKVCache):
     """MLA latent pool + the DSA index-key slab (one row per token per full-indexer
     layer, bf16, slot order = the backend's full-layer order)."""
+
+    # the index slab (and the kpool shadow rows) are not page-major, so no page moves; elastic VRAM is
+    # verified only on Hy4's pool, which opts back in
+    ELASTIC_VRAM = False
+    page_views = None
 
     def __init__(
         self,

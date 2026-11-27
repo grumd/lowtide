@@ -122,17 +122,6 @@ class Hy4KVCache(KpoolDSAKVCache):
 
     ELASTIC_VRAM = True
 
-    def __init__(self, *args, **kwargs) -> None:
-        from .mha_pool import _TIER_ALLOC
-
-        self.elastic = _TIER_ALLOC is not None
-        super().__init__(*args, **kwargs)
-
-    def rebuild(self, num_pages: int) -> None:
-        if self.elastic:
-            raise RuntimeError("an elastic KV pool resizes by remapping pages, not rebuild")
-        super().rebuild(num_pages)
-
 
 class Hy4WindowKVCache(Hy4KVCache):
     """Indexed layers on the full tier, sliding layers on the page-bound window tier (module

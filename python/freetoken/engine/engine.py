@@ -1254,7 +1254,7 @@ class Engine:
         from freetoken.kvcache.host_prefix_pool import HostPrefixPool
 
         lsp = self.linear_state_pool
-        if config.cache_type != "hybrid_radix" or lsp is None or not hasattr(self.kv_cache, "page_views"):
+        if config.cache_type != "hybrid_radix" or lsp is None or getattr(self.kv_cache, "page_views", None) is None:
             raise ValueError("--cache-ram-gb needs a hybrid GDN model on the hybrid radix cache")
         self.host_prefix_pool = HostPrefixPool(
             self.kv_cache.page_views(),
@@ -2771,7 +2771,7 @@ def _check_vram_flags(config: EngineConfig) -> None:
     if getattr(config, "elastic_kv", None) and not _elastic_vram_supported(config):
         raise ValueError(
             "--elastic-kv: elastic VRAM needs a MoE model on --moe-strategy offload with GPU decode "
-            "(no --moe-cpu-layers) and an MHA/QSA KV pool; drop the flag for this setup"
+            "(no --moe-cpu-layers) and an MHA/QSA/MLA KV pool; drop the flag for this setup"
         )
     flags = getattr(config, "static_vram_flags", ())
     if flags and _elastic_vram(config):

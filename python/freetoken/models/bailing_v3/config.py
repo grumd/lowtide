@@ -28,6 +28,12 @@ from .args import load_args
 MAX_LAYERS_ENV = "FREETOKEN_BAILING_MAX_LAYERS"
 EXPERT_ACTIVATION = "swiglustep"
 
+# Prefill activations over the idle footprint per rank (torch peak reserved over idle allocated, NVFP4A16
+# FTW on RTX 3080s; flat with depth up to 49k): TP=1 685 / 1045 / 1766 / 3224 MiB at 2048 / 4096 / 8192 /
+# 16384-token chunks, TP=2 506 / 1586 MiB at 2328 / 16384. (base, per token, per token split across TP
+# ranks): ~330 MiB + 182 KiB/token at TP=1, the split term covers TP=2 with room.
+PREFILL_WORKSPACE = (352 << 20, 0, 184 << 10)
+
 
 def max_layers(num_layers: int) -> int:
     cap = os.environ.get(MAX_LAYERS_ENV)
@@ -101,6 +107,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         n_group=int(getattr(text, "n_group", 1) or 1),
         topk_group=int(getattr(text, "topk_group", 1) or 1),
         attn_sm_scale=args.qk_head_dim**-0.5,
+        prefill_workspace=PREFILL_WORKSPACE,
         bailing_args=args,
     )
 
