@@ -16,6 +16,7 @@ VRAM is usually the bottleneck for large MoE models, so Lowtide spends as much o
 |---|---|---|
 | **Qwen3.8-Flash-Next** | [grumd0/Qwen3.8-Flash-Next-FP4-Local-Lowtide](https://huggingface.co/grumd0/Qwen3.8-Flash-Next-FP4-Local-Lowtide) | NVIDIA FP4-Local QAD + BF16 PLE; 1–2 GPUs |
 | **Hy4-flash** | [grumd0/Hy4-flash-NVFP4-Lowtide](https://huggingface.co/grumd0/Hy4-flash-NVFP4-Lowtide) | NVFP4 from official FP8; 2 GPUs, text only, fast NVMe |
+| **Ling-3.2 air** | convert [primitive-ai/Ling-3.2-air-NVFP4A16](https://huggingface.co/primitive-ai/Ling-3.2-air-NVFP4A16) with `ft checkpoint` | NVFP4 experts; 1–2 GPUs, text only |
 
 ## Quick start
 
@@ -97,6 +98,19 @@ Quality (KLD vs BF16, [dataset](https://huggingface.co/datasets/jyohukuchan/qwen
 
 - **`--mtp on`** enables the DFly2 drafter (lossless).
 - **`--kv-cache-dtype int8_mla`** (or `fp8_mla`, opt-in, off by default) cuts KV VRAM by 43% for extra expert cache slots at longer contexts. Use these MLA formats with Hy4-flash for best KLD.
+
+## Ling-3.2 air
+
+[inclusionAI Ling-3.2 air](https://huggingface.co/inclusionAI/Ling-3.2-air), served from primitive-ai's NVFP4A16 export (text only for now). Its MLA layers keep only 8 KiB of KV per token, so the full 262k context costs 2 GiB and the rest of VRAM goes to experts. Download it with `hf download primitive-ai/Ling-3.2-air-NVFP4A16`, convert it once with `ft checkpoint --model <download dir> --out <ftw dir>` (73 GiB), then serve the FTW with `scripts/serve.sh`.
+
+Measured on the same box as above. The flags column adds `--moe-decode-fetch 0.1 --moe-routed-prefill-tokens 4096` on one GPU and `--moe-routed-prefill-tokens 3072` on two (CPU-assisted decode costs 12% on two GPUs, so leave it off there).
+
+| Setup | Decode | Decode, flags | 16k prefill | 16k prefill, flags | Max context |
+|---|---|---|---|---|---|
+| 1x RTX 3080 20 GB | 41 tok/s | 65 tok/s | 1,260 tok/s | 1,990 tok/s | 262k |
+| 2x RTX 3080 20 GB | 118 tok/s | 118 tok/s | 2,700 tok/s | 3,510 tok/s | 262k |
+
+`--ngram-spec` (on in `serve.sh`) pays off on code edits that copy text back: 196 tok/s on two GPUs, and 110 tok/s on one with the CPU flags. `--mtp on` builds the checkpoint's own MTP head. Its first draft is accepted about 70% of the time, but each verify pass pulls in more experts than a plain step, so with the default 3 drafts it is a loss on one GPU and about even on two. On two GPUs `--mtp on --mtp-draft-tokens 1` came out about 8% ahead in one run. The KV formats (`--kv-cache-dtype fp8_mla` and friends) cut the KV by 43–49% for a KLD of 0.006–0.010 against bf16 KV; at 2 GiB for 262k tokens that is rarely worth it.
 
 ## Citation & Acknowledgments
 

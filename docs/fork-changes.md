@@ -50,6 +50,9 @@ Every change against [anon761/freetoken](https://github.com/anon761/freetoken), 
 - **NVFP4 expert globals in fp32:** FP4-Local's globals underflow fp16 (`81b7b8f`).
 - **FTW PLE handling:** an NVFP4 PLE table is repacked into one-read rows (`9b2a293`). `--ple none` keeps the table in the source checkpoint (`3d9bc64`).
 
+**Models**
+- **Ling-3.2 air** (`bailing_v3`, branch `ling32`): KDA + gated MLA + 512-expert NVFP4 MoE from primitive-ai's NVFP4A16 export, on the same paths as Qwen3.8-Flash-Next: elastic VRAM for the MLA latent pool (262k context by default on one or two 20 GB GPUs), the prefix RAM tier, the KV formats, CPU-assisted decode and hybrid CPU prefill, n-gram verify windows (KDA verify bitwise equal to step-by-step decode), the MTP head from the checkpoint's own MTP layer, and the glm47 / qwen3 parsers. The shared expert runs while the routed experts' copy is in flight, with one all-reduce per MoE layer. Not served yet: images, `--kv-tier` (dense MLA).
+
 **Server and tooling**
 - Single-file chat page at `/` (`3663bdf`).
 - Decode profiler, routing log, decode and prefill logit dumps (`4ad6fca`).

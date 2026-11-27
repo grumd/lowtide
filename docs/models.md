@@ -14,6 +14,7 @@ for them; other checkpoints of the same architectures work too.
 | Qwen3.6 / Qwen3.5 MoE | [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) ([-FP8](https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8)), [nvidia/Qwen3.6-35B-A3B-NVFP4](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4), [Qwen/Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) ([-FP8](https://huggingface.co/Qwen/Qwen3.5-35B-A3B-FP8)) |
 | Qwen3.8 / Qwen3.6 dense | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) ([-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8)), [RadixArk/Qwen3.8-27B-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4), [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B) ([-FP8](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)), [nvidia/Qwen3.6-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.6-27B-NVFP4) |
 | Qwen3-MoE | [Qwen/Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B) |
+| Ling-3.2 air | [primitive-ai/Ling-3.2-air-NVFP4A16](https://huggingface.co/primitive-ai/Ling-3.2-air-NVFP4A16) (text only) |
 | Qwen3-VL | [Qwen/Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct), [Qwen/Qwen3-VL-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct) |
 | gpt-oss | [openai/gpt-oss-120b](https://huggingface.co/openai/gpt-oss-120b), [openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b) |
 | Gemma-4 | [google/gemma-4-E2B-it](https://huggingface.co/google/gemma-4-E2B-it), [google/gemma-4-E4B-it](https://huggingface.co/google/gemma-4-E4B-it), [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it), [nvidia/Gemma-4-26B-A4B-NVFP4](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4), [google/gemma-4-12B-it](https://huggingface.co/google/gemma-4-12B-it), [nvidia/Gemma-4-31B-IT-NVFP4](https://huggingface.co/nvidia/Gemma-4-31B-IT-NVFP4) .. |
@@ -196,6 +197,13 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   template kwargs with thinking on, `"chat_template_kwargs": {"enable_thinking": true,
   "reasoning_effort": 37}`, and the checkpoint's encoder validates it. Runtime window-cache
   controls use 128-token pages.
+- Ling-3.2 air (`bailing_moe_v3_vl`) serves text from the NVFP4A16 export: KDA linear attention, gated MLA
+  (7 of 42 layers, 8 KiB of KV per token, so 262k tokens take 2 GiB), 512 NVFP4 experts per layer on the offload
+  cache. inclusionAI's FP8 release is refused: its experts as bf16 would need about 225 GiB of host RAM. `ft
+  checkpoint` keeps the vision tower and the MTP layer as raw bytes in the FTW; `--mtp on` builds the MTP head
+  from them (its 512 experts stay resident, 1.7 GiB on one GPU, 0.85 GiB per GPU on two). Images are not served
+  yet. `auto` picks the `glm47` tool parser and the `qwen3` reasoning parser. `--kv-tier` does not apply (dense
+  MLA, nothing to move); the other KV formats and `--cache-ram-gb` work.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
 - The Qwen3.8-Flash-Next NVFP4 exports differ in the draft-head (MTP) packaging:
   RadixArk stacks the experts (bf16 `experts.gate_up_proj`), NVIDIA ships them
