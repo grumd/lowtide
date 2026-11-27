@@ -34,7 +34,7 @@ from __future__ import annotations
 import functools
 import math
 import operator
-from typing import Sequence
+from typing import ClassVar, Sequence
 
 import torch
 
@@ -59,6 +59,9 @@ class QSAKVCache(MHAKVCache):
     ``cmp_scratch_base`` on are the per-request-slot scratch sinks. ``slot`` is the sparse
     layer's order in the attention backend, same convention as BSAKVCache/DSAKVCache.
     """
+
+    # quantized K/V (one scale per token and kv head) shards with the kv heads under TP
+    kv_formats_tp: ClassVar[bool] = True
 
     # Tiered elastic pool: the host K/V mapping, backed with RAM as pages come into use (else None).
     _host_bank = None
@@ -99,6 +102,8 @@ class QSAKVCache(MHAKVCache):
         mrope: bool = False,
         kv_format: KVFormat = NONE,
     ) -> None:
+        if kv_format.quantized and kv_tier_cells > 0:
+            raise ValueError("--kv-cache-dtype cannot be combined with --kv-tier")
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
             raise ValueError(

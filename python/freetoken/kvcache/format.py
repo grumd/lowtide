@@ -17,6 +17,7 @@ class KVFormat:
     scale_dtype: torch.dtype | None = None  # logical scale type; None means no scale tensor
     scale_store_dtype: torch.dtype | None = None  # dtype of the scale tensor
     scale_group: int = ROW  # channels per scale
+    rope_unquantized: bool = False  # MLA: keep trailing k_rope in compute dtype (bf16)
 
     def __post_init__(self) -> None:
         if (self.elem_dtype is None) != (self.elem_store_dtype is None):
@@ -59,8 +60,58 @@ class KVFormat:
             return elem_bytes
         return elem_bytes + segments * self.scale_dim(head_dim) * self.scale_store_dtype.itemsize
 
+    # -- MLA latent row helpers (ckv [d_v] + k_rope [d_r]) ----------------------------------
+    def mla_row_elems(self, d_v: int, d_r: int, compute_dtype: torch.dtype = torch.bfloat16) -> int:
+        """Elements of the row buffer per token: for ``rope_unquantized`` formats, ``ckv`` is stored
+        in ``elem_store_dtype`` (1 B/elem) and ``k_rope`` stays raw ``compute_dtype`` (2 B/elem)."""
+        if not self.quantized:
+            return d_v + d_r
+        ckv_bytes = d_v * self.elem_dtype.itemsize
+        rope_bytes = d_r * (compute_dtype.itemsize if self.rope_unquantized else self.elem_dtype.itemsize)
+        total_bytes = ckv_bytes + rope_bytes
+        if total_bytes % self.elem_store_dtype.itemsize:
+            raise ValueError(f"{self.name} cannot store MLA row ({d_v}+{d_r})")
+        return total_bytes // self.elem_store_dtype.itemsize
+
+    def mla_scale_dim(self, d_v: int, d_r: int = 0) -> int:
+        """Number of fp32 scales per MLA latent row."""
+        if self.scale_dtype is None:
+            return 0
+        n_ckv = self.scale_dim(d_v)
+        if self.rope_unquantized or d_r == 0:
+            return n_ckv
+        return n_ckv + (1 if self.scale_group == ROW else self.scale_dim(d_r))
+
+    def mla_row_bytes(self, d_v: int, d_r: int, compute_dtype: torch.dtype) -> int:
+        """Total bytes per MLA latent row (data + scales)."""
+        if not self.quantized:
+            return (d_v + d_r) * compute_dtype.itemsize
+        data_bytes = self.mla_row_elems(d_v, d_r, compute_dtype) * self.elem_store_dtype.itemsize
+        scale_bytes = self.mla_scale_dim(d_v, d_r) * self.scale_store_dtype.itemsize
+        return data_bytes + scale_bytes
+
+
 
 NONE = KVFormat("none", elem_dtype=None, elem_store_dtype=None)
+# Hy4-flash MLA: c_kv quantized in 128-element groups, k_rope kept in the compute dtype
+FP8_MLA = KVFormat(
+    "fp8_mla",
+    elem_dtype=torch.float8_e4m3fn,
+    elem_store_dtype=torch.uint8,
+    scale_dtype=torch.float32,
+    scale_store_dtype=torch.float32,
+    scale_group=128,
+    rope_unquantized=True,
+)
+INT8_MLA = KVFormat(
+    "int8_mla",
+    elem_dtype=torch.int8,
+    elem_store_dtype=torch.int8,
+    scale_dtype=torch.float32,
+    scale_store_dtype=torch.float32,
+    scale_group=128,
+    rope_unquantized=True,
+)
 FP8_PER_TOKEN_HEAD = KVFormat(
     "fp8_per_token_head",
     elem_dtype=torch.float8_e4m3fn,
@@ -81,10 +132,12 @@ FP8_DS_MLA = KVFormat("fp8_ds_mla", elem_dtype=None, elem_store_dtype=None)
 NVFP4_DS_MLA = KVFormat("nvfp4_ds_mla", elem_dtype=None, elem_store_dtype=None)
 
 KV_FORMATS: dict[str, KVFormat] = {
-    fmt.name: fmt for fmt in (NONE, FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD, FP8_DS_MLA, NVFP4_DS_MLA)
+    fmt.name: fmt for fmt in (NONE, FP8_PER_TOKEN_HEAD, INT8_PER_TOKEN_HEAD, FP8_MLA, INT8_MLA, FP8_DS_MLA, NVFP4_DS_MLA)
 }
 # what a pool with per-row scale tensors and a reader built on kv_rows.py can declare
 ROW_SCALE_FORMATS = frozenset({NONE.name, FP8_PER_TOKEN_HEAD.name, INT8_PER_TOKEN_HEAD.name})
+# what an MLA latent pool (DSA backend) can declare: the row-scale formats plus the group-128 c_kv ones
+MLA_KV_FORMATS = ROW_SCALE_FORMATS | frozenset({FP8_MLA.name, INT8_MLA.name})
 
 
 def resolve_kv_format(kv_cache_dtype: str) -> KVFormat:

@@ -202,3 +202,46 @@ def test_dfly_drafter_tensors_fill_the_drafter(monkeypatch, tp):
     assert {k for k in sd if k.startswith("dfly.")} == set(drafter)
     monkeypatch.delenv("FREETOKEN_ENABLE_MTP")
     assert not parsed_config().hy4_args.dfly_enabled
+
+
+def _ftw_with_engram_dir(root, files: dict[str, dict[str, torch.Tensor]]):
+    import json
+
+    from safetensors.torch import save_file
+
+    ftw = root / "ftw"
+    (ftw / "engram").mkdir(parents=True)
+    (ftw / "freetoken_weight.json").write_text(
+        json.dumps({"format": "freetoken_weight", "source_model_path": None, "tensors": [], "shards": []})
+    )
+    for name, tensors in files.items():
+        save_file(tensors, str(ftw / "engram" / name))
+    return ftw
+
+
+def test_engram_dir_tables_are_found_by_header_without_an_index(tmp_path):
+    from freetoken.models.hy4.weight import CheckpointSource, source_checkpoint
+
+    a, b = "model.layers.1.x.weight", "model.layers.11.x.weight"
+    ftw = _ftw_with_engram_dir(tmp_path, {
+        "model-00001-of-00148.safetensors": {a: torch.zeros(4, 2, dtype=torch.bfloat16)},
+        "model-00002-of-00148.safetensors": {b: torch.ones(3, 2, dtype=torch.bfloat16)},
+    })
+    folder = source_checkpoint(str(ftw))
+    assert folder == str(ftw / "engram")
+    src = CheckpointSource(folder)
+    assert sorted(src.keys()) == [a, b]
+    path, _off, nbytes = src.location(b)
+    assert path.endswith("model-00002-of-00148.safetensors") and nbytes == 3 * 2 * 2
+
+
+def test_engram_dir_rejects_a_table_in_two_files(tmp_path):
+    from freetoken.models.hy4.weight import CheckpointSource
+
+    key = "model.layers.1.x.weight"
+    ftw = _ftw_with_engram_dir(tmp_path, {
+        "old.safetensors": {key: torch.zeros(2, 2, dtype=torch.bfloat16)},
+        "new.safetensors": {key: torch.ones(2, 2, dtype=torch.bfloat16)},
+    })
+    with pytest.raises(ValueError, match="remove one of them"):
+        CheckpointSource(str(ftw / "engram"))

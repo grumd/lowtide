@@ -700,8 +700,7 @@ def test_converted_ftw_reads_tables_from_its_own_dir(tmp_path, monkeypatch, incl
             engram_table_sources(str(out))
         return
     # the tiny tables share model.safetensors with every other tensor: each gets its own file
-    assert index["engram_files"] == ["engram/engram-layer-001.safetensors", "engram/engram-layer-004.safetensors",
-                                     "engram/model.safetensors.index.json"]
+    assert index["engram_files"] == ["engram/engram-layer-001.safetensors", "engram/engram-layer-004.safetensors"]
     shutil.rmtree(src)
     got = engram_table_sources(str(out))
     assert _fields(got) == _fields(want)
@@ -748,7 +747,7 @@ def test_table_only_shard_is_linked_else_copied(tmp_path, monkeypatch, link):
     want = w.engram_table_sources(str(src))
     out = tmp_path / "ftw"
     files = w.ftw_engram_files(str(src), str(out))
-    assert files == ["engram/model-tables.safetensors", "engram/model.safetensors.index.json"]
+    assert files == ["engram/model-tables.safetensors"]
     same = os.stat(out / files[0]).st_ino == os.stat(src / "model-tables.safetensors").st_ino
     assert same == (link == "hardlink")
     got = w.engram_sources(w.CheckpointSource(str(out / "engram")), golden_config(golden_dir() / "tiny_ckpt"))
@@ -765,6 +764,6 @@ def test_realdims_table_extracts_bitwise(tmp_path):
     ckpt = golden_dir() / "realdims" / "ckpt"
     want = w.engram_table_sources(str(ckpt))
     files = w.ftw_engram_files(str(ckpt), str(tmp_path))
-    assert files == ["engram/engram-layer-001.safetensors", "engram/model.safetensors.index.json"]
+    assert files == ["engram/engram-layer-001.safetensors"]
     got = w.engram_sources(w.CheckpointSource(str(tmp_path / "engram")), golden_config(ckpt))
     assert _fields(got) == _fields(want) and _table_bytes(got) == _table_bytes(want)

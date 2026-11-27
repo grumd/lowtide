@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol
 
-from freetoken.kvcache.format import FP8_DS_MLA, NVFP4_DS_MLA, ROW_SCALE_FORMATS
+from freetoken.kvcache.format import FP8_DS_MLA, MLA_KV_FORMATS, NVFP4_DS_MLA, ROW_SCALE_FORMATS
 from freetoken.utils import Registry, init_logger
 
 from .base import AttentionSpec, AttnType, BaseAttnBackend, BaseAttnMetadata, HybridBackend
@@ -123,7 +123,7 @@ def create_dsv41_sparse_backend(config: ModelConfig):
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
     "dsa",
-    BackendInfo(supported_types=frozenset({AttnType.MLA, AttnType.DSA}), kv_formats=ROW_SCALE_FORMATS),
+    BackendInfo(supported_types=frozenset({AttnType.MLA, AttnType.DSA}), kv_formats=MLA_KV_FORMATS),
 )
 def create_dsa_backend(config: ModelConfig):
     # Hy4 also groups its index (ratio 4), so it must branch before the kpool check.

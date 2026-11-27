@@ -206,11 +206,14 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         ``q_cat`` keeps its strides (a transposed bmm output needs no copy) and
         ``out`` receives the result in place."""
         from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
+        from freetoken.kvcache.format import NONE
 
+        kv_format = getattr(self.kvcache, "kv_format", NONE)
+        scale = self.kvcache.latent_scale(layer_id) if kv_format.quantized else None
         return glm_dsa_sparse_attn(
             q_cat, self.kvcache.latent_rows(layer_id), sel, self.sm_scale,
             counts=cnt, d_v=self.kv_lora_rank, out=out,
-            kv_format=self.kvcache.kv_format, scale=self.kvcache.latent_scale(layer_id),
+            kv_format=kv_format, scale=scale,
         )
 
     def mla_forward(

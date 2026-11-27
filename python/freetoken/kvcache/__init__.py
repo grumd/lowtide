@@ -136,6 +136,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             device=device,
             dtype=dtype,
             num_req_slots=config.max_running_req + 1,
+            kv_format=getattr(config, "kv_format", NONE),
         )
         pool.configure_checkpoints(config)
         return pool
@@ -197,6 +198,7 @@ def create_kvcache_pool(
             num_window_tokens=num_swa_tokens,
             num_req_slots=num_req_slots,
             index_ratio=hy4.index_ratio,
+            kv_format=kv_format,
         )
     if kv_tier_cells and model_config.has_swa_attention:
         raise ValueError("--kv-tier serves QSA (Qwen3.8-Flash-Next) pools only")

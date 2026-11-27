@@ -95,7 +95,7 @@ ft serve --model ... --tp-size 2 --gpu 0,1 --gpu-memory-ratio '0,0.8;1,0.9'
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
 | `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
-| `--kv-cache-dtype` | auto | How K and V are stored. `auto` keeps the compute dtype. `fp8_per_token_head` (e4m3) and `int8_per_token_head` store 8 bits per element plus one fp32 scale per token and head (two per MLA latent row, for ckv and kpe), about half the KV memory. The `triton`, `qsa_sparse`, `m3_sparse` and `dsa` backends read them; `auto` picks one of these. They need `--dtype bfloat16` and no tensor parallelism. An `mtp` draft stores its KV in the same format. DeepSeek-V4 stores only `fp8_ds_mla` (window and compressed KV as e4m3 with one ue8m0 scale per 64 channels and bf16 rope, 584 B per row; indexer keys as MXFP4, 68 B) and DeepSeek-V4.1 only `nvfp4_ds_mla` (window KV as MXFP8, compressed KV as NVFP4, indexer keys as MXFP4); the names follow vLLM, and `auto` picks them on those models |
+| `--kv-cache-dtype` | auto | How K and V are stored. `auto` keeps the compute dtype (lossless default); the other formats are lossy and need `--dtype bfloat16`. `fp8_per_token_head` (e4m3) and `int8_per_token_head` store 8 bits per element plus one fp32 scale per token and head (two per MLA latent row, for ckv and kpe), about half the KV memory. The `triton`, `qsa_sparse`, `m3_sparse` and `dsa` backends read them; `auto` picks one of these. They need no tensor parallelism, except on `qsa_sparse` and `dsa`. An `mtp` draft stores its KV in the same format. On Qwen3.8-Flash-Next (`qsa_sparse`, 1 or 2 GPUs) the per-token-head formats take 262k KV from 6.70 to 3.50 GiB on 1 GPU (resident 262k expert slots 1,210 -> 2,446) and from 3.45 to 1.85 GiB/GPU on 2 GPUs; KLD vs bf16 KV (7,705 rows across 3k prose, 2.4k code, 71.6k doc): `int8_per_token_head` 0.0171 mean / 0.0043 median (94.6% top-1, flat across 0-71.6k), `fp8_per_token_head` 0.0213 / 0.0055 (93.8%). `fp8_mla` (e4m3) and `int8_mla` quantize MLA `ckv` in 128-element groups with fp32 scales and keep `k_rope` in bf16 (656 B vs 1152 B/row, -43% KV VRAM); the `dsa` backend reads them and Hy4-flash stores only these. On Hy4-flash TP=2 (2x RTX 3080 20 GB, `--mtp on`): +206/+306 expert slots at 0/39.5k context, attention 5.60-5.68 ms vs 5.85 ms bf16 (42L `T=3`); KLD vs bf16 KV (7,256 rows up to 63.6k): `int8_mla` 0.099 mean / 0.0059 median (92.3% top-1), `fp8_mla` 0.126 / 0.0068 (91.6%). Prefer the int8 formats over fp8 (same VRAM and speed, lower KLD). None of them combines with `--kv-tier`. DeepSeek-V4 stores only `fp8_ds_mla` (window and compressed KV as e4m3 with one ue8m0 scale per 64 channels and bf16 rope, 584 B per row; indexer keys as MXFP4, 68 B) and DeepSeek-V4.1 only `nvfp4_ds_mla` (window KV as MXFP8, compressed KV as NVFP4, indexer keys as MXFP4); the names follow vLLM, and `auto` picks them on those models |
 
 ### MoE offload
 
@@ -353,8 +353,12 @@ Converts an HF safetensors checkpoint to FTW, FreeToken's self-contained
 fast-load format; point `ft serve --model` at the output dir. The FTW carries
 everything the source had (including the draft head; Hy4-flash's DFly2 drafter is stored
 under FTW kind `dfly` and loaded with `ft serve --mtp on`), so the server replays it
-without re-reading the HF shards. The Engram n-gram tables are the exception: they stay in the
-source checkpoint unless `--include-engram` is given. MoE experts are always packed into
+without re-reading the HF shards. The n-gram tables read from disk while serving (Hy4-flash Engram,
+Qwen3.8-Flash-Next PLE) are not FTW entries: they are safetensors files in `engram/` in the
+FTW dir, under the source's file and tensor names and without an index. The server finds a
+table by reading the file headers, so a file can be replaced by the same table from another
+checkpoint (for example Intel's BF16 PLE table instead of NVIDIA's NVFP4 one). The Engram tables
+stay in the source checkpoint unless `--include-engram` is given. MoE experts are always packed into
 expert banks, which serve the fused and the offload strategies alike (DeepSeek-V4 experts
 serve offload only); `--moe-backend` is kept for compatibility. See the FTW caveats in
 [models.md](models.md#notes); FTW files from older builds can be repaired with
@@ -367,8 +371,8 @@ serve offload only); `--moe-backend` is kept for compatibility. See the FTW cave
 | `--moe-backend` | offload | `offload` packs the experts into offload banks; e.g. `triton` keeps them dense for resident serving |
 | `--quant-backend` | auto | Kernel per quantized layer type (as for `ft serve`); the expert banks are packed for the chosen kernel and the server picks it back up |
 | `--shard-gib` | 8 | Max FTW shard size in GiB |
-| `--include-engram` | off | Also export the Engram n-gram tables, so the FTW serves without its source checkpoint. DeepSeek-V4.1: into the FTW (~189 GiB extra disk). Hy4-flash: into `engram/` in the FTW dir (original tensor names and bytes, own `model.safetensors.index.json`, read in place like the source's); a source shard that holds only tables is hardlinked when both dirs are on one filesystem (no extra disk) and copied otherwise (~118 GiB), a table sharing its shard gets a file of its own. Never edit a hardlinked file in place: it is the source's file too. Without the flag the tables are read in place from the source shards at serve time (the index records `source_model_path`) |
-| `--ple` | bf16 | Stored dtype of the PLE n-gram table side tables (qwen4_exp): `bf16`, `fp8`, `auto` (keep the source dtype), or `none` to copy nothing and read the table from the source checkpoint at serve time (the source must stay in place) |
+| `--include-engram` | off | Also export the Engram n-gram tables, so the FTW serves without its source checkpoint. DeepSeek-V4.1: into the FTW (~189 GiB extra disk). Hy4-flash: into `engram/` (original file names, tensor names and bytes, read in place like the source's); a source shard that holds only tables is hardlinked when both dirs are on one filesystem (no extra disk) and copied otherwise (~118 GiB), a table sharing its shard gets a file of its own. Never edit a hardlinked file in place: it is the source's file too. Without the flag the tables are read in place from the source shards at serve time (the index records `source_model_path`) |
+| `--ple` | bf16 | Stored dtype of the PLE n-gram table in `engram/` (qwen4_exp): `bf16`, `fp8`, `auto` (keep the source dtype), or `none` to copy nothing and read the table from the source checkpoint at serve time (the source must stay in place) |
 | `--gpu` | first visible GPU | GPU for the repack: a UUID from `nvidia-smi -L` or an index |
 
 ## ft bench bw

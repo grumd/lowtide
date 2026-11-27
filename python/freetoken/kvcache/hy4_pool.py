@@ -26,12 +26,15 @@ checkpoints are ordinary unlocked swa nodes that ``evict_swa`` reclaims under pr
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import torch
 
 from freetoken.utils import align_ceil, init_logger
 
 from .dsa_pool import KpoolDSAKVCache
 from .dsv4.window_tier import FreeListAllocator
+from .format import FP8_MLA, INT8_MLA, NONE, KVFormat
 
 logger = init_logger(__name__)
 
@@ -114,6 +117,9 @@ class Hy4KVCache(KpoolDSAKVCache):
     """All 42 layers on the full tier (sliding layers read the last ``window`` rows of the same
     history): the kpool DSA pool, with its page-scaled tiers mappable by elastic VRAM."""
 
+    # Hy4 reads the group-128 c_kv formats (fp8_mla / int8_mla); the per-token-head MLA rows are untested here
+    kv_formats: ClassVar[frozenset[str]] = frozenset({NONE.name, FP8_MLA.name, INT8_MLA.name})
+
     ELASTIC_VRAM = True
 
     def __init__(self, *args, **kwargs) -> None:
@@ -150,6 +156,7 @@ class Hy4WindowKVCache(Hy4KVCache):
         num_window_tokens: int,
         num_req_slots: int,
         index_ratio: int,
+        kv_format: KVFormat = NONE,
     ) -> None:
         assert num_window_tokens % page_size == 0, (num_window_tokens, page_size)
         self._swa_layer = {int(g): i for i, g in enumerate(sliding_layer_ids)}
@@ -159,18 +166,27 @@ class Hy4WindowKVCache(Hy4KVCache):
             latent_dim, len(indexed_layer_ids), num_pages, page_size, dtype, device,
             index_head_dim=index_head_dim, num_index_layers=len(indexed_layer_ids),
             layer_ids=tuple(indexed_layer_ids), num_req_slots=num_req_slots,
-            index_ratio=index_ratio,
+            index_ratio=index_ratio, kv_format=kv_format,
         )
 
     # ----- allocation ---------------------------------------------------------------------
     def _alloc(self, num_pages: int) -> None:
         super()._alloc(num_pages)
         ps = self._page_size
+        fmt = self.kv_format
         # + one dummy page bound to the full dummy page, + one scratch row for unbound stores
         self._win_slots = self._num_window_tokens + ps
         self._win_buffer = torch.zeros(
-            len(self._swa_layer), self._win_slots + 1, self._latent_dim,
-            dtype=self._dtype, device=self._device,
+            len(self._swa_layer), self._win_slots + 1, self._row_elems,
+            dtype=fmt.elem_tensor_dtype(self._dtype), device=self._device,
+        )
+        self._win_scale_buffer = (
+            None
+            if self._n_scales == 0
+            else torch.zeros(
+                len(self._swa_layer), self._win_slots + 1, self._n_scales,
+                dtype=fmt.scale_store_dtype, device=self._device,
+            )
         )
         full_tokens = num_pages * ps
         self.full_to_window = torch.full((full_tokens + 1,), -1, dtype=torch.int32, device=self._device)
@@ -182,6 +198,7 @@ class Hy4WindowKVCache(Hy4KVCache):
 
     def rebuild(self, num_pages: int, num_window_tokens: int | None = None) -> None:
         self._win_buffer = None
+        self._win_scale_buffer = None
         self.full_to_window = None
         if num_window_tokens is not None:
             self._num_window_tokens = int(num_window_tokens)
@@ -210,7 +227,8 @@ class Hy4WindowKVCache(Hy4KVCache):
         and ratio x full tokens per page unless a window size is pinned."""
         args = _window_args(config)
         ps = config.page_size
-        row = args.latent_dim * config.dtype.itemsize
+        fmt = getattr(config, "kv_format", NONE)
+        row = fmt.mla_row_bytes(args.kv_lora_rank, args.qk_rope_head_dim, config.dtype)
         n_idx = sum(1 for i in args.indexed_layer_ids if i < config.model_config.num_layers)
         n_swa = sum(1 for i in args.sliding_layer_ids if i < config.model_config.num_layers)
         full = n_idx * row + n_idx * args.index_head_dim * 2 // args.index_ratio + 4
@@ -232,7 +250,10 @@ class Hy4WindowKVCache(Hy4KVCache):
     def unit_bytes(self) -> tuple[int, int]:
         kv, _ = super().unit_bytes()
         win = self._win_buffer
-        return kv, int(win.numel() * win.element_size()) // self._win_slots
+        win_total = int(win.numel() * win.element_size())
+        if self._win_scale_buffer is not None:
+            win_total += int(self._win_scale_buffer.numel() * self._win_scale_buffer.element_size())
+        return kv, win_total // self._win_slots
 
     # ----- layer views ----------------------------------------------------------------------
     def is_window_layer(self, layer_id: int) -> bool:
@@ -246,11 +267,19 @@ class Hy4WindowKVCache(Hy4KVCache):
             return super().latent_rows(layer_id)
         return self._win_buffer[w]
 
+    def latent_scale(self, layer_id: int) -> torch.Tensor | None:
+        w = self._swa_layer.get(layer_id)
+        if w is None:
+            return super().latent_scale(layer_id)
+        return None if self._win_scale_buffer is None else self._win_scale_buffer[w]
+
     def k_cache(self, layer_id: int) -> torch.Tensor:
         w = self._swa_layer.get(layer_id)
         if w is None:
             return super().k_cache(layer_id)
-        return self._win_buffer[w, : self._win_slots].view(-1, self._page_size, self._latent_dim)
+        return self._win_buffer[w, : self._win_slots].view(
+            -1, self._page_size, self._row_elems
+        )
 
     def window_slots(self, full_slots: torch.Tensor) -> torch.Tensor:
         """Window rows of ``full_slots`` (int32); ``-1`` in and unbound slots map to ``-1``."""
@@ -267,6 +296,11 @@ class Hy4WindowKVCache(Hy4KVCache):
             return super().store_kv(c_kv, k_rope, out_loc, layer_id)
         loc = window_loc if window_loc is not None else self.store_slots(out_loc)
         rows = self._win_buffer[w]
+        if self.kv_format.quantized:
+            from freetoken.kernel.triton.kv_rows import store_latent_rows
+
+            store_latent_rows(self.kv_format, c_kv, k_rope, loc, rows, self._win_scale_buffer[w])
+            return
         split = rows.shape[1] - k_rope.shape[-1]
         rows[loc, :split] = c_kv
         rows[loc, split:] = k_rope

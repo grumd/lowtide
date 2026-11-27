@@ -23,7 +23,7 @@ from typing import ClassVar
 import torch
 
 from .base import BaseKVCachePool
-from .format import NONE, ROW_SCALE_FORMATS, KVFormat
+from .format import MLA_KV_FORMATS, NONE, KVFormat
 
 
 class MLAKVCache(BaseKVCachePool):
@@ -39,7 +39,8 @@ class MLAKVCache(BaseKVCachePool):
     A quantized row keeps two scales: ckv and kpe have their own ranges.
     """
 
-    kv_formats: ClassVar[frozenset[str]] = ROW_SCALE_FORMATS
+    kv_formats: ClassVar[frozenset[str]] = MLA_KV_FORMATS
+    kv_formats_tp: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -51,9 +52,14 @@ class MLAKVCache(BaseKVCachePool):
         device: torch.device,
         layer_ids: "tuple[int, ...] | None" = None,
         kv_format: KVFormat = NONE,
+        rope_dim: int | None = None,
     ) -> None:
         self.kv_format = kv_format
         self._latent_dim = latent_dim
+        self._rope_dim = latent_dim % 128 if rope_dim is None else int(rope_dim)
+        self._ckv_dim = latent_dim - self._rope_dim
+        self._row_elems = kv_format.mla_row_elems(self._ckv_dim, self._rope_dim, dtype)
+        self._n_scales = kv_format.mla_scale_dim(self._ckv_dim, self._rope_dim)
         if layer_ids is None:
             self._num_layers = num_layers
             self._layer_index: dict[int, int] | None = None
@@ -74,7 +80,7 @@ class MLAKVCache(BaseKVCachePool):
         self._num_pages = num_pages
         fmt = self.kv_format
         dtype = fmt.elem_tensor_dtype(self._dtype)
-        elem_dim = fmt.elem_dim(self._latent_dim)
+        elem_dim = self._row_elems
         page_bytes = self._page_size * elem_dim * dtype.itemsize
         # plain torch allocation unless elastic VRAM installed its allocator (the pool opted in)
         self._kv_buffer = alloc_tier(
@@ -87,20 +93,22 @@ class MLAKVCache(BaseKVCachePool):
             zero=fmt.quantized,
         )
         self._scale_buffer = None
-        if fmt.scale_dtype is not None:
-            scale_page = self._page_size * 2 * fmt.scale_store_dtype.itemsize
+        if self._n_scales > 0:
+            # 1 contiguous run of (num_pages, page_size, num_layers, n_scales): under elastic VRAM
+            # with 2 MiB chunks this maps 1-2 chunks instead of num_layers chunks.
+            scale_page_bytes = self._page_size * self._num_layers * self._n_scales * fmt.scale_store_dtype.itemsize
             self._scale_buffer = alloc_tier(
                 "kv_scale",
-                (self._num_layers, num_pages * self._page_size, 2),
+                (num_pages, self._page_size, self._num_layers, self._n_scales),
                 fmt.scale_store_dtype,
                 self._device,
-                paged_run_intervals(self._num_layers, num_pages * scale_page, scale_page, scale_page),
+                paged_run_intervals(1, num_pages * scale_page_bytes, scale_page_bytes, scale_page_bytes),
                 zero=True,
             )
 
     # -- views (addressed by GLOBAL layer id; remapped when layer_ids was given) --
     def k_cache(self, layer_id: int) -> torch.Tensor:
-        """Paged latent view ``[num_pages, page_size, latent_dim]``."""
+        """Paged latent view ``[num_pages, page_size, row_elems]``."""
         return self._kv_buffer[0, self._local_layer(layer_id)].view(
             self._num_pages, self._page_size, -1
         )
@@ -110,12 +118,14 @@ class MLAKVCache(BaseKVCachePool):
         return self.k_cache(layer_id)
 
     def latent_rows(self, layer_id: int) -> torch.Tensor:
-        """Row-flat latent view ``[num_pages * page_size, latent_dim]``."""
-        return self._kv_buffer[0, self._local_layer(layer_id)].view(-1, self._latent_dim)
+        """Row-flat latent view ``[num_pages * page_size, row_elems]``."""
+        return self._kv_buffer[0, self._local_layer(layer_id)].view(-1, self._row_elems)
 
     def latent_scale(self, layer_id: int) -> torch.Tensor | None:
-        """Row scales ``[num_pages * page_size, 2]`` (ckv, kpe), or None when rows are not quantized."""
-        return None if self._scale_buffer is None else self._scale_buffer[self._local_layer(layer_id)]
+        """Row scales ``[num_pages * page_size, n_scales]``, or None when rows are not quantized."""
+        if self._scale_buffer is None:
+            return None
+        return self._scale_buffer.view(-1, self._num_layers, self._n_scales)[:, self._local_layer(layer_id), :]
 
     # -- writes -----------------------------------------------------------------
     def store_kv(

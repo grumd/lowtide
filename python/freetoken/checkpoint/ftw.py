@@ -28,6 +28,13 @@ Layout on disk::
     <dir>/freetoken-00000.ftw         # the byte region, sliced <= shard_limit
     <dir>/freetoken-00001.ftw
     <dir>/config.json, tokenizer*, ...# copied so the dir is a self-contained checkpoint
+    <dir>/engram/*.safetensors        # n-gram tables read from disk row by row (optional)
+
+The n-gram embedding tables a model reads in place at serve time (Hy4 Engram, Qwen4-exp PLE)
+are not FTW entries: they live in ``engram/`` as plain safetensors files under the source
+checkpoint's file and tensor names, with no index. The loader finds a table by reading the
+file headers, so a file can be swapped for the same table from another checkpoint (e.g. an
+FP8 instead of a BF16 PLE table).
 """
 
 from __future__ import annotations
@@ -49,6 +56,8 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 INDEX_NAME = "freetoken_weight.json"
+# In-place n-gram tables beside the shards (see the module docstring).
+ENGRAM_DIR = "engram"
 FORMAT_TAG = "freetoken_weight"
 FORMAT_VERSION = 1
 ALIGN = 4096  # O_DIRECT block alignment (== page size on this platform)

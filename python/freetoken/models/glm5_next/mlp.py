@@ -51,17 +51,20 @@ class Glm5NextGatedMLP(BaseOP):
         self.swiglu_limit = swiglu_limit
 
     @nvtx_annotate("MLP")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, reduce: bool = True) -> torch.Tensor:
         gate = self.gate_proj.forward(x)
         up = self.up_proj.forward(x)
         del x
         if self.swiglu_limit is None:
             import torch.nn.functional as F
 
-            return self.down_proj.forward(F.silu(gate) * up)
-        gated = swiglu_clamp_and_mul(
-            torch.cat([gate, up], dim=-1), alpha=1.0, limit=self.swiglu_limit
-        )
+            gated = F.silu(gate) * up
+        else:
+            gated = swiglu_clamp_and_mul(
+                torch.cat([gate, up], dim=-1), alpha=1.0, limit=self.swiglu_limit
+            )
+        if isinstance(self.down_proj, LinearRowParallel):
+            return self.down_proj.forward(gated, reduce=reduce)
         return self.down_proj.forward(gated)
 
 

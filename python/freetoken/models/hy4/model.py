@@ -109,7 +109,7 @@ class Hy4Model(BaseOP):
             assert store.layers == [layer._layer_id for layer in self._engram_layers], store.layers
         self._engram_store = store
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, batch=None) -> torch.Tensor:
         streams = hc_expand(self.embed_tokens.forward(input_ids), self._n)
         engram = None
         if self._engram_layers:
@@ -141,6 +141,15 @@ class Hy4LMHead(ParallelLMHead):
         w = self.tied_embedding.weight if self.tied_embedding is not None else getattr(self, "weight", None)
         if self.bias is None and w is not None and w.dtype == x.dtype and w.dtype in (torch.bfloat16, torch.float16):
             if x.is_cuda:
+                if (
+                    x.shape[0] == 1
+                    and x.is_contiguous()
+                    and x.dtype == torch.bfloat16
+                    and w.stride(1) == 1
+                ):
+                    from freetoken.kernel.triton.gemv import gemv
+
+                    return gemv(x, w, out_dtype=torch.float32)
                 return torch.mm(x, w.t(), out_dtype=torch.float32)
             return F.linear(x.float(), w.float())
         return super()._logits(x).float()
@@ -174,11 +183,15 @@ class Hy4ForCausalLM(BaseLLMModel):
             self.dfly = Hy4DFly(config)
         self._dfly_tap = None
         self._dfly_graphs = None
+        self._draft_vocab = None
 
     # ----- DFly2 drafter --------------------------------------------------------------------
     def dfly_drafter(self):
         """The drafter when this serve builds it (``--mtp on``), else None."""
         return self.dfly
+
+    def set_draft_vocab(self, dv) -> None:
+        self._draft_vocab = dv
 
     def setup_draft_buffers(self, rows: int, slots: int, device: torch.device) -> None:
         """Before any graph capture: the static target-row export the drafter reads (``rows``
@@ -203,22 +216,64 @@ class Hy4ForCausalLM(BaseLLMModel):
         from .dfly import DFlyGraphs
 
         self._dfly_graphs = DFlyGraphs(
-            self._dfly_eager, bs_list, range(1, max_k + 1), pad_slot, device, stream, pool
+            self._dfly_eager, bs_list, range(1, max_k + 1), pad_slot, device, stream, pool,
+            draft_sampled=self._dfly_eager_sampled, draft_vocab=self._draft_vocab,
         )
 
-    def dfly_draft(self, slots: torch.Tensor, bonus: torch.Tensor, anchor: torch.Tensor, k: int) -> torch.Tensor:
-        """``k`` drafts per request ``[n, k]`` int32 from the state kept in table rows ``slots``,
-        each block starting with the pending token ``bonus`` at position ``anchor``."""
+    def dfly_draft(
+        self,
+        slots: torch.Tensor,
+        bonus: torch.Tensor,
+        anchor: torch.Tensor,
+        k: int,
+        *,
+        temp: torch.Tensor | None = None,
+        top_p: torch.Tensor | None = None,
+        top_k: torch.Tensor | None = None,
+        u: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """``k`` drafts per request from the state kept in table rows ``slots``, each block
+        starting with the pending token ``bonus`` at position ``anchor``. When ``temp`` is given
+        (non-greedy batch), draws from the draft head's truncated distribution and returns
+        ``(drafts [n, k], cand_ids [n, k, DRAFT_K], cand_q [n, k, DRAFT_K])``; otherwise returns
+        ``(drafts [n, k], None, None)`` with zero sampling overhead."""
+        dv = self._draft_vocab
+        use_dv = dv is not None and dv.active
         graphs = self._dfly_graphs
-        if graphs is not None and graphs.can_use(slots.shape[0], k):
-            return graphs.run(slots, bonus, anchor, k)
-        return self._dfly_eager(slots, bonus, anchor, k)
+        if temp is not None:
+            assert top_p is not None and top_k is not None
+            if u is None:
+                from freetoken.engine.draft_sample import DRAFT_K
 
-    def _dfly_eager(self, slots: torch.Tensor, bonus: torch.Tensor, anchor: torch.Tensor, k: int) -> torch.Tensor:
+                u = torch.rand((slots.shape[0], k, DRAFT_K), device=slots.device)
+            if graphs is not None and graphs.can_use(slots.shape[0], k, sampled=True, use_dv=use_dv):
+                return graphs.run_sampled(slots, bonus, anchor, k, temp, top_p, top_k, u, use_dv=use_dv)
+            return self._dfly_eager_sampled(
+                slots, bonus, anchor, k, temp, top_p, top_k, u, draft_vocab=dv if use_dv else None
+            )
+        if graphs is not None and graphs.can_use(slots.shape[0], k, sampled=False, use_dv=use_dv):
+            return graphs.run(slots, bonus, anchor, k, use_dv=use_dv), None, None
+        return self._dfly_eager(slots, bonus, anchor, k, draft_vocab=dv if use_dv else None), None, None
+
+    def _dfly_eager(
+        self, slots: torch.Tensor, bonus: torch.Tensor, anchor: torch.Tensor, k: int, *, draft_vocab=None
+    ) -> torch.Tensor:
         tap = self._dfly_tap
         return self.dfly.forward(
             self.model.embed_tokens, self.lm_head, bonus, anchor,
             tap.hidden.index_select(0, slots), tap.sel.index_select(1, slots), k,
+            hist_cnt=tap.cnt.index_select(1, slots), draft_vocab=draft_vocab,
+        )
+
+    def _dfly_eager_sampled(
+        self, slots: torch.Tensor, bonus: torch.Tensor, anchor: torch.Tensor, k: int,
+        temp: torch.Tensor, top_p: torch.Tensor, top_k: torch.Tensor, u: torch.Tensor, *, draft_vocab=None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        tap = self._dfly_tap
+        return self.dfly.forward_sampled(
+            self.model.embed_tokens, self.lm_head, bonus, anchor,
+            tap.hidden.index_select(0, slots), tap.sel.index_select(1, slots),
+            tap.cnt.index_select(1, slots), k, temp, top_p, top_k, u, draft_vocab=draft_vocab,
         )
 
     def _export_hidden(self, out: torch.Tensor) -> None:

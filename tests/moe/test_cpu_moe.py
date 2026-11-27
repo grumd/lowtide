@@ -1337,3 +1337,195 @@ def test_cpu_moe_executor_is_collectable():
     if watchdog is not None:
         watchdog.join(timeout=5.0)  # exits on the first tick after the weakref dies
         assert not watchdog.is_alive(), "watchdog thread must exit after executor GC"
+
+
+_E2M1_TABLE = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=torch.float32,
+)
+
+
+def _dequant_nvfp4_row_f32(packed: torch.Tensor, scale: torch.Tensor, glob: torch.Tensor) -> torch.Tensor:
+    """Exact fp32 dequant for one expert bank [OUT, IN//2] -> [OUT, IN]."""
+    lo = (packed & 0xF).to(torch.long)
+    hi = (packed >> 4).to(torch.long)
+    codes = torch.stack((lo, hi), dim=-1).reshape(packed.shape[0], -1)
+    vals = _E2M1_TABLE[codes]
+    sc = scale.view(torch.float8_e4m3fn).float().repeat_interleave(16, dim=-1)
+    return vals * sc * glob.unsqueeze(-1)
+
+
+def _nvfp4_exact_ref(
+    cache,
+    layer: int,
+    x: torch.Tensor,
+    ids: torch.Tensor,
+    w: torch.Tensor,
+    *,
+    activation: str,
+    alpha: float = 1.0,
+    limit: float = float("inf"),
+    apply_on_input: bool = False,
+) -> torch.Tensor:
+    b = cache.bank_sources
+    gup, gus, gug = b["gate_up_packed"][layer], b["gate_up_scale"][layer], b["gate_up_global"][layer]
+    dnp, dns, dng = b["down_packed"][layer], b["down_scale"][layer], b["down_global"][layer]
+    I = gup.shape[1] // 2
+    H = gup.shape[2] * 2
+    T, top_k = ids.shape
+    xf = x.float()
+    out = torch.zeros(T, H, dtype=torch.float32)
+    deq_gu: dict[int, torch.Tensor] = {}
+    deq_dn: dict[int, torch.Tensor] = {}
+    for t in range(T):
+        for k in range(top_k):
+            e = int(ids[t, k])
+            if e < 0:
+                continue
+            if e not in deq_gu:
+                deq_gu[e] = _dequant_nvfp4_row_f32(gup[e], gus[e], gug[e])
+                deq_dn[e] = _dequant_nvfp4_row_f32(dnp[e], dns[e], dng[e])
+            wi = float(w[t, k]) if apply_on_input else 1.0
+            wo = 1.0 if apply_on_input else float(w[t, k])
+            h = (deq_gu[e] @ xf[t]) * wi
+            gate, up = h[:I], h[I:]
+            if activation == "silu":
+                act = Fn.silu(gate) * up
+            elif activation == "swiglu_clamp":
+                g = gate.clamp(max=limit)
+                u = up.clamp(-limit, limit)
+                act = g * torch.sigmoid(g * alpha) * u
+            elif activation == "swigluoai":
+                g = gate.clamp(max=limit)
+                u = up.clamp(-limit, limit)
+                act = g * torch.sigmoid(g * alpha) * (u + 1.0)
+            else:
+                raise ValueError(activation)
+            out[t] += wo * (deq_dn[e] @ act.bfloat16().float())
+    return out
+
+
+@pytest.mark.parametrize("T", [1, 3, 6, 10, 18])
+@pytest.mark.parametrize("out_fp32", [True, False])
+@pytest.mark.parametrize("activation", ["silu", "swiglu_clamp"])
+def test_nvfp4_tiled_multitoken_shared_experts(T, out_fp32, activation):
+    """Multi-token expert-tiled AVX-512-BF16 NVFP4 path + active-route compaction:
+    shared experts (including >MT=8 routes per expert and >16 active tokens), all-(-1)
+    tokens, all-(-1) empty batch, fp32 and bf16 output, silu and swiglu_clamp."""
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    L, E, H, I, top_k = 1, 16, 256, 192, 6
+    cache = _make_nvfp4_cache(L, E, H, I, seed=42 + T)
+    ex = CpuMoeExecutor(
+        cache,
+        top_k=top_k,
+        activation=activation,
+        apply_router_weight_on_input=False,
+        num_threads=4,
+        max_tokens=T,
+        device=torch.device("cpu"),
+        swiglu_alpha=1.0,
+        swiglu_limit=5.0 if activation == "swiglu_clamp" else None,
+        out_fp32=out_fp32,
+        w4a8=False,
+    )
+    io = ex.stage(0, T)
+    task = ex._task_for(0, T)
+
+    g = torch.Generator().manual_seed(1000 + T + int(out_fp32) * 17)
+    x = (torch.randn(T, H, generator=g) * 2.0).bfloat16()
+    ids = torch.full((T, top_k), -1, dtype=torch.int32)
+    for t in range(T):
+        if T >= 3 and t == 1:
+            continue  # leave token 1 with 0 active routes (all -1)
+        # Share experts 0 and 3 across every active token to exercise multi-token tiling
+        ids[t, 0] = 0
+        ids[t, 1] = 3
+        ids[t, 2] = (t % 5) + 4
+        if t % 2 == 0:
+            ids[t, 3] = 11
+    w = torch.rand(T, top_k, generator=g, dtype=torch.float32)
+
+    io["x"].copy_(x)
+    io["ids"].copy_(ids)
+    io["w"].copy_(w)
+    io["y"].fill_(999.0)  # sentinel: inactive rows must be overwritten with 0
+    ex._ext.run_task(task)
+    got = io["y"].clone()
+
+    ref = _nvfp4_exact_ref(
+        cache, 0, x, ids, w,
+        activation=activation,
+        alpha=1.0,
+        limit=5.0 if activation == "swiglu_clamp" else float("inf"),
+    )
+    if T >= 3:
+        assert torch.equal(got[1], torch.zeros_like(got[1])), "all-(-1) token must be exact zero"
+    tol = 2e-4 if out_fp32 else 1.5e-2
+    rel = (got.float() - ref).abs().max() / (ref.abs().max() + 1e-6)
+    assert rel < tol, f"T={T} out_fp32={out_fp32} act={activation} rel={rel.item()}"
+
+    # Empty active-route batch: every token has all -1 routes -> strict zeros
+    io["ids"].fill_(-1)
+    io["y"].fill_(777.0)
+    ex._ext.run_task(task)
+    assert torch.equal(io["y"], torch.zeros_like(io["y"])), "empty active batch must zero output"
+
+
+def test_nvfp4_tiled_pooled_high_expert_ids_and_epilogues():
+    """High expert IDs (pooled bank style, sparse expert_slot reset across calls),
+    swigluoai epilogue, apply_router_weight_on_input=True, and thread-count determinism."""
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    # Pooled-like large num_experts (4096) with compact dims
+    E, H, I, top_k, T = 4096, 128, 64, 4, 6
+    cache = _make_nvfp4_cache(1, E, H, I, seed=77)
+    ex = CpuMoeExecutor(
+        cache,
+        top_k=top_k,
+        activation="swigluoai",
+        apply_router_weight_on_input=True,
+        num_threads=4,
+        max_tokens=T,
+        device=torch.device("cpu"),
+        swiglu_alpha=1.702,
+        swiglu_limit=7.0,
+        out_fp32=True,
+        w4a8=False,
+    )
+    io = ex.stage(0, T)
+    task = ex._task_for(0, T)
+
+    g = torch.Generator().manual_seed(99)
+    high_pools = [
+        [0, 1, 2047, 4095],
+        [4095, 3000, 1024, 512],
+        [2048, 2048, 4094, 7],  # duplicate expert within same token
+    ]
+    for step, pool in enumerate(high_pools):
+        x = (torch.randn(T, H, generator=g) * 1.5).bfloat16()
+        ids = torch.full((T, top_k), -1, dtype=torch.int32)
+        for t in range(T):
+            for k in range(top_k):
+                if (t + k) % 3 != 0:
+                    ids[t, k] = pool[(t + k) % len(pool)]
+        w = torch.rand(T, top_k, generator=g, dtype=torch.float32)
+        io["x"].copy_(x)
+        io["ids"].copy_(ids)
+        io["w"].copy_(w)
+        io["y"].fill_(-123.0)
+        ex._ext.run_task(task)
+        got = io["y"].clone()
+        ref = _nvfp4_exact_ref(
+            cache, 0, x, ids, w,
+            activation="swigluoai", alpha=1.702, limit=7.0, apply_on_input=True,
+        )
+        rel = (got - ref).abs().max() / (ref.abs().max() + 1e-6)
+        assert rel < 2e-4, f"step={step} pooled high ids rel={rel.item()}"
+
+        # Thread-count determinism: 1 vs 2 vs 4 threads must produce bit-identical fp32 output
+        for nthr in (1, 2, 4):
+            ex.set_active_threads(nthr)
+            io["y"].zero_()
+            ex._ext.run_task(task)
+            assert torch.equal(io["y"], got), f"step={step} nthr={nthr} non-deterministic"

@@ -28,7 +28,7 @@ from safetensors.torch import save_file
 
 from freetoken.utils import cached_load_hf_config, download_hf_weight
 
-from .ftw import DEFAULT_SHARD_LIMIT, FTWWriter, layer_bank_entry_name
+from .ftw import DEFAULT_SHARD_LIMIT, ENGRAM_DIR, FTWWriter, layer_bank_entry_name
 
 # Machine-readable convert progress for a supervising process (e.g. a GUI frontend parses
 # these `FTCONVERT <phase> <done> <total>` stdout lines to drive its convert bar). Gated by
@@ -352,7 +352,7 @@ def convert_checkpoint(
     place from the source shards at serve time). OFF by default so the FTW stays the
     current dense+banks layout; the index records it under ``"includes"`` so the loader
     can tell an FTW apart. A family with an ``ftw_engram_files`` hook (Hy4)
-    keeps its tables beside the entries instead (``engram/``, hardlinked when it can be).
+    keeps its tables in ``engram/`` instead (see ``ftw.ENGRAM_DIR``), hardlinked when it can be.
 
     The FTW format is TP-agnostic and conversion runs single-process, so the resulting
     checkpoint records no TP layout and loads independently of the runtime TP setting.
@@ -554,11 +554,11 @@ def convert_checkpoint(
     _progress("finalize")  # writing shard index + copying config/tokenizer
     copied = _copy_metadata(model_path, out_dir)
     _declare_quantization(model_path, out_dir)
-    engram_files = None
+    engram_files: list[str] = []
     if include_engram:
         from freetoken.models.weight import ftw_engram_files
 
-        engram_files = ftw_engram_files(model_path, out_dir)
+        engram_files += ftw_engram_files(model_path, out_dir) or []
     # FlashML's side-file hook (DeepSeek-V4.1: the engram tables); a family with a
     # side_table_files hook (qwen4_exp PLE) is handled by the block below instead
     side_files: list[str] = []
@@ -571,8 +571,8 @@ def convert_checkpoint(
         except (AttributeError, KeyError, ValueError):
             side_hook = None
         side_files = side_hook(model_path, out_dir) if side_hook is not None else []
-    # Model-specific side tables (qwen4_exp: the PLE n-gram table): .safetensors files
-    # the model loads outside the dense stream — without them the FTW dir cannot serve.
+    # Model-specific side tables (qwen4_exp: the PLE n-gram table): .safetensors files in
+    # engram/ the model loads outside the dense stream - without them the FTW dir cannot serve.
     # ``ple_mode`` selects the stored dtype: ``bf16``/``fp8`` re-encode to that dtype
     # (extracting a table embedded in big dense shards), ``auto`` preserves the source.
     # A table already in the requested dtype rides verbatim (the loader raw-byte-copies it).
@@ -591,12 +591,16 @@ def convert_checkpoint(
             headers.append(json.loads(fh.read(hlen)))
     from freetoken.models.qwen4_exp.weight import ple_table_is_nvfp4, repack_ple_nvfp4
 
+    table_dir = os.path.join(out_dir, ENGRAM_DIR)
+    ple_files: list[str] = []
+    if side_tables:
+        os.makedirs(table_dir, exist_ok=True)
     if side_tables and ple_table_is_nvfp4(headers):
         # NVFP4 table: always repacked to interleaved rows (the disk backend's format);
         # the source shards also hold dense tensors, so nothing rides verbatim.
         if ple_mode not in ("auto", "bf16", "nvfp4"):
             raise SystemExit(f"--ple {ple_mode} is not supported for an NVFP4 n-gram table")
-        copied.extend(repack_ple_nvfp4([os.path.abspath(p) for p in side_tables], out_dir))
+        ple_files.extend(repack_ple_nvfp4([os.path.abspath(p) for p in side_tables], table_dir))
         ple_stored = "nvfp4"
         side_tables = []
     for src in side_tables:
@@ -611,14 +615,15 @@ def convert_checkpoint(
             continue
         src_dtype = _ple_table_source_dtype(header, ple_keys)
         if _ple_rides_verbatim(header, ple_keys, ple_mode):
-            dst = os.path.join(out_dir, os.path.basename(src_abs))
+            dst = os.path.join(table_dir, os.path.basename(src_abs))
             shutil.copy2(src_abs, dst)
-            copied.append(os.path.basename(src_abs))
+            ple_files.append(os.path.basename(src_abs))
             ple_stored = src_dtype
             continue
         stored = "fp8" if ple_mode == "fp8" else "bf16"
-        _extract_ple_table(src_abs, out_dir, copied, out_dtype=stored)
+        _extract_ple_table(src_abs, table_dir, ple_files, out_dtype=stored)
         ple_stored = stored
+    engram_files += [f"{ENGRAM_DIR}/{name}" for name in ple_files]
 
     try:
         fingerprint = _source_fingerprint(model_path, mc, device=dev)
@@ -647,9 +652,9 @@ def convert_checkpoint(
             **n_side,
         },
         "copied_metadata": copied,
-        # Engram tables kept beside the entries (Hy4 --include-engram: engram/, read in place at
-        # serve time instead of from source_model_path); None when the FTW has no such files.
-        "engram_files": engram_files,
+        # n-gram tables in engram/ (Hy4 Engram with --include-engram, qwen4_exp PLE), read in
+        # place at serve time; None when the FTW has none.
+        "engram_files": engram_files or None,
         # FlashML side files (DeepSeek-V4.1 engram), [] for the others
         "side_files": side_files,
         # Which optional side payloads this FTW carries. The loader reads these to decide

@@ -251,8 +251,10 @@ def _validate_kv_format(config, model_config) -> None:
         raise ValueError(f"--kv-cache-dtype {kv_format.name}: {pool_cls.__name__} only stores {sorted(pool_cls.kv_formats)}")
     if config.dtype != torch.bfloat16:
         raise ValueError(f"--kv-cache-dtype {kv_format.name} needs --dtype bfloat16, got {config.dtype}")
-    if config.tp_info.size != 1:
-        raise ValueError(f"--kv-cache-dtype {kv_format.name} does not support tensor parallelism yet")
+    if config.tp_info.size != 1 and not pool_cls.kv_formats_tp:
+        raise ValueError(f"--kv-cache-dtype {kv_format.name} does not support tensor parallelism for {pool_cls.__name__} yet")
+    if getattr(config, "kv_tier", False):
+        raise ValueError(f"--kv-cache-dtype {kv_format.name} cannot be combined with --kv-tier")
 
 
 def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
@@ -942,16 +944,18 @@ class Engine:
             logger.info_rank0(
                 f"MTP verify CUDA graphs captured: bs={_bs_list}, t={_t}"
             )
-        # MTP draft vocabulary: the draft chain's argmax over the most frequently generated
-        # tokens instead of the whole lm_head (see engine/draft_vocab.py).
+        # MTP / DFly2 draft vocabulary: the draft head's argmax/sampling over the most frequently
+        # generated tokens instead of the whole lm_head (see engine/draft_vocab.py).
         self.draft_vocab = None
-        if getattr(self.model, "mtp", None) is not None:
+        if getattr(self.model, "mtp", None) is not None or _dfly_drafter(self.model) is not None:
             from freetoken.engine.draft_vocab import DraftVocabHead
             from freetoken.env import ENV
 
             _dv = int(ENV.MTP_DRAFT_VOCAB.value)
             if _dv > 0 and DraftVocabHead.supported(self.model.lm_head):
                 self.draft_vocab = DraftVocabHead(self.model.lm_head, _dv, self.device)
+                if hasattr(self.model, "set_draft_vocab"):
+                    self.model.set_draft_vocab(self.draft_vocab)
                 logger.info_rank0(f"MTP draft vocab: learning the top {_dv} generated tokens")
             elif _dv > 0:
                 logger.info_rank0("MTP draft vocab: lm_head format unsupported, full vocab")

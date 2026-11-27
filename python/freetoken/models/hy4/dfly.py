@@ -48,10 +48,14 @@ class DFlyTap:
         n = len(self.layer_slot)
         self.hidden_rows = torch.zeros(rows, hidden, dtype=torch.bfloat16, device=device)
         self.sel_rows = torch.full((n, rows, width), -1, dtype=torch.int32, device=device)
+        self.cnt_rows = torch.zeros((n, rows), dtype=torch.int32, device=device)
         self.hidden = torch.zeros(slots, hidden, dtype=torch.bfloat16, device=device)
         self.sel = torch.full((n, slots, width), -1, dtype=torch.int32, device=device)
+        self.cnt = torch.zeros((n, slots), dtype=torch.int32, device=device)
 
-    def put_sel(self, layer_id: int, sel: torch.Tensor, row0: int = 0) -> None:
+    def put_sel(
+        self, layer_id: int, sel: torch.Tensor, row0: int = 0, cnt: torch.Tensor | None = None
+    ) -> None:
         """``sel [r, w]`` physical latent rows of target layer ``layer_id`` (``-1`` = none),
         ``w <= width``, at row buffer rows ``row0 .. row0 + r``."""
         s = self.layer_slot.get(layer_id)
@@ -62,6 +66,11 @@ class DFlyTap:
         dst[:, :w].copy_(sel)
         if w < self.width:
             dst[:, w:].fill_(-1)
+        c_dst = self.cnt_rows[s, row0 : row0 + r]
+        if cnt is not None:
+            c_dst.copy_(cnt.reshape(r).clamp_max(self.width))
+        else:
+            c_dst.fill_(w)
 
     def put_dense(self, layer_id: int, rows: torch.Tensor, row: int) -> None:
         """A dense-attending prefill row: every position before it (``rows`` its physical rows)."""
@@ -74,6 +83,7 @@ class DFlyTap:
         """Slot ``slots[j]`` takes row buffer row ``rows[j]`` (device int64 tensors)."""
         self.hidden.index_copy_(0, slots, self.hidden_rows.index_select(0, rows))
         self.sel.index_copy_(1, slots, self.sel_rows.index_select(1, rows))
+        self.cnt.index_copy_(1, slots, self.cnt_rows.index_select(1, rows))
 
 
 class Hy4DFlyAttention(Hy4Attention):
@@ -84,6 +94,7 @@ class Hy4DFlyAttention(Hy4Attention):
     def __init__(self, config: ModelConfig, target_layer: int, *, prefix: str = ""):
         super().__init__(config, target_layer, prefix=prefix, indexer=False, fp8=True)
         self._hist: torch.Tensor | None = None  # [n, width] this round's history rows
+        self._hist_cnt: torch.Tensor | None = None  # [n] valid history count per request
         self._positions: torch.Tensor | None = None
 
     def core(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -99,7 +110,8 @@ class Hy4DFlyAttention(Hy4Attention):
         k_rope = apply_rope(kv[:, self._lora :], self._positions, inv_freq)
         q_absorbed = torch.bmm(q[..., : self._nope].transpose(0, 1), w_uk).transpose(0, 1)
         o_latent = get_global_ctx().attn_backend.dfly_attend(
-            torch.cat([q_absorbed, q_pe], dim=-1), self.layer_id, c_kv, k_rope, self._hist, self.sinks
+            torch.cat([q_absorbed, q_pe], dim=-1), self.layer_id, c_kv, k_rope, self._hist, self.sinks,
+            hist_cnt=self._hist_cnt,
         )
         o = torch.bmm(o_latent.transpose(0, 1), self._kv_b()[1], out_dtype=torch.float32).transpose(0, 1)
         return o, gate
@@ -198,7 +210,8 @@ class Hy4DFly(BaseOP):
             layer.self_attn.prepare_for_runtime()
 
     def block_hidden(
-        self, embed, bonus: torch.Tensor, anchor: torch.Tensor, h_target: torch.Tensor, hist: torch.Tensor, t: int
+        self, embed, bonus: torch.Tensor, anchor: torch.Tensor, h_target: torch.Tensor,
+        hist: torch.Tensor, t: int, hist_cnt: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The block pass: ``bonus [n]`` at positions ``anchor [n]``, ``t - 1`` masks after it,
         ``h_target [n, H]``, ``hist [layers, n, width]``. Returns the final-normed ``[n, t, H]``."""
@@ -209,64 +222,179 @@ class Hy4DFly(BaseOP):
         x = torch.cat([self.fusion.forward(x[:, 0].contiguous(), h_target).unsqueeze(1), x[:, 1:]], dim=1).view(n * t, -1)
         positions = (anchor.view(n, 1) + torch.arange(t, device=bonus.device, dtype=anchor.dtype)).view(-1)
         for i, layer in enumerate(self.layers.op_list):
-            layer.self_attn._hist, layer.self_attn._positions = hist[i], positions
+            layer.self_attn._hist = hist[i]
+            layer.self_attn._hist_cnt = None if hist_cnt is None else hist_cnt[i]
+            layer.self_attn._positions = positions
             x = layer.forward(x)
-            layer.self_attn._hist = layer.self_attn._positions = None
+            layer.self_attn._hist = layer.self_attn._hist_cnt = layer.self_attn._positions = None
         return self.final_norm.forward(x).view(n, t, -1)
 
     def forward(
         self, embed, lm_head, bonus: torch.Tensor, anchor: torch.Tensor, h_target: torch.Tensor,
-        hist: torch.Tensor, k: int,
+        hist: torch.Tensor, k: int, *, hist_cnt: torch.Tensor | None = None, draft_vocab=None,
     ) -> torch.Tensor:
         """``k`` greedy drafts per request ``[n, k]`` int32 (row ``j`` of the block predicts
         position ``anchor + j``; row 0 only gives context)."""
-        hid = self.block_hidden(embed, bonus, anchor, h_target, hist, k + 1)
+        hid = self.block_hidden(embed, bonus, anchor, h_target, hist, k + 1, hist_cnt=hist_cnt)
+        use_dv = draft_vocab is not None and draft_vocab.active
         prev = bonus
         out = []
         for s in range(k):
             h = self.hidden_correction.forward(hid[:, s + 1].contiguous(), embed.forward(prev))
-            prev = lm_head.forward_argmax(h)
+            prev = draft_vocab.argmax(h) if use_dv else lm_head.forward_argmax(h)
             out.append(prev)
         return torch.stack(out, dim=1)
 
+    def forward_sampled(
+        self, embed, lm_head, bonus: torch.Tensor, anchor: torch.Tensor, h_target: torch.Tensor,
+        hist: torch.Tensor, hist_cnt: torch.Tensor | None, k: int,
+        temp: torch.Tensor, top_p: torch.Tensor, top_k: torch.Tensor, u: torch.Tensor,
+        draft_vocab=None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``k`` sampled drafts per request: ``(drafts [n, k] int32, cand_ids [n, k, DRAFT_K] int32,
+        cand_q [n, k, DRAFT_K] fp32)`` drawn from the draft head's truncated distribution for
+        exact rejection sampling (``speculative_accept``). ``u`` is ``[n, k, DRAFT_K]`` uniforms."""
+        from freetoken.engine.draft_sample import candidates, sample
+
+        hid = self.block_hidden(embed, bonus, anchor, h_target, hist, k + 1, hist_cnt=hist_cnt)
+        use_dv = draft_vocab is not None and draft_vocab.active
+        comm = getattr(lm_head, "_comm", None)
+        tp_size = lm_head.tp_size
+        if not use_dv:
+            start, count = lm_head.vocab_range
+            full_ids = torch.arange(start, start + count, dtype=torch.int32, device=bonus.device)
+        prev = bonus
+        drafts, cids, qs = [], [], []
+        for s in range(k):
+            h = self.hidden_correction.forward(hid[:, s + 1].contiguous(), embed.forward(prev))
+            if use_dv:
+                logits, ids = draft_vocab.local_logits(h), draft_vocab.ids
+            else:
+                logits, ids = lm_head._logits(h)[:, :count], full_ids
+            vals, cid = candidates(logits, ids, comm, tp_size)
+            prev, q = sample(vals, cid, temp, top_p, top_k, u[:, s])
+            drafts.append(prev)
+            cids.append(cid)
+            qs.append(q)
+        return torch.stack(drafts, dim=1), torch.stack(cids, dim=1), torch.stack(qs, dim=1)
+
 
 class DFlyGraphs:
-    """CUDA graphs of the whole draft (block pass + ``k`` correction / argmax steps), one per
-    padded batch size and draft count; padding rows read the dummy table row's state."""
+    """CUDA graphs of the whole draft (block pass + ``k`` correction / argmax or sampled steps),
+    one per padded batch size, draft count, greedy/sampled, and full/draft-vocab head; padding
+    rows read the dummy table row's state."""
 
-    def __init__(self, draft, bs_list, ks, pad_slot: int, device: torch.device, stream, pool) -> None:
+    def __init__(
+        self, draft, bs_list, ks, pad_slot: int, device: torch.device, stream, pool,
+        *, draft_sampled=None, draft_vocab=None,
+    ) -> None:
+        from freetoken.engine.draft_sample import DRAFT_K
         from freetoken.engine.graph import upload_graph
 
         self.bs_list = sorted(bs_list)
         n = self.bs_list[-1]
+        ks = list(ks)
+        max_k = max(ks)
         self.pad_slot = pad_slot
         self.slots = torch.full((n,), pad_slot, dtype=torch.int64, device=device)
         self.bonus = torch.zeros(n, dtype=torch.int32, device=device)
         self.anchor = torch.zeros(n, dtype=torch.int64, device=device)
-        self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
-        self.out: dict[tuple[int, int], torch.Tensor] = {}
-        for bs in self.bs_list:
-            for k in ks:
-                args = (self.slots[:bs], self.bonus[:bs], self.anchor[:bs], k)
-                draft(*args)  # eager warmup: kernel compiles and autotune outside the capture
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g, pool=pool, stream=stream):
-                    self.out[(bs, k)] = draft(*args)
-                upload_graph(g, stream)
-                self.graphs[(bs, k)] = g
+        self.temp = torch.zeros(n, dtype=torch.float32, device=device)
+        self.top_p = torch.ones(n, dtype=torch.float32, device=device)
+        self.top_k = torch.full((n,), DRAFT_K, dtype=torch.int64, device=device)
+        self.u = torch.full((n, max_k, DRAFT_K), 0.5, dtype=torch.float32, device=device)
+        # Static outputs live outside the shared graph pool so a subsequent verify-graph replay
+        # (which shares ``graph_runner.pool``) cannot overwrite cand_ids / cand_q before accept.
+        self.out_drafts = torch.zeros((n, max_k), dtype=torch.int32, device=device)
+        self.out_cand_ids = torch.zeros((n, max_k, DRAFT_K), dtype=torch.int32, device=device)
+        self.out_cand_q = torch.zeros((n, max_k, DRAFT_K), dtype=torch.float32, device=device)
+        self.graphs: dict[tuple[int, int, bool, bool], torch.cuda.CUDAGraph] = {}
 
-    def can_use(self, n: int, k: int) -> bool:
-        return n <= self.bs_list[-1] and (self.bs_list[-1], k) in self.graphs
+        def _capture_one(key, fn):
+            nonlocal pool
+            fn()  # eager warmup: kernel compiles and autotune outside the capture
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=pool, stream=stream):
+                fn()
+            upload_graph(g, stream)
+            if pool is None:
+                pool = g.pool()
+            self.graphs[key] = g
 
-    def run(self, slots: torch.Tensor, bonus: torch.Tensor, anchor: torch.Tensor, k: int) -> torch.Tensor:
+        dv_modes = (False, True) if draft_vocab is not None else (False,)
+        for use_dv in dv_modes:
+            dv = draft_vocab if use_dv else None
+            saved_active = dv.active if dv is not None else False
+            saved_id0 = int(dv.ids[0].item()) if (dv is not None and not saved_active) else -1
+            if dv is not None and not saved_active:
+                # Seed one valid row during capture so argmax/sample never emit token -1 or NaN.
+                dv.ids[0] = dv.start
+                dv.active = True
+            try:
+                for bs in self.bs_list:
+                    for k in ks:
+                        def _greedy(bs=bs, k=k, dv=dv):
+                            d = draft(self.slots[:bs], self.bonus[:bs], self.anchor[:bs], k, draft_vocab=dv)
+                            self.out_drafts[:bs, :k].copy_(d)
+
+                        _capture_one((bs, k, False, use_dv), _greedy)
+                        if draft_sampled is not None:
+                            def _sampled(bs=bs, k=k, dv=dv):
+                                d, cid, cq = draft_sampled(
+                                    self.slots[:bs], self.bonus[:bs], self.anchor[:bs], k,
+                                    self.temp[:bs], self.top_p[:bs], self.top_k[:bs], self.u[:bs, :k],
+                                    draft_vocab=dv,
+                                )
+                                self.out_drafts[:bs, :k].copy_(d)
+                                self.out_cand_ids[:bs, :k].copy_(cid)
+                                self.out_cand_q[:bs, :k].copy_(cq)
+
+                            _capture_one((bs, k, True, use_dv), _sampled)
+            finally:
+                if dv is not None and not saved_active:
+                    dv.ids[0] = saved_id0
+                    dv.active = False
+
+    def can_use(self, n: int, k: int, *, sampled: bool = False, use_dv: bool = False) -> bool:
+        return n <= self.bs_list[-1] and (self.bs_list[-1], k, sampled, use_dv) in self.graphs
+
+    def run(
+        self, slots: torch.Tensor, bonus: torch.Tensor, anchor: torch.Tensor, k: int,
+        *, use_dv: bool = False,
+    ) -> torch.Tensor:
         n = slots.shape[0]
         bs = next(b for b in self.bs_list if b >= n)
         self.slots[:bs].fill_(self.pad_slot)
         self.slots[:n].copy_(slots)
         self.bonus[:n].copy_(bonus)
         self.anchor[:n].copy_(anchor)
-        self.graphs[(bs, k)].replay()
-        return self.out[(bs, k)][:n]
+        self.graphs[(bs, k, False, use_dv)].replay()
+        return self.out_drafts[:n, :k].clone()
+
+    def run_sampled(
+        self, slots: torch.Tensor, bonus: torch.Tensor, anchor: torch.Tensor, k: int,
+        temp: torch.Tensor, top_p: torch.Tensor, top_k: torch.Tensor, u: torch.Tensor,
+        *, use_dv: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        n = slots.shape[0]
+        bs = next(b for b in self.bs_list if b >= n)
+        self.slots[:bs].fill_(self.pad_slot)
+        self.slots[:n].copy_(slots)
+        self.bonus[:n].copy_(bonus)
+        self.anchor[:n].copy_(anchor)
+        self.temp[:bs].zero_()
+        self.temp[:n].copy_(temp)
+        self.top_p[:bs].fill_(1.0)
+        self.top_p[:n].copy_(top_p)
+        self.top_k[:bs].fill_(self.u.shape[-1])
+        self.top_k[:n].copy_(top_k)
+        self.u[:n, :k].copy_(u)
+        self.graphs[(bs, k, True, use_dv)].replay()
+        return (
+            self.out_drafts[:n, :k].clone(),
+            self.out_cand_ids[:n, :k].clone(),
+            self.out_cand_q[:n, :k].clone(),
+        )
 
 
 # the dense SwiGLU width of the released drafter (read from the weights; not in config.json)

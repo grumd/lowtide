@@ -1,8 +1,8 @@
 """FTW PLE source resolution + verbatim detection (CPU-only).
 
-A self-contained FTW carries the PLE n-gram table as ``model-plefp8-*`` side tables; an
-older/partial FTW may not, so the loader falls back to the raw source recorded in the
-FTW index instead of failing the serve.
+A self-contained FTW carries the PLE n-gram table in ``engram/`` (older FTWs next to the
+shards); an older/partial FTW may not carry it at all, so the loader falls back to the raw
+source recorded in the FTW index instead of failing the serve.
 """
 
 from __future__ import annotations
@@ -52,6 +52,29 @@ def test_ftw_without_side_tables_falls_back_to_source(tmp_path):
 def test_ftw_with_side_tables_uses_itself(tmp_path):
     ftw = tmp_path / "ftw"
     ftw.mkdir()
+    _ftw_dir(str(ftw), "/nonexistent")
+    save_file(
+        {f"{PREFIX}.shard_0.weight": torch.zeros(2, 4, dtype=torch.float8_e4m3fn)},
+        str(ftw / "model-plefp8-00000.safetensors"),
+    )
+    assert ple_source_folder(str(ftw)) == str(ftw)
+
+
+def test_ftw_engram_dir_wins_over_root_tables(tmp_path):
+    ftw = tmp_path / "ftw"
+    (ftw / "engram").mkdir(parents=True)
+    _ftw_dir(str(ftw), "/nonexistent")
+    for d in (ftw, ftw / "engram"):
+        save_file(
+            {f"{PREFIX}.shard_0.weight": torch.zeros(2, 4, dtype=torch.float8_e4m3fn)},
+            str(d / "model-00016-of-00017.safetensors"),
+        )
+    assert ple_source_folder(str(ftw)) == str(ftw / "engram")
+
+
+def test_ftw_empty_engram_dir_falls_back_to_root_tables(tmp_path):
+    ftw = tmp_path / "ftw"
+    (ftw / "engram").mkdir(parents=True)
     _ftw_dir(str(ftw), "/nonexistent")
     save_file(
         {f"{PREFIX}.shard_0.weight": torch.zeros(2, 4, dtype=torch.float8_e4m3fn)},
