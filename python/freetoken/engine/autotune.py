@@ -43,7 +43,7 @@ def snap(share: float) -> int:
 
 
 class ShareTuner:
-    """Feed ``block_done`` the mean step time of each block run at ``arm()``. A search tries the
+    """Feed ``block_done`` the median step time of each block run at ``arm()``. A search tries the
     neighbours of the current share and plain decode (any split share pays a CPU handshake per
     layer that plain decode does not, so plain can win past a share that loses to its neighbour);
     after a move it keeps going the same way (and tries plain again). Settled, it searches again after ``RECHECK`` steps,
@@ -157,6 +157,11 @@ class CutoffTuner:
             target = math.inf if gap > 0 else 0.0
         if up_only and m < s[0] + s[1] * t:  # a lower bound, unless that routed chunk lost
             target = max(target, self.cutoff)
+        # routed time grows faster than linearly, so a line through small chunks says little about
+        # sizes far past them: raise the cutoff at most to twice the largest routed chunk
+        top = max(self._pts(True), default=(0, 0.0))[0]
+        if target > self.cutoff:
+            target = min(target, max(self.cutoff, 2 * top))
         new = min(max(target, self.cutoff / CUTOFF_STEP), self.cutoff * CUTOFF_STEP)
         new = int(min(max(new, self.lo), self.hi)) // 128 * 128
         if abs(new - self.cutoff) < 0.05 * self.cutoff:
@@ -244,6 +249,7 @@ class AutoTune:
         self.block: list[float] = []
         self.block_key = None
         self.applied = None
+        self.prev = None  # the last forward if it was a timed decode step: (size, arm, start event)
         if self.share is not None:
             self._apply(self.share.arm())
         if cutoff is not None:
@@ -257,19 +263,25 @@ class AutoTune:
             ms = rec[-1].elapsed_time(end)
             (self._step if rec[0] == "decode" else self._chunk)(rec[1], rec[2], ms)
         if batch.is_decode and self.share is not None and graph:
-            rec = ("decode", batch.size, self.applied)
-        elif batch.is_prefill and self.cutoff is not None:
-            tokens = len(batch.input_ids)
-            routed = self.cutoff.routed(tokens)
-            # this chunk's path, which may differ from the cutoff's while the tuner explores
-            cut = self.cutoff.cutoff
-            self.cache.routed_prefill_tokens = max(cut, tokens) if routed else min(cut, tokens - 1)
-            rec = ("prefill", tokens, routed)
-        else:
+            # a decode step lasts from its start to the next one's, so the time includes the host
+            # work between forwards (sampling, scheduling), which the CPU split's workers can slow
+            start = torch.cuda.Event(enable_timing=True)
+            start.record()
+            prev, self.prev = self.prev, (batch.size, self.applied, start)
+            if prev is not None and prev[:2] == self.prev[:2]:
+                self.pending.append((self.n, ("decode", batch.size, self.applied, prev[2]), start))
             return None
+        self.prev = None
+        if not (batch.is_prefill and self.cutoff is not None):
+            return None
+        tokens = len(batch.input_ids)
+        routed = self.cutoff.routed(tokens)
+        # this chunk's path, which may differ from the cutoff's while the tuner explores
+        cut = self.cutoff.cutoff
+        self.cache.routed_prefill_tokens = max(cut, tokens) if routed else min(cut, tokens - 1)
         start = torch.cuda.Event(enable_timing=True)
         start.record()
-        return (*rec, start)
+        return ("prefill", tokens, routed, start)
 
     def after(self, rec) -> None:
         if rec is not None:
@@ -293,10 +305,11 @@ class AutoTune:
         if len(self.block) < BLOCK:
             return
         t = self.share
-        mean = self._max(sum(self.block) / BLOCK) if t.cand is not None else 0.0
+        # the median drops a step that waited on something else (a new request, a slow sample)
+        mid = self._max(sorted(self.block)[BLOCK // 2]) if t.cand is not None else 0.0
         self.block = []
         old = LADDER[t.cur]
-        if t.block_done(mean):
+        if t.block_done(mid):
             logger.info_rank0(f"autotune: --moe-decode-fetch {_share(old)} -> {_share(LADDER[t.cur])} "
                               f"({t.last[1]:.2f} vs {t.last[0]:.2f} ms per decode step)")
         self._apply(t.arm())

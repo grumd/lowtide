@@ -111,7 +111,7 @@ def test_cutoff_steps_are_bounded():
     t = CutoffTuner(2048, lo=52, hi=16384)
     t.warm = {True: True, False: True}
     t.observe(3000, False, 10000.0)
-    assert t.observe(1000, True, 100.0)  # routed hugely faster: one step only
+    assert t.observe(1600, True, 100.0)  # routed hugely faster: one step only
     assert t.cutoff == int(2048 * at.CUTOFF_STEP) // 128 * 128
 
 
@@ -209,3 +209,38 @@ def test_cutoff_hy4_chunks_of_4096_and_remainders():
             r = t.routed(tokens)
             t.observe(tokens, r, hy4(tokens, r) * (1 + rng.gauss(0, 0.03)))
     assert 1400 < t.cutoff < 2400
+
+
+@pytest.mark.parametrize("verify", [0.0, 0.3, 1.0])
+def test_glue_counts_the_host_time_between_decode_steps(monkeypatch, verify):
+    # the split's forward is shorter, but its CPU workers slow the host work before the next step;
+    # n-gram / MTP verify windows (always split, and not seen by the glue) fall between some or all
+    # decode steps
+    monkeypatch.setattr(at.torch.cuda, "Event", FakeEvent)
+    rng = random.Random(4)
+    cache = FakeCache()
+    tune = AutoTune(cache, None, snap(0.5), None)
+    decode = SimpleNamespace(is_decode=True, is_prefill=False, size=1)
+    prefill = SimpleNamespace(is_decode=False, is_prefill=True, input_ids=[0] * 100)
+    for i in range(3000):
+        batch = prefill if i % 200 == 0 else decode  # a new request now and then: a long gap
+        rec = tune.before(batch, batch is decode)
+        FakeEvent.clock[0] += 9.0 if cache.cpu_decode_on else 10.0
+        tune.after(rec)
+        FakeEvent.clock[0] += 2.5 if cache.cpu_decode_on else 0.5
+        if rng.random() < verify:
+            FakeEvent.clock[0] += 14.0
+        if batch is prefill:
+            FakeEvent.clock[0] += 500.0
+    assert not cache.cpu_decode_on
+
+
+def test_cutoff_rises_at_most_to_twice_the_largest_routed_chunk():
+    t = CutoffTuner(2048, lo=52, hi=16384)
+    t.warm = {True: True, False: True}
+    t.observe(1000, True, 1100.0)
+    t.observe(1800, True, 1250.0)  # a flat routed line: crosses streamed far out
+    t.observe(2800, False, 2000.0)
+    assert t.cutoff == 3072
+    t.observe(3500, False, 2040.0)
+    assert t.cutoff == 3584  # not 4608: no routed chunk past 1800 yet
