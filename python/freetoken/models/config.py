@@ -404,6 +404,9 @@ class ModelConfig:
     # the compressed-indexer geometry, the LatentMoE widths, the identity-HC knobs and the
     # Engram hash geometry. Opaque to model-agnostic engine code; None for every other model.
     hy4_args: Any | None = None
+    # Ling-3.2 (bailing_moe_v3) payload (BailingV3Args): the KDA / MLA dims, the layer layout and the
+    # per-layer expert clamps. Opaque to model-agnostic engine code; None for every other model.
+    bailing_args: Any | None = None
     # Gemma-4 E2B / E4B payload (Gemma4EArgs): per-layer input embeddings and KV-shared
     # layers. Opaque to model-agnostic engine code; None for every other model.
     gemma4_e_args: Any | None = None

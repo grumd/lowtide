@@ -83,6 +83,10 @@ _GLM5_NEXT_PACKED = _EXPERTS_PACKED + (
 )
 _GLM5_NEXT_PROCESSOR = "freetoken.mm.processors.glm5_next:Glm5NextMMProcessor"
 _GLM5_NEXT_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+# Ling-3.2's KDA fuses its five head-structured input projections; b_proj stays its own bf16 linear.
+_BAILING_V3_PACKED = _DENSE_PACKED + _EXPERTS_PACKED + (
+    ("in_proj", ("q_proj", "k_proj", "v_proj", "f_proj", "g_proj")),
+)
 # Gemma 4 keeps HF's flat layer children (mlp / experts / router) under one feed_forward block.
 _GEMMA4_SEGMENTS = (
     ("feed_forward.shared_mlp", "mlp"),
@@ -571,6 +575,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     "HYV4FlashForConditionalGeneration": ModelSpec("freetoken.models.hy4", "Hy4ForCausalLM"),
     # Text-only sibling (the text_config's own architectures entry).
     "HYV4FlashForCausalLM": ModelSpec("freetoken.models.hy4", "Hy4ForCausalLM"),
+    # Ling-3.2 (model_type bailing_moe_v3_vl): hybrid KDA (35/42 layers) + gated MLA with 64-dim
+    # interleaved rope, 512-expert sigmoid/noaux_tc MoE with per-layer post-silu clamps; text tower at
+    # bare model.*, served text-only. The release's FP8 declaration is dropped by adjust_hf_config.
+    "BailingMoeV3VLForConditionalGeneration": ModelSpec(
+        "freetoken.models.bailing_v3",
+        "BailingV3ForCausalLM",
+        packed_modules_mapping=_BAILING_V3_PACKED,
+    ),
     # llama.cpp glm5-next GGUF (unsloth GLM-5.3-Flash-GGUF): the same model classes
     # with every tensor in its packed ggml type; a glm5v mmproj adds the vision tower
     "Glm5NextGGUFForCausalLM": ModelSpec(

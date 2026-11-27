@@ -131,6 +131,10 @@ def create_dsa_backend(config: ModelConfig):
         from freetoken.models.hy4.backend import Hy4AttnBackend
 
         return Hy4AttnBackend(config)
+    if getattr(config, "bailing_args", None) is not None:
+        from freetoken.models.bailing_v3.backend import BailingV3AttnBackend
+
+        return BailingV3AttnBackend(config)
     # MLA with a grouped index (index_ratio > 1) is the kpool indexer layout.
     if any(s.mla and s.index_ratio > 1 for s in config.kv_cache_group_specs()):
         from .dsa_indexer_kpool import Glm5NextDSABackend

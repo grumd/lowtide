@@ -295,6 +295,18 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         aliases=("zai-org/GLM-5.3-Flash", "LibertAIDAI/GLM-5.3-Flash-NVFP4"),
     ),
     AotModel(
+        # Ling-3.2-air: hybrid KDA + gated MLA on the DSA backend's dense path (no paged-KV store
+        # groups); the KDA state lives in the LinearStatePool.
+        name="inclusionAI/Ling-3.2-air",
+        architecture="BailingMoeV3VLForConditionalGeneration",
+        hidden_size=2560,
+        kv_groups=(),
+        top_k=8,
+        moe_intermediate_size=768,
+        expert_formats=_NVFP4_FORMATS,
+        aliases=("primitive-ai/Ling-3.2-air-NVFP4A16",),
+    ),
+    AotModel(
         # Hy4-flash: MLA latent on the DSA backend like GLM-5.3 (no paged-KV store groups).
         # No expert formats yet: banks size from the 1536 latent, not hidden_size, and the
         # served 4-bit format is not settled.

@@ -43,7 +43,7 @@ GENERIC_TOOL_CALL_FALLBACK = "llama3"
 NO_DEDICATED_TOOL_FORMAT = {"LlamaForCausalLM", "LlamaGGUFForCausalLM"}
 
 # Architectures registered before their parsers exist; empty once every family is wired.
-PARSERS_PENDING: set[str] = set()
+PARSERS_PENDING: set[str] = {"BailingMoeV3VLForConditionalGeneration"}  # Ling-3.2: parsers come with serving glue
 
 
 class _Config:
