@@ -2,10 +2,9 @@
 
 Resolved once, in the launching process, so every TP rank gets the same answer and the
 "Parsed arguments" line shows it. An explicit flag (or its FREETOKEN_* variable) always wins.
+(The CPU-assist knobs --moe-decode-fetch and --moe-routed-prefill-tokens are tuned at runtime
+instead, by engine/autotune.py.)
 
-- ``--moe-routed-prefill-tokens`` / ``--moe-decode-fetch``: the model family's measured values
-  for the GPU count (``SERVE_DEFAULTS`` in the family's package), with ``--moe-strategy offload``;
-  the decode share only for NVFP4 / W4A16 experts the CPU kernel can compute.
 - ``--moe-vram-only`` (the RAM saver): on when the expert banks plus the server's own host RAM
   do not fit in the RAM free at start (and under the cgroup limit).
 - ``--prefill-batch-max``: where the saver is on because RAM is short, the free RAM sits near
@@ -18,7 +17,6 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Mapping
 
 from freetoken.utils import init_logger
 
@@ -30,9 +28,6 @@ SERVER_HOST_BYTES = 8 << 30
 # A long prompt may take the RAM the saver keeps free down to this much.
 CHUNK_RAM_MARGIN = 2 << 30
 CHUNK_STEP = 1024
-
-ROUTED_PREFILL_ENV = "FREETOKEN_MOE_ROUTED_PREFILL_TOKENS"
-DECODE_FETCH_ENV = "FREETOKEN_MOE_DECODE_FETCH"
 
 
 @dataclass(frozen=True)
@@ -78,24 +73,13 @@ def ftw_bank_bytes(model_path: str) -> int:
     return sum(t["nbytes"] for t in index.get("tensors", ()) if t.get("kind") == "experts_bank")
 
 
-def family_serve_defaults(module: str, tp_size: int) -> Mapping[str, Any]:
-    from freetoken.models.register import _load_attr
-
-    try:
-        table = _load_attr(module, "SERVE_DEFAULTS")
-    except AttributeError:
-        return {}
-    return table.get(tp_size, {})
-
-
 def resolve_serving_defaults(kwargs: dict, *, chunk_explicit: bool, tp_size: int) -> None:
-    """Fill the unset settings above into ``kwargs`` (parse_args' ServerArgs fields; env-backed
-    ones into os.environ) and log what was picked. A no-op for checkpoints it cannot read."""
-    from freetoken.checkpoint.ftw import ftw_quant_format, is_ftw_checkpoint
+    """Fill the unset settings above into ``kwargs`` (parse_args' ServerArgs fields) and log what
+    was picked. A no-op for checkpoints it cannot read."""
+    from freetoken.checkpoint.ftw import is_ftw_checkpoint
     from freetoken.distributed import DistributedInfo
     from freetoken.engine.cache_budget import prefill_workspace
     from freetoken.engine.config import EngineConfig
-    from freetoken.models.register import get_model_spec
 
     path = kwargs["model_path"]
     if kwargs.get("use_dummy_weight") or not os.path.isdir(path):
@@ -103,7 +87,6 @@ def resolve_serving_defaults(kwargs: dict, *, chunk_explicit: bool, tp_size: int
     try:
         config = EngineConfig(model_path=path, tp_info=DistributedInfo(0, tp_size), dtype=None)
         model_config = config.model_config
-        spec = get_model_spec(config.hf_config.architectures[0])
     except Exception as exc:  # GGUF and other layouts the family readers resolve later
         logger.debug(f"auto settings skipped: {exc}")
         return
@@ -111,18 +94,6 @@ def resolve_serving_defaults(kwargs: dict, *, chunk_explicit: bool, tp_size: int
         return
     offload = kwargs["moe_strategy"] == "offload" and not kwargs.get("moe_cpu_layers")
     picked: list[str] = []
-
-    measured = family_serve_defaults(spec.module, tp_size) if offload else {}
-    routed = measured.get("moe_routed_prefill_tokens")
-    if routed is not None and not os.environ.get(ROUTED_PREFILL_ENV, "").strip():
-        os.environ[ROUTED_PREFILL_ENV] = str(routed)
-        picked.append(f"--moe-routed-prefill-tokens {routed}")
-    fetch = measured.get("moe_decode_fetch")
-    fmt = ftw_quant_format(path)
-    if fetch is not None and not os.environ.get(DECODE_FETCH_ENV, "").strip() and _cpu_decodes(fmt, kwargs):
-        os.environ[DECODE_FETCH_ENV] = str(fetch)
-        picked.append(f"--moe-decode-fetch {fetch:g}")
-
     ftw = is_ftw_checkpoint(path)
     bank_bytes = ftw_bank_bytes(path) if ftw else 0
     if bank_bytes:
@@ -164,14 +135,3 @@ def resolve_serving_defaults(kwargs: dict, *, chunk_explicit: bool, tp_size: int
         kwargs["moe_vram_only"] = plan.vram_only
     if picked:
         logger.info(f"auto settings for {model_config.model_type} on {tp_size} GPU(s): " + ", ".join(picked))
-
-
-def _cpu_decodes(fmt: str | None, kwargs: dict) -> bool:
-    """CPU-assisted decode computes NVFP4 and W4A16 experts (W4A16 with AVX-512 BF16)."""
-    if os.environ.get("FREETOKEN_MOE_VERIFY_CPU") == "1" or fmt not in ("nvfp4", "w4a16"):
-        return False
-    if fmt == "w4a16":
-        from freetoken.moe.wna16_cpu_prefill import cpu_supported
-
-        return cpu_supported()
-    return True

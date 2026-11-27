@@ -164,7 +164,7 @@ class GraphRunner:
         # same addresses -- reading it after g.replay() yields the CURRENT step's
         # streams without breaking the graph (same trick as the logits buffer,
         # minus the copy: the captured kernels write hidden anyway).
-        self.mtp_streams_map: Dict[int, "torch.Tensor"] = {}
+        self.mtp_streams_map: Dict[tuple[int, bool], "torch.Tensor"] = {}
         self.dummy_req = dummy_req
         self.moe_offload_cache = moe_offload_cache
         self.mrope = mrope
@@ -203,7 +203,7 @@ class GraphRunner:
         # reads it as an indeterminate phase and animates the bar. Must precede the
         # graphs-disabled early return so that config gets the phase too.
         emit_progress("Capturing CUDA graphs / warming up", 0, 0)
-        self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        self.graph_map: Dict[tuple[int, bool], torch.cuda.CUDAGraph] = {}
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
@@ -231,7 +231,10 @@ class GraphRunner:
             disable=not get_tp_info().is_primary(),  # disable for non-primary ranks
         )
         pool = self.graph_pool
-        for bs in pbar:
+        cache = self.moe_offload_cache
+        # one graph per CPU-assisted decode setting the share tuner may switch between
+        variants = cache.decode_variants() if hasattr(cache, "decode_variants") else (True,)
+        for bs, on in ((bs, on) for bs in pbar for on in variants):
             free_memory = get_free_memory(self.device)
             pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
             pbar.refresh()
@@ -244,6 +247,8 @@ class GraphRunner:
             self.buffer.set_batch(batch)
             if self.linear_backend is not None:
                 self.linear_backend.prepare_for_capture(batch)
+            if len(variants) > 1:
+                was, cache.cpu_decode_on = cache.cpu_decode_on, on
             with get_global_ctx().forward_batch(batch, **self.ctx_override):
                 self._store_output(bs, self.forward())
                 # Keep the offload cache warmed for capture. Resetting here forces
@@ -252,10 +257,12 @@ class GraphRunner:
                     self._store_output(bs, self.forward())
                 _upload_graph(graph, self.stream)
                 self._reset_moe_offload_cache()
+            if len(variants) > 1:
+                cache.cpu_decode_on = was
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
-            self.graph_map[bs] = graph
-            self.mtp_streams_map[bs] = getattr(batch, "mtp_streams", None)
+            self.graph_map[bs, on] = graph
+            self.mtp_streams_map[bs, on] = getattr(batch, "mtp_streams", None)
         self.graph_pool = pool
 
         self.pool = pool
@@ -274,7 +281,7 @@ class GraphRunner:
         assert self.can_use_cuda_graph(batch) and self._out is not None
         self.buffer.copy_from(batch)
         padded = batch.padded_size
-        g = self.graph_map[padded]
+        g = self.graph_map[padded, self._variant()]
         self.attn_backend.prepare_for_replay(batch)
         if self.linear_backend is not None:
             self.linear_backend.prepare_for_replay(batch)
@@ -287,8 +294,11 @@ class GraphRunner:
     def mtp_streams(self, batch: Batch):
         """The replayed step's pre-mixer residual streams ([bs, hc*hidden]), or None
         when the model does not stash them. Valid only right after replay()."""
-        t = self.mtp_streams_map.get(batch.padded_size)
+        t = self.mtp_streams_map.get((batch.padded_size, self._variant()))
         return t[: batch.size] if t is not None else None
+
+    def _variant(self) -> bool:
+        return getattr(self.moe_offload_cache, "cpu_decode_on", True)
 
     def pad_batch(self, batch: Batch) -> None:
         padded_size = (  # choose the first available batch size

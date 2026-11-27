@@ -111,6 +111,11 @@ class Wna16CpuPrefill:
         # FREETOKEN_WNA16_CPU_PREFILL_STATS=1: one log line per prefill forward
         self.stats = {} if os.environ.get("FREETOKEN_WNA16_CPU_PREFILL_STATS") == "1" else None
 
+    def resize(self, max_tokens: int) -> None:
+        """Room for chunks of up to ``max_tokens`` (rounded up to 1024): the routed-prefill cutoff
+        was raised at runtime (engine/autotune.py)."""
+        self._init_buffers(self.impl, self.hidden, self.top_k, -(-max_tokens // 1024) * 1024)
+
     def record(self, layer_id: int, tokens: int, routed: int, fetched: int, cpu_experts: int,
                cpu_s: float, gpu_busy: bool) -> None:
         st = self.stats

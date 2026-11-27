@@ -1516,12 +1516,9 @@ def parse_args(
             "experts through the GPU expert cache (the CPU computing part of the misses, see "
             "--moe-prefill-fetch) instead of streaming every expert of every layer over PCIe. "
             "Cuts the fixed per-chunk stream on PCIe-bound boxes; past the cutoff the overlapped "
-            "stream wins again. The best cutoff depends on the PCIe link, the CPU and the GPU "
-            "count (about 1280 with --moe-prefill-fetch 1 on Qwen3.8-Flash-Next); time your prompt "
-            "sizes to tune it, or use scripts/calibrate.sh. Default with --moe-strategy offload: the "
-            "model's value measured on RTX 3080s at PCIe 4.0 x8 with a Ryzen 7 9800X3D "
-            "(Qwen3.8-Flash-Next 4096 on one GPU, 3072 on two; Hy4-flash 2048 / 1069); other models 0 "
-            "(only extends under tokens * top_k < num_experts)."
+            "stream wins again. Unset: where the CPU computes part of a routed chunk, tuned at "
+            "runtime from measured chunk times (routed vs streamed); otherwise 0 (only extends under "
+            "tokens * top_k < num_experts). Setting it fixes the cutoff."
         ),
     )
     parser.add_argument(
@@ -1548,9 +1545,9 @@ def parse_args(
             "With --moe-strategy offload and NVFP4 or W4A16 experts: the share (0-1) of each decode step's "
             "expert-cache misses fetched over PCIe into the cache; the CPU computes the rest from "
             "the pinned banks while the GPU runs the hits. 1 = every miss over PCIe, "
-            "0 = every miss on the CPU (the cache then only changes during prefill). Default with "
-            "--moe-strategy offload: the model's measured share (Qwen3.8-Flash-Next 0.1 on one GPU; "
-            "Hy4-flash 0.1), else 1."
+            "0 = every miss on the CPU (the cache then only changes during prefill). Unset: where "
+            "the CPU kernel runs, the share (or plain decode) is tuned at runtime from measured "
+            "decode step times; setting it fixes the share."
         ),
     )
     parser.add_argument(

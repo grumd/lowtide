@@ -6,6 +6,7 @@ import errno
 import gc
 import math
 import os
+import time
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -1062,6 +1063,11 @@ class Engine:
                 self.max_seq_len = limit
         if self.moe_offload_cache is not None and self.moe_offload_cache.pooled:
             self._seed_vram_only()
+        self.autotune = None
+        if getattr(self, "_autotune_start", None) is not None:
+            from freetoken.engine.autotune import AutoTune
+
+            self.autotune = AutoTune(self.moe_offload_cache, *self._autotune_start)
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -1598,6 +1604,7 @@ class Engine:
             attach_locked_fetch(cache, config, staging, self._profile_layer_rows)
         self._maybe_init_wna16_cpu_prefill(cache, layers)
         self._maybe_init_cpu_decode(config, cache, layers)
+        self._probe_autotune(config, cache)
         self.moe_offload_cache = cache
         logger.info_rank0(
             f"MoE: strategy={config.moe_strategy} decode_target={cache.decode_target} "
@@ -1782,17 +1789,55 @@ class Engine:
         cache.cpu_prefill = executor
         cache.cpu_prefill_fetch = fetch
 
+    def _probe_autotune(self, config: EngineConfig, cache) -> None:
+        """Starting values for the CPU-assist knobs whose flags are unset (engine/autotune.py),
+        from a probe of the expert fetch and the CPU kernel; the tuners take over at runtime. The
+        routed-prefill cutoff is tuned only where the CPU computes part of a routed chunk; without
+        that it stays at the flag's value (0 when unset), so --moe-prefill-fetch 1
+        --moe-decode-fetch 1 runs stay bit-reproducible."""
+        from freetoken.engine import autotune
+        from freetoken.layers.moe import _ROUTED_PREFILL_TOKENS
+
+        cache.routed_prefill_tokens = _ROUTED_PREFILL_TOKENS
+        self._autotune_start = None
+        tune_cutoff = cache.cpu_prefill is not None and not os.environ.get(
+            "FREETOKEN_MOE_ROUTED_PREFILL_TOKENS", "").strip()
+        if not (tune_cutoff or cache.decode_fetch_tuned):
+            return
+        group = self.tp_cpu_group if config.tp_info.size > 1 else None
+        t0 = time.perf_counter()
+        probe = autotune.probe(cache, group)
+        took = time.perf_counter() - t0
+        share = cutoff = None
+        if cache.decode_fetch_tuned:
+            share = autotune.snap(probe.share()) if probe is not None else autotune.snap(0.25)
+        if tune_cutoff:
+            e, k = cache.num_experts, cache.cpu_prefill.top_k
+            lo = -(-e // k)
+            hi = max(lo, config.prefill_batch_max)
+            start = int(min(max(probe.cutoff(e, k, cache.cpu_prefill_fetch), lo), hi)) // 128 * 128
+            cutoff = autotune.CutoffTuner(max(start, lo), lo, hi)
+        self._autotune_start = (group, share, cutoff)
+        if probe is not None:
+            logger.info_rank0(
+                f"autotune probe ({took * 1e3:.0f} ms): expert fetch {probe.fetch_us:.0f} us, CPU kernel "
+                f"{probe.cpu_us:.0f} us + {probe.cpu_token_us:.1f} us/token per expert; starting at"
+                + (f" --moe-decode-fetch {autotune.LADDER[share]:g}" if share is not None else "")
+                + (f" --moe-routed-prefill-tokens {cutoff.cutoff}" if cutoff is not None else "")
+            )
+
     def _maybe_init_cpu_decode(self, config: EngineConfig, cache, layers) -> None:
         """FREETOKEN_MOE_DECODE_FETCH (--moe-decode-fetch) < 1: decode fetches that share of its
         expert-cache misses over PCIe and computes the rest on this rank's CPU cores, straight
-        from the pinned banks (OffloadMoELayer._decode_cpu_split)."""
+        from the pinned banks (OffloadMoELayer._decode_cpu_split). Unset: the same where it can
+        run, with the share (or plain decode) picked at runtime by measured step times
+        (engine/autotune.py)."""
         raw = os.environ.get("FREETOKEN_MOE_DECODE_FETCH", "").strip()
-        if not raw:
-            return
-        fetch = float(raw)
+        tuned = not raw
+        fetch = float(raw) if raw else 1.0
         if not 0.0 <= fetch <= 1.0:
             raise ValueError(f"--moe-decode-fetch must be in [0, 1], got {fetch}")
-        if fetch >= 1.0:
+        if fetch >= 1.0 and not tuned:
             return
         from freetoken.moe.wna16_cpu_prefill import cpu_supported as wna16_cpu_supported
 
@@ -1813,7 +1858,10 @@ class Engine:
         elif cache._unpinned_layers:
             reason = "every expert layer must be pinned"
         if reason:
-            logger.warning_rank0(f"--moe-decode-fetch ignored: {reason}")
+            if tuned:
+                logger.info_rank0(f"CPU-assisted decode off: {reason}")
+            else:
+                logger.warning_rank0(f"--moe-decode-fetch ignored: {reason}")
             return
         from freetoken.moe.cpu_executor import CpuMoeExecutor, physical_core_cpus
 
@@ -1830,8 +1878,8 @@ class Engine:
         mine = cores[tp.rank * per:(tp.rank + 1) * per]
         threads = _rank_cpu_threads(config)
         cpus = mine[len(mine) - threads:] if threads <= len(mine) else mine
-        # calibration (scripts/calibrate.sh): tune_cpu_decode changes the share and the
-        # thread count at runtime
+        # FREETOKEN_CPU_DECODE_TUNABLE=1 (manual runs through /v1/admin/decode-tune):
+        # tune_cpu_decode changes the share and the thread count at runtime
         tunable = os.environ.get("FREETOKEN_CPU_DECODE_TUNABLE", "0").strip() == "1"
         if tunable:
             # the pool spans every core of this rank; the ones past `threads` park until raised
@@ -1857,13 +1905,15 @@ class Engine:
         if tunable:
             executor.set_active_threads(min(threads, executor.max_threads))
         cache.cpu_decode = executor
+        cache.decode_fetch_tuned = tuned
         cache.set_decode_fetch(fetch)
         if self.cpu_moe_executor is None:
             self.cpu_moe_executor = executor  # its flag watchdog is checked after every forward
         self._cpu_decode_tunable = tunable
         logger.info_rank0(
-            f"--moe-decode-fetch {fetch}: decode fetches {fetch:.0%} of its expert-cache misses over "
-            f"PCIe and computes the rest on cpus {cpus[:executor.active_threads]} ({executor.isa})"
+            ("CPU-assisted decode (share tuned at runtime)" if tuned else
+             f"--moe-decode-fetch {fetch}: decode fetches {fetch:.0%} of its expert-cache misses over PCIe and")
+            + f" computes the rest on cpus {cpus[:executor.active_threads]} ({executor.isa})"
             + (f"; runtime-tunable, up to {executor.max_threads} threads" if tunable else "")
         )
 
@@ -2287,11 +2337,14 @@ class Engine:
                 if (log := route_log.current()) is not None:
                     log.flush(self.config.tp_info.rank)
         dump_path = os.environ.get("FREETOKEN_DUMP_PREFILL_LOGITS")
+        tune = self.autotune.before(batch, use_graph) if getattr(self, "autotune", None) is not None else None
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             if dump_path and batch.is_prefill and not use_graph:
                 logits = self._forward_dumping_logits(batch, dump_path)
             else:
                 logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        if tune is not None:
+            self.autotune.after(tune)
         if prof is not None:
             self._finish_prefill_profile(prof, batch)
         if self.cpu_moe_executor is not None:

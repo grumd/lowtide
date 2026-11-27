@@ -1,7 +1,7 @@
 """engine/auto_config.py: the RAM saver and chunk cap `ft serve` picks when the flags are unset."""
 
 import pytest
-from freetoken.engine.auto_config import SERVER_HOST_BYTES, family_serve_defaults, plan_host_ram
+from freetoken.engine.auto_config import SERVER_HOST_BYTES, plan_host_ram
 
 GiB = 2**30
 Q38_FP4_BANKS = int(63.63 * GiB)
@@ -54,13 +54,3 @@ def test_chunk_cap_bounds():
     assert plan(HY4_BANKS, 80 * GiB, keep_free_gb=1000).prefill_batch_max is None
     assert plan(HY4_BANKS, 80 * GiB, chunk_max=4096).prefill_batch_max is None
     assert plan(HY4_BANKS, None).prefill_batch_max is None  # RAM unknown: not short
-
-
-def test_family_tables():
-    assert family_serve_defaults("freetoken.models.qwen4_exp", 1) == {
-        "moe_routed_prefill_tokens": 4096, "moe_decode_fetch": 0.1}
-    assert family_serve_defaults("freetoken.models.qwen4_exp", 2) == {"moe_routed_prefill_tokens": 3072}
-    assert family_serve_defaults("freetoken.models.hy4", 2) == {
-        "moe_routed_prefill_tokens": 1069, "moe_decode_fetch": 0.1}
-    assert family_serve_defaults("freetoken.models.hy4", 4) == {}
-    assert family_serve_defaults("freetoken.models.glm5_next", 1) == {}

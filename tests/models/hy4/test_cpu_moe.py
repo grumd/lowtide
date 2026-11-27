@@ -425,7 +425,6 @@ def test_hybrid_merge_and_cpu_decode_real_layers(real_layers, monkeypatch):
 
     rl = real_layers
     spy = _Spy(monkeypatch)
-    monkeypatch.setattr(moe_mod, "_ROUTED_PREFILL_TOKENS", 4096)
     hybrid_calls, split_calls = [], []
     for name, sink in (("_prefill_cpu_hybrid", hybrid_calls), ("_decode_cpu_split", split_calls)):
         orig = getattr(moe_mod.OffloadMoELayer, name)
@@ -437,6 +436,7 @@ def test_hybrid_merge_and_cpu_decode_real_layers(real_layers, monkeypatch):
         monkeypatch.setattr(moe_mod.OffloadMoELayer, name, wrap)
     torch.cuda.empty_cache()
     cache, misses = _cache(rl, slots=512)
+    cache.routed_prefill_tokens = 4096
     exs = _bound_layers(rl, cache)
     T = rl.layers[0].lat.shape[0]
 

@@ -9,7 +9,7 @@ Contracts shared across modules (do not rename):
 - kvcache.qsa_pool.QSAKVCache(MHAKVCache): ``cmp_k_cache(slot) -> [rows, index_head_dim]`` (compressed index keys, row = kv slot // index_ratio), ``pending_ring(slot) -> [num_req_slots, ring_capacity, index_head_dim]`` (per-request pre-RoPE index-k tail indexed by table_idx, never cleared), ``cmp_scratch_base`` (int, first scratch row for non-closing decode writes). ``slot`` is the sparse layer's order in the attention backend.
 """
 
-from .config import SERVE_DEFAULTS, parse_config
+from .config import parse_config
 from .gguf import gguf_mm_config, iter_gguf_weights, parse_gguf_config, to_gguf
 from .model import Qwen4ExpForCausalLM, Qwen4ExpForConditionalGeneration
 from .weight import (
@@ -33,7 +33,6 @@ __all__ = [
     "iter_weights",
     "load_ple_table",
     "parse_config",
-    "SERVE_DEFAULTS",
     "side_table_files",
     "rename_ftw_weight",
     "gguf_mm_config",

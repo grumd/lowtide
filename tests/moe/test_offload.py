@@ -1245,13 +1245,11 @@ def test_small_chunks_fetch_routed_only_instead_of_whole_layers():
 
 
 def test_routed_prefill_tokens_knob_extends_the_on_demand_path(monkeypatch):
-    """FREETOKEN_MOE_ROUTED_PREFILL_TOKENS keeps chunks up to that size on the routed
-    fetch (a PCIe-bound box pays a fixed whole-bank stream otherwise); longer chunks
-    still stream whole layers, and the CPU / hybrid decode targets never take it."""
-    import freetoken.layers.moe as moe_mod
-
+    """The routed-prefill cutoff keeps chunks up to that size on the routed fetch (a
+    PCIe-bound box pays a fixed whole-bank stream otherwise); longer chunks still stream
+    whole layers, and the CPU / hybrid decode targets never take it."""
     layer, cache = _make_layer_and_cache()  # E=4, top_k=2
-    monkeypatch.setattr(moe_mod, "_ROUTED_PREFILL_TOKENS", 512)
+    cache.routed_prefill_tokens = 512
 
     def routed_only(tokens: int) -> bool:
         return layer._fetch_routed_only(torch.empty(tokens, 8))

@@ -741,8 +741,6 @@ def test_kernel_error_through_offload_layer(real_layers, monkeypatch):
     """(b) FreeToken's NVFP4 expert output vs exact math on the same NVFP4 weights, through
     ``routed_forward`` of the real offload layer over a 512-slot cache shared by every captured
     layer: full-layer prefill, routed-only prefill, a short prefill chunk, decode M=1 and M=4."""
-    import freetoken.layers.moe as moe_mod
-
     rl = real_layers
     spy = _Spy(monkeypatch)
     torch.cuda.empty_cache()
@@ -780,10 +778,10 @@ def test_kernel_error_through_offload_layer(real_layers, monkeypatch):
         k = spy.take()
         assert k == ["fused_experts_nvfp4_tile"], k
         _check(tag, "prefill 341 (materialize)", got, lay.nv, None, k, results)
-        monkeypatch.setattr(moe_mod, "_ROUTED_PREFILL_TOKENS", 4096)
+        cache.routed_prefill_tokens = 4096
         with _phase("prefill"):
             got = ex.routed_forward(lay.lat.clone(), lay.w, lay.ids.clone())
-        monkeypatch.setattr(moe_mod, "_ROUTED_PREFILL_TOKENS", 0)
+        cache.routed_prefill_tokens = 0
         k = spy.take()
         assert k == ["fused_experts_nvfp4_tile"], k
         _check(tag, "prefill 341 (routed slots)", got, lay.nv, None, k, results)

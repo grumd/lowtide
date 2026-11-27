@@ -225,10 +225,17 @@ class OffloadMoeCache:
     # over PCIe instead (see OffloadMoELayer._prefill_cpu_hybrid).
     cpu_prefill: object | None = None
     cpu_prefill_fetch: float = 0.35
+    # prefill chunks up to this many tokens take the routed fetch (--moe-routed-prefill-tokens;
+    # engine/autotune.py moves it at runtime when the flag is unset)
+    routed_prefill_tokens: int = 0
     # Decode with CPU help (--moe-decode-fetch < 1, GPU decode target): the CpuMoeExecutor that
     # computes the misses a decode step does not fetch (None: plain decode), and the fetched share.
     cpu_decode: object | None = None
     decode_fetch: float = 1.0
+    # Whether decode takes the CPU-assisted split while ``cpu_decode`` is built (the share tuner's
+    # plain arm turns it off; the decode graphs are captured both ways, see ``decode_variants``).
+    cpu_decode_on: bool = True
+    decode_fetch_tuned: bool = False
     # Elastic VRAM: ``bank_alloc(name, shape, dtype)`` returns each bank's slot
     # cache (a CUDA-VMM tensor sized for cache_size with only the active prefix backed), and
     # slots >= ``active_slots`` are fenced off. None keeps plain torch.empty banks, all active.
@@ -1735,6 +1742,13 @@ class OffloadMoeCache:
         self._pending_whole_layer = False
         self._pending_planned = self.pooled
         ensure_experts_split(self, layer_id, expert_ids, topk_weights, x, io, self.decode_fetch_q16)
+
+    def decode_variants(self) -> tuple[bool, ...]:
+        """The ``cpu_decode_on`` settings decode graphs are captured for: both while the share is
+        tuned at runtime (a re-capture is not safe at TP=2), else the current one."""
+        if self.cpu_decode is not None and self.decode_fetch_tuned:
+            return (True, False)
+        return (self.cpu_decode_on,)
 
     def set_decode_fetch(self, fetch: float) -> None:
         """CPU-assisted decode fetches this share of its misses over PCIe from the next step on;

@@ -18,14 +18,6 @@ from freetoken.models.config import (
 from freetoken.models.qwen3_vl.config import parse_vision_config
 
 
-# `ft serve` offload defaults per GPU count (engine/auto_config.py), measured on RTX 3080s at PCIe 4.0 x8;
-# numbers in scripts/README.md. Two GPUs stream half of every expert each and miss too rarely for CPU decode.
-SERVE_DEFAULTS = {
-    1: {"moe_routed_prefill_tokens": 4096, "moe_decode_fetch": 0.1},
-    2: {"moe_routed_prefill_tokens": 3072},
-}
-
-
 @dataclass(frozen=True)
 class Qwen4ExpArgs:
     """Qwen3.8-Flash-Next geometry beyond the generic ModelConfig fields (ModelConfig.qwen4_args)."""

@@ -249,10 +249,10 @@ class OffloadMoELayer(MoELayer):
         tokens = hidden_states.size(0)
         if tokens * self.top_k < self.num_experts:
             return True
-        return tokens <= _ROUTED_PREFILL_TOKENS and self._routed_prefill_ok()
+        return self._routed_prefill_ok() and tokens <= self.offload_cache.routed_prefill_tokens
 
     def _routed_prefill_ok(self) -> bool:
-        """Whether a ``FREETOKEN_MOE_ROUTED_PREFILL_TOKENS`` chunk can take the routed
+        """Whether a chunk up to the routed-prefill cutoff can take the routed
         fetch: plain GPU decode target (the CPU / hybrid executors keep their own
         paths) and a unique routed set the LRU kernel can take in one call."""
         cache = self.offload_cache
@@ -375,7 +375,7 @@ class OffloadMoELayer(MoELayer):
         # the CPU-assisted paths need the batch phase; the plain GPU decode never reads it
         batch = get_global_ctx().batch if cache.cpu_decode is not None or cache.cpu_prefill is not None else None
         # a speculative verify window is a few decode tokens: same CPU-assisted split
-        if (cache.cpu_decode is not None and hidden_states.size(0) <= cache.cpu_decode.max_tokens
+        if (cache.cpu_decode is not None and cache.cpu_decode_on and hidden_states.size(0) <= cache.cpu_decode.max_tokens
                 and (_CPU_DECODE_PREFILL or not batch.is_prefill or getattr(batch, "mtp_verify", False))
                 and not cache.is_unpinned_layer(self.layer_id)):
             return self._decode_cpu_split(cache, hidden_states, topk_weights, topk_ids, during_copy)
@@ -456,7 +456,7 @@ class OffloadMoELayer(MoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Routed-only prefill chunk (``FREETOKEN_MOE_ROUTED_PREFILL_TOKENS``): make each
+        """Routed-only prefill chunk (up to ``cache.routed_prefill_tokens``): make each
         routed expert resident once -- the LRU kernel gets the unique routed set, not
         every (token, expert) route -- then run the grouped GEMM over the slot cache
         (the per-route GEMV when the format has no slot-cache prefill kernel).
