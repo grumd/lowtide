@@ -1808,16 +1808,21 @@ class Engine:
         t0 = time.perf_counter()
         probe = autotune.probe(cache, group)
         took = time.perf_counter() - t0
-        share = cutoff = None
+        share = cutoff = seed = None
         if cache.decode_fetch_tuned:
             share = autotune.snap(probe.share()) if probe is not None else autotune.snap(0.25)
         if tune_cutoff:
             e, k = cache.num_experts, cache.cpu_prefill.top_k
             lo = -(-e // k)
             hi = max(lo, config.prefill_batch_max)
-            start = int(min(max(probe.cutoff(e, k, cache.cpu_prefill_fetch), lo), hi)) // 128 * 128
-            cutoff = autotune.CutoffTuner(max(start, lo), lo, hi)
-        self._autotune_start = (group, share, cutoff)
+
+            def seed(skew: float) -> int:
+                return max(int(min(max(probe.cutoff(e, k, cache.cpu_prefill_fetch, skew), lo), hi)) // 128 * 128, lo)
+
+            # the CPU's misses taken at the chunk's mean tokens per expert until a routed chunk
+            # measures how much fewer they get
+            cutoff = autotune.CutoffTuner(seed(1.0), lo, hi)
+        self._autotune_start = (group, share, cutoff, seed)
         if probe is not None:
             logger.info_rank0(
                 f"autotune probe ({took * 1e3:.0f} ms): expert fetch {probe.fetch_us:.0f} us, CPU kernel "

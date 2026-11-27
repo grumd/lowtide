@@ -194,7 +194,7 @@ class DraftPolicy:
         self.cost = [0.0] * n
         self.cost_n = [0.0] * n
         self.tried = [0] * n
-        self.warm = [False] * n
+        self.warm = [0] * n
         self.ok = [0.0] * (len(self.BUCKETS) + 1)
         self.bad = [0.0] * (len(self.BUCKETS) + 1)
 
@@ -249,9 +249,11 @@ class DraftPolicy:
         """Record a measured round (``t`` > 1) or plain step (``t`` == 1); priced after ``adopt``."""
         if not 1 <= t <= self.max_t or ms <= 0:
             return
-        if not self.warm[t]:
-            # the first round of a width compiles its kernels: it says nothing about the cost
-            self.warm[t] = True
+        if self.warm[t] < 2:
+            # the first rounds of a width compile its kernels and replay its graphs cold (one per
+            # CPU-split setting): a second round still measured up to 2x its later cost and priced
+            # the width out for good, so code-edit speed hung on which width warmed first
+            self.warm[t] += 1
             return
         if self.meas_n[t] > 0:
             ms = min(ms, 2.0 * self.meas[t])  # one stalled round cannot price a width out
@@ -552,7 +554,8 @@ class NgramSpecManager:
         width = 1 + max(len(d) for _, d, _ in plans)
         a_list = self._round(plans, draft_q=draft_q)
         ms = (time.perf_counter() - t0) * 1e3
-        self.policy.observe_cost(width, ms)
+        if not getattr(self.engine.moe_offload_cache, "verify_trial", False):  # not a runtime-tuning trial
+            self.policy.observe_cost(width, ms)
         if self._debug:
             for (r, d, match), a in zip(plans, a_list):
                 logger.info_rank0(
@@ -631,7 +634,8 @@ class NgramSpecManager:
         """Overlap loop, after a plain decode step launched: the time between two consecutive
         plain launches of a lone request is its decode step cost."""
         now = time.perf_counter()
-        if single and self._last_plain_t is not None:
+        if single and self._last_plain_t is not None and not getattr(
+                self.engine.moe_offload_cache, "decode_trial", False):  # not a runtime-tuning trial
             self.policy.observe_cost(1, (now - self._last_plain_t) * 1e3)
         self._last_plain_t = now if single else None
 

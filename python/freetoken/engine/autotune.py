@@ -37,10 +37,6 @@ STALL = 4 * BLOCK  # steps a comparison may go without a block of its kind
 REJECT = 1.2  # a tried setting whose first block is this much slower loses at once
 CUTOFF_STEP = 1.5  # most the cutoff moves per chunk
 CUTOFF_WINDOW = 6  # latest chunks remembered per path
-# the GPU takes the most-routed misses of a routed chunk, so the experts left to the CPU see about
-# this many times fewer tokens than the chunk's mean per expert (fitted to the crossovers measured
-# on q38, Ling-3.2 air and Hy4-flash at one and two GPUs: 2.5-4)
-ROUTE_SKEW = 3.0
 
 
 def snap(share: float) -> int:
@@ -201,11 +197,13 @@ class Probe:
         """Decode: the share of misses whose fetch takes as long as the CPU takes for the rest."""
         return self.cpu_us / (self.cpu_us + self.fetch_us)
 
-    def cutoff(self, num_experts: int, top_k: int, prefill_fetch: float) -> float:
+    def cutoff(self, num_experts: int, top_k: int, prefill_fetch: float, skew: float = 1.0) -> float:
         """Prefill: the chunk at which the CPU's share of the misses (``1 - prefill_fetch``), each
-        expert with ``1 / ROUTE_SKEW`` of the chunk's mean tokens, takes as long as fetching every miss."""
+        expert with ``1 / skew`` of the chunk's mean tokens, takes as long as fetching every miss.
+        The GPU takes the most-routed misses, so ``skew`` (the chunk's mean tokens per expert over
+        the CPU's) is above 1; routed chunks measure it."""
         tokens = (self.fetch_us / (1 - prefill_fetch) - self.cpu_us + self.cpu_token_us) / self.cpu_token_us
-        return max(tokens, 1.0) * ROUTE_SKEW * num_experts / top_k
+        return max(tokens, 1.0) * skew * num_experts / top_k
 
 
 def probe(cache, group) -> Probe | None:
@@ -262,9 +260,15 @@ class AutoTune:
     """Engine glue: ``before`` / ``after`` around each forward record CUDA events, read two
     forwards later (done by then), and apply the tuners' settings between forwards."""
 
-    def __init__(self, cache, group, share_start: int | None, cutoff: CutoffTuner | None) -> None:
+    def __init__(self, cache, group, share_start: int | None, cutoff: CutoffTuner | None,
+                 seed=None) -> None:
         self.cache, self.group, self.cutoff = cache, group, cutoff
         self.share = ShareTuner(share_start) if share_start is not None else None
+        # n-gram / MTP verify windows get their own share: their k+1 tokens per request miss more
+        self.vshare = ShareTuner(share_start) if share_start is not None else None
+        self.vapplied = None
+        self.vblock: list[float] = []
+        self.seed = seed  # skew -> the probe's cutoff, until the first routed chunk measures the skew
         self.pending: deque = deque()
         self.n = 0
         self.blocks: dict = {}  # step kind -> times at the applied setting
@@ -274,27 +278,40 @@ class AutoTune:
         self.prev = None  # the last forward if it was a timed decode step: (size, arm, start event)
         if self.share is not None:
             self._apply(self.share.arm())
+            self._vapply(self.vshare.arm())
         if cutoff is not None:
             self._set_cutoff(cutoff.cutoff)
 
-    def before(self, batch, graph: bool):
+    def _harvest(self) -> None:
         self.n += 1
         while self.pending and self.pending[0][0] <= self.n - 2:
             _, rec, end = self.pending.popleft()
             end.synchronize()
             ms = rec[-1].elapsed_time(end)
-            (self._step if rec[0] == "decode" else self._chunk)(rec[1], rec[2], ms)
-        verify = getattr(batch, "mtp_verify", False)  # an n-gram / MTP verify window
-        if (batch.is_decode or verify) and self.share is not None and graph:
+            {"decode": self._step, "prefill": self._chunk, "verify": self._vstep}[rec[0]](*rec[1:-1], ms)
+
+    def verify(self, t: int):
+        """Before a verify window (n-gram or MTP) of ``t`` tokens per request: time it for the
+        verify share; pass the result to ``after``."""
+        self._harvest()
+        self.prev = None
+        if self.vshare is None:
+            return None
+        start = torch.cuda.Event(enable_timing=True)
+        start.record()
+        return ("verify", t, self.vapplied, start)
+
+    def before(self, batch, graph: bool):
+        self._harvest()
+        if batch.is_decode and self.share is not None and graph:
             if self.share.cand is not None:
                 self.stalled += 1
                 if self.stalled > STALL:  # mixed step kinds starve the comparison: drop it
                     self.share.drop()
                     self.stalled = 0
                     self._apply(self.share.arm())
-            # a step lasts from its start to the next one's of the same kind, so the time includes
-            # the host work between forwards (sampling, scheduling, drafting), which the CPU split's
-            # workers can slow
+            # a step lasts from its start to the next one's, so the time includes the host work
+            # between forwards (sampling, scheduling), which the CPU split's workers can slow
             start = torch.cuda.Event(enable_timing=True)
             start.record()
             prev, self.prev = self.prev, ((batch.size, len(batch.input_ids)), self.applied, start)
@@ -309,13 +326,11 @@ class AutoTune:
         # this chunk's path, which may differ from the cutoff's while the tuner explores
         cut = self.cutoff.cutoff
         self.cache.routed_prefill_tokens = max(cut, tokens) if routed else min(cut, tokens - 1)
+        # the MoE layers add this chunk's routing counts here (layers/moe.py)
+        self.cache.route_counts = counts = [0, 0, 0, 0]
         start = torch.cuda.Event(enable_timing=True)
         start.record()
-        return ("prefill", tokens, routed, start)
-
-    def untimed(self) -> None:
-        """A forward between decode steps that is not timed: the next step starts a new interval."""
-        self.prev = None
+        return ("prefill", tokens, routed, counts, start)
 
     def after(self, rec) -> None:
         if rec is not None:
@@ -358,15 +373,50 @@ class AutoTune:
             self.applied = i
             self.cache.cpu_decode_on = LADDER[i] < 1
             if LADDER[i] < 1:
-                self.cache.set_decode_fetch(LADDER[i])
-        self.cache.verify_cpu_on = LADDER[self.share.cur] < 1
+                self.cache.set_decode_fetch(LADDER[i], part="decode")
+        # the n-gram cost policy skips steps and rounds run at a setting being tried
+        self.cache.decode_trial = i != self.share.cur
 
-    def _chunk(self, tokens: int, routed: bool, ms: float) -> None:
+    def _vstep(self, t: int, arm: int, ms: float) -> None:
+        if arm != self.vapplied:
+            return
+        self.vblock.append(ms / t)  # per window token: n-gram windows change width every round
+        if len(self.vblock) < BLOCK:
+            return
+        v = self.vshare
+        mid = self._max(sorted(self.vblock)[BLOCK // 2]) if v.cand is not None else 0.0
+        self.vblock = []
+        old = LADDER[v.cur]
+        if v.block_done(mid):
+            logger.info_rank0(f"autotune: verify windows {_share(old)} -> {_share(LADDER[v.cur])} "
+                              f"({v.last[1]:.2f} vs {v.last[0]:.2f} ms per window token)")
+        self._vapply(v.arm())
+
+    def _vapply(self, j: int) -> None:
+        if j != self.vapplied:
+            self.vapplied = j
+            self.cache.verify_cpu_on = LADDER[j] < 1
+            if LADDER[j] < 1:
+                self.cache.set_decode_fetch(LADDER[j], part="verify")
+        self.cache.verify_trial = j != self.vshare.cur
+
+    def _chunk(self, tokens: int, routed: bool, c: list, ms: float) -> None:
         old = self.cutoff.cutoff
         if self.cutoff.observe(tokens, routed, self._max(ms)):
             self._set_cutoff(self.cutoff.cutoff)
             logger.info_rank0(f"autotune: --moe-routed-prefill-tokens {old} -> {self.cutoff.cutoff} (a "
                               f"{tokens}-token {'routed' if routed else 'streamed'} chunk took {ms:.0f} ms)")
+        # c: [routes, experts, routes and count of the least-routed experts (those the CPU computes)]
+        if self.seed is not None and routed:
+            # the chunk's mean tokens per expert over the CPU's; needs a few tokens per expert
+            skew = self._max((c[0] / c[1]) / (c[2] / c[3]) if c[3] and c[0] >= 4 * c[1] else 0.0)
+            if skew > 0:
+                old, new = self.cutoff.cutoff, self.seed(skew)
+                self.seed = None
+                self.cutoff.cutoff = new
+                self._set_cutoff(new)
+                logger.info_rank0(f"autotune: --moe-routed-prefill-tokens {old} -> {new} (routes per "
+                                  f"expert: chunk mean / CPU share {skew:.2f})")
 
     def _set_cutoff(self, tokens: int) -> None:
         cpu = self.cache.cpu_prefill

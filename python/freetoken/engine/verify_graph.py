@@ -51,13 +51,8 @@ class VerifyGraphRunner:
         vocab_size: int,
         device: torch.device,
         padding_slot: int,
-        settled: bool = False,
     ) -> None:
         self.gr = graph_runner
-        # n-gram verify windows run the tuner's settled decode mode, not the setting it is trying:
-        # their widths change from round to round, so they are not timed, and a slow trial would
-        # mislead the n-gram cost policy. MTP verify windows are the decode steps, timed and tried.
-        self.settled = settled
         self.model = model
         self.attn = attn_backend
         self.moe = moe_offload_cache
@@ -70,7 +65,7 @@ class VerifyGraphRunner:
         self.dummy_table_idx = graph_runner.dummy_req.table_idx
         self.graph_map: Dict[tuple[int, bool], torch.cuda.CUDAGraph] = {}
         self.streams_map: Dict[tuple[int, bool], torch.Tensor] = {}
-        self.tune = None  # engine/autotune.AutoTune: times the verify windows like decode steps
+        self.tune = None  # engine/autotune.AutoTune: times the verify windows for their own share
 
         # Static geometry sized for the largest captured size; each graph uses a prefix.
         self.input_ids = torch.zeros(self.total, dtype=torch.int32, device=device)
@@ -88,16 +83,15 @@ class VerifyGraphRunner:
         self.attn.init_capture_verify(self.n_max, t)
         # Descending: the largest capture allocates the per-layer GDN verify buffers, smaller
         # graphs then reuse them (gdn_verify.ensure_verify_buffers keeps the max).
-        # one graph per CPU-assisted decode setting the share tuner may switch between, so a
-        # verify window takes the same expert path as the decode steps around it
+        # one graph with and one without the CPU split while the tuner picks the verify setting
         variants = moe_offload_cache.decode_variants() if hasattr(moe_offload_cache, "decode_variants") else (True,)
         for bs in sorted(self.bs_list, reverse=True):
             for on in variants:
                 if len(variants) > 1:
-                    was, moe_offload_cache.cpu_decode_on = moe_offload_cache.cpu_decode_on, on
+                    was, moe_offload_cache.verify_cpu_on = moe_offload_cache.verify_cpu_on, on
                 self._capture(bs, on)
                 if len(variants) > 1:
-                    moe_offload_cache.cpu_decode_on = was
+                    moe_offload_cache.verify_cpu_on = was
 
     # ------------------------------------------------------------------ capture
 
@@ -156,7 +150,7 @@ class VerifyGraphRunner:
         self.streams_map[bs, on] = getattr(batch, "mtp_streams", None)
 
     def _variant(self) -> bool:
-        return getattr(self.moe, "verify_cpu_on" if self.settled else "cpu_decode_on", True)
+        return getattr(self.moe, "verify_cpu_on", True)
 
     def _reset_moe(self) -> None:
         if self.moe is not None:
@@ -178,8 +172,7 @@ class VerifyGraphRunner:
         ``input_ids`` gathered by the caller."""
         n = batch.size
         assert self.can_use(n), f"verify n={n} outside captured range (max {self.n_max})"
-        if self.tune is not None:
-            self.tune.untimed() if self.settled else self.tune.before(batch, True)
+        tune = self.tune.verify(self.t) if self.tune is not None else None
         bs = self._select_bs(n)
         real = n * self.t
         total = bs * self.t
@@ -215,6 +208,8 @@ class VerifyGraphRunner:
             batch.attn_metadata = self.attn.make_verify_metadata()
             batch.fla_metadata = self._fla_metadata(bs)
             self.graph_map[bs, self._variant()].replay()
+        if tune is not None:
+            self.tune.after(tune)
         streams = self.streams_map.get((bs, self._variant()))
         return self.logits[:real], (streams[:real] if streams is not None else None)
 
@@ -258,7 +253,7 @@ class MultiWidthVerifyGraphs:
         self.stores: Dict[int, dict] = {}
         self.commits: Dict[int, CommitGraphRunner] = {}
         for t in sorted(widths, reverse=True):
-            runner = self.runners[t] = VerifyGraphRunner(t=t, settled=True, **kwargs)
+            runner = self.runners[t] = VerifyGraphRunner(t=t, **kwargs)
             self.stores[t] = getattr(self.attn, self.store_attr)
             if pool is not None and getattr(self.model, "select_verify_width", None) is not None:
                 # the accepted-prefix commit of this width, reading this width's verify buffers

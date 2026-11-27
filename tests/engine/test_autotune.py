@@ -118,10 +118,27 @@ def test_cutoff_steps_are_bounded():
 def test_probe_starting_values():
     p = Probe(fetch_us=209.0, cpu_us=63.5, cpu_token_us=6.5)
     assert LADDER[snap(p.share())] == 0.25
-    # the CPU's 65% of misses, at a third of the mean tokens per expert, take as long as fetching them all
-    tokens = p.cutoff(512, 10, 0.35)
-    per_expert = tokens * 10 / 512 / at.ROUTE_SKEW
-    assert 0.65 * (63.5 + 6.5 * (per_expert - 1)) == pytest.approx(209.0)
+    # the CPU's 65% of misses, at 1 / skew of the mean tokens per expert, take as long as fetching them all
+    for skew in (1.0, 3.0):
+        per_expert = p.cutoff(512, 10, 0.35, skew) * 10 / 512 / skew
+        assert 0.65 * (63.5 + 6.5 * (per_expert - 1)) == pytest.approx(209.0)
+
+
+def test_glue_seeds_the_cutoff_from_the_first_routed_chunks_skew(monkeypatch):
+    monkeypatch.setattr(at.torch.cuda, "Event", FakeEvent)
+    cache = FakeCache()
+    tune = AutoTune(cache, None, None, CutoffTuner(1024, 52, 16384), seed=lambda skew: int(1000 * skew))
+    chunk = SimpleNamespace(is_decode=False, is_prefill=True, input_ids=[0] * 500)
+    rec = tune.before(chunk, False)
+    assert rec[2] is True  # 500 <= 1024 / 2: routed
+    # 500 tokens x 10 routes over 480 experts; the least-routed 200 got 650 routes
+    cache.route_counts[:] = [5000, 480, 650, 200]
+    FakeEvent.clock[0] += 500.0
+    tune.after(rec)
+    # one-token replies: the next turns' chunks come before this one is read
+    for _ in range(2):
+        tune.after(tune.before(SimpleNamespace(is_decode=False, is_prefill=True, input_ids=[0] * 20000), False))
+    assert tune.cutoff.cutoff == int(1000 * (5000 / 480) / (650 / 200)) and tune.seed is None
 
 
 class FakeEvent:
@@ -143,10 +160,15 @@ class FakeEvent:
 class FakeCache:
     def __init__(self):
         self.cpu_decode_on, self.decode_fetch, self.routed_prefill_tokens = True, 1.0, 0
+        self.verify_cpu_on, self.verify_fetch = True, 1.0
+        self.route_counts = [0, 0, 0, 0]
         self.cpu_prefill = SimpleNamespace(max_tokens=1024, resize=lambda n: setattr(self.cpu_prefill, "max_tokens", n))
 
-    def set_decode_fetch(self, f):
-        self.decode_fetch = f
+    def set_decode_fetch(self, f, part="both"):
+        if part != "verify":
+            self.decode_fetch = f
+        if part != "decode":
+            self.verify_fetch = f
 
 
 def test_glue_switches_the_plain_path_and_skips_steps_launched_before_a_switch(monkeypatch):
@@ -161,7 +183,7 @@ def test_glue_switches_the_plain_path_and_skips_steps_launched_before_a_switch(m
         seen.append(cache.cpu_decode_on)
         FakeEvent.clock[0] += 10.0 if cache.cpu_decode_on else 9.0  # plain is faster
         tune.after(rec)
-    assert not cache.cpu_decode_on and not cache.verify_cpu_on  # n-gram verify windows follow
+    assert not cache.cpu_decode_on and cache.decode_fetch < 1.0
     assert seen.count(False) > 0.9 * len(seen)
     # a cutoff raised past the CPU executor's buffers grows them
     tune._set_cutoff(3000)
@@ -246,18 +268,29 @@ def test_cutoff_rises_at_most_to_twice_the_largest_routed_chunk():
     assert t.cutoff == 3584  # not 4608: no routed chunk past 1800 yet
 
 
-def test_glue_tunes_on_verify_windows(monkeypatch):
-    # MTP: every step is a verify window (k+1 tokens, replayed from its own graph twin)
+def test_glue_tunes_verify_windows_on_their_own_share(monkeypatch):
+    # n-gram rounds between plain decode steps: windows of changing width, timed per window token;
+    # verify windows prefer the split at 0.25, decode steps plain
     monkeypatch.setattr(at.torch.cuda, "Event", FakeEvent)
     cache = FakeCache()
-    tune = AutoTune(cache, None, snap(0.25), None)
-    verify = SimpleNamespace(is_decode=False, is_prefill=True, mtp_verify=True, size=1, input_ids=[0] * 4)
-    for _ in range(3000):
-        rec = tune.before(verify, True)
-        assert rec is None and cache.routed_prefill_tokens == 0  # not taken for a prefill chunk
-        FakeEvent.clock[0] += {0.06: 30.0, 0.12: 26.0, 0.25: 24.0, 0.5: 22.0, 1.0: 25.0}[
-            cache.decode_fetch if cache.cpu_decode_on else 1.0]
-    assert cache.cpu_decode_on and cache.decode_fetch == 0.5
+    tune = AutoTune(cache, None, snap(0.12), None)
+    decode = SimpleNamespace(is_decode=True, is_prefill=False, size=1, input_ids=[0])
+    per_token = {0.06: 9.0, 0.12: 8.0, 0.25: 6.0, 0.5: 6.5, 1.0: 9.5}
+    rng = random.Random(5)
+    trials = 0
+    for i in range(6000):
+        if i % 3 == 0:
+            t = rng.choice([3, 5, 8])
+            rec = tune.verify(t)
+            trials += cache.verify_trial
+            FakeEvent.clock[0] += t * per_token[cache.verify_fetch if cache.verify_cpu_on else 1.0]
+            tune.after(rec)
+        else:
+            tune.before(decode, True)
+            FakeEvent.clock[0] += 10.0 if cache.cpu_decode_on else 9.0
+    assert cache.verify_cpu_on and cache.verify_fetch == 0.25
+    assert not cache.cpu_decode_on and not cache.decode_trial
+    assert trials < 0.1 * 2000  # the n-gram cost policy skips these rounds
 
 
 def test_share_drops_a_far_slower_setting_after_one_block():
@@ -281,12 +314,13 @@ def test_glue_drops_a_comparison_that_mixed_steps_starve(monkeypatch):
     tune.share.blocks = [[16.0], []]  # the next block runs the tried setting
     tune._apply(tune.share.arm())
     assert not cache.cpu_decode_on
-    kinds = [SimpleNamespace(is_decode=True, is_prefill=False, size=1, input_ids=[0])] + [
-        SimpleNamespace(is_decode=False, is_prefill=True, mtp_verify=True, size=1, input_ids=[0] * w) for w in (3, 5, 8)]
+    decode = SimpleNamespace(is_decode=True, is_prefill=False, size=1, input_ids=[0])
     plain = 0
     for i in range(2000):
-        tune.before(kinds[(i * 7) % 5 % 4], True)
+        if i % 2:
+            tune.before(decode, True)
+        else:
+            tune.after(tune.verify(3))
         plain += not cache.cpu_decode_on
         FakeEvent.clock[0] += 17.0 if cache.cpu_decode_on else 28.0
-    assert plain <= at.STALL and tune.share.cand is None and cache.cpu_decode_on
-    assert cache.verify_cpu_on  # n-gram verify windows never ran the tried setting
+    assert plain <= 2 * at.STALL + 2 and tune.share.cand is None and cache.cpu_decode_on

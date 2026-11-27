@@ -165,8 +165,8 @@ def test_tp_diagnostics_files_are_read_on_rank0_only(tmp_path):
 def test_rank1_keeps_its_plan_inputs_until_rank0_values_arrive():
     m = _mgr(mode="adaptive")
     m._tp = True
-    m.policy.observe_cost(1, 10.0)
-    m.policy.observe_cost(1, 10.0)
+    for _ in range(3):  # two warm-up rounds, one measured
+        m.policy.observe_cost(1, 10.0)
     m.begin_iteration()  # no broadcast yet: nothing of this rank's clock is adopted
     assert m.policy.cost_n[1] == 0
     m.sched.tp_sync_values = _mgr().sync_payload()
@@ -352,7 +352,7 @@ def test_suffix_drafter_bulk_append_links_to_older_history():
 def test_policy_prefers_plain_steps_when_windows_are_expensive():
     p = DraftPolicy(max_t=8)
     for t in range(1, 9):
-        for _ in range(4):
+        for _ in range(5):
             p.observe_cost(t, 20.0 + 40.0 * (t - 1))
     p.sync()
     assert p.choose(7, match=30) == 0
@@ -385,9 +385,10 @@ def test_policy_probes_an_unmeasured_size_a_few_times():
     assert p.choose(4, match=30, probe=False) == 0
 
 
-def test_policy_ignores_the_first_round_of_a_width():
+def test_policy_ignores_the_first_rounds_of_a_width():
     p = DraftPolicy(max_t=4)
     p.observe_cost(3, 5000.0)  # kernel compilation
+    p.observe_cost(3, 300.0)  # cold graph replays
     assert p.meas_n[3] == 0
     p.observe_cost(3, 30.0)
     assert p.meas[3] == 30.0

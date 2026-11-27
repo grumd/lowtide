@@ -375,7 +375,8 @@ class OffloadMoELayer(MoELayer):
         # the CPU-assisted paths need the batch phase; the plain GPU decode never reads it
         batch = get_global_ctx().batch if cache.cpu_decode is not None or cache.cpu_prefill is not None else None
         # a speculative verify window is a few decode tokens: same CPU-assisted split
-        if (cache.cpu_decode is not None and cache.cpu_decode_on and hidden_states.size(0) <= cache.cpu_decode.max_tokens
+        if (cache.cpu_decode is not None and hidden_states.size(0) <= cache.cpu_decode.max_tokens
+                and (cache.verify_cpu_on if getattr(batch, "mtp_verify", False) else cache.cpu_decode_on)
                 and (_CPU_DECODE_PREFILL or not batch.is_prefill or getattr(batch, "mtp_verify", False))
                 and not cache.is_unpinned_layer(self.layer_id)):
             return self._decode_cpu_split(cache, hidden_states, topk_weights, topk_ids, during_copy)
@@ -428,7 +429,8 @@ class OffloadMoELayer(MoELayer):
         cpu = cache.cpu_decode
         T = hidden_states.size(0)
         io = cpu.stage(self.layer_id, T)
-        cache.ensure_experts_split(self.layer_id, topk_ids, topk_weights, hidden_states, io)
+        verify = getattr(get_global_ctx().batch, "mtp_verify", False)
+        cache.ensure_experts_split(self.layer_id, topk_ids, topk_weights, hidden_states, io, verify)
         cpu.signal(self.layer_id, T)
         main = torch.cuda.current_stream(hidden_states.device)
         side = cache.decode_copy_stream()
@@ -507,13 +509,19 @@ class OffloadMoELayer(MoELayer):
         cpu.ids[:T].copy_(torch.where(on_cpu, cache.cpu_rows(self.layer_id, topk_ids).to(torch.int32), -1),
                           non_blocking=True)
         cpu.w[:T].copy_(topk_weights, non_blocking=True)
+        # the routes of the least-routed (1 - fetch share) experts, the share the CPU computes of
+        # the misses: the cutoff's starting estimate (engine/autotune.py) reads how few they are
+        n_low = max(1, int((1 - cache.cpu_prefill_fetch) * routed.numel()))
         cpu.meta.copy_(torch.stack([route_slot.max().long(), on_cpu.logical_not().sum(),
-                                    cache.num_indices[0], routed.new_tensor(routed.numel()).long()]),
+                                    cache.num_indices[0], routed.new_tensor(routed.numel()).long(),
+                                    torch.sort(counts).values[:n_low].sum()]),
                        non_blocking=True)
         staged = torch.cuda.Event()
         staged.record()
         staged.synchronize()
-        resident, n_gpu, n_fetch, n_routed = cpu.meta.tolist()
+        resident, n_gpu, n_fetch, n_routed, low_routes = cpu.meta.tolist()
+        c = cache.route_counts
+        c[0], c[1], c[2], c[3] = c[0] + topk_ids.numel(), c[1] + n_routed, c[2] + low_routes, c[3] + n_low
         cache.copy_missing()
         cache.demote_fetched(n_fetch)  # a prefill chunk must not flush decode's working set
         gpu_routes = None

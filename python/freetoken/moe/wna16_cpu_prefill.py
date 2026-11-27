@@ -107,7 +107,7 @@ class Wna16CpuPrefill:
         self.y = torch.empty((max_tokens, hidden), dtype=torch.float32, pin_memory=pin)
         self.ids = torch.empty((max_tokens, top_k), dtype=torch.int32, pin_memory=pin)
         self.w = torch.empty((max_tokens, top_k), dtype=torch.float32, pin_memory=pin)
-        self.meta = torch.empty((4,), dtype=torch.int64, pin_memory=pin)
+        self.meta = torch.empty((5,), dtype=torch.int64, pin_memory=pin)
         # FREETOKEN_WNA16_CPU_PREFILL_STATS=1: one log line per prefill forward
         self.stats = {} if os.environ.get("FREETOKEN_WNA16_CPU_PREFILL_STATS") == "1" else None
 
