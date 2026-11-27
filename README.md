@@ -20,7 +20,7 @@ VRAM is usually the bottleneck for large MoE models, so Lowtide spends as much o
 
 ## Quick start
 
-Linux (x86_64), CUDA 13 (`nvcc`), 1–2 NVIDIA GPUs (16+ GB VRAM), 96 GB+ RAM, NVMe SSD (AVX-512 BF16 CPU helps). Full setup and `calibrate.sh` in [`scripts/README.md`](scripts/README.md#requirements).
+Linux (x86_64), CUDA 13 (`nvcc`), 1–2 NVIDIA GPUs (16+ GB VRAM), 96 GB+ RAM, NVMe SSD (AVX-512 BF16 CPU helps). Full setup in [`scripts/README.md`](scripts/README.md#requirements).
 
 ```bash
 git clone https://github.com/grumd/lowtide && cd lowtide

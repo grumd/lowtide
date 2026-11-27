@@ -3,7 +3,6 @@
 | Script | Purpose |
 |---|---|
 | `serve.sh` | serve an FTW checkpoint (Qwen3.8-Flash-Next INT4 / FP4, Hy4-flash) on one or two GPUs |
-| `calibrate.sh`, `calibrate.py` | measure the best CPU-assisted decode flags for this machine |
 | `build-release-wheels.sh`, `publish-wheels.sh`, `ci/` | upstream wheel builds and releases, used by `.github/workflows` |
 
 ## `serve.sh`
@@ -71,10 +70,19 @@ With `--moe-strategy offload`, `ft serve` fills these in when the command line l
 
 | Setting | Rule | Qwen3.8-Flash-Next | Hy4-flash |
 |---|---|---|---|
-| `--moe-routed-prefill-tokens` | the model's measured cutoff for the GPU count (`SERVE_DEFAULTS` in its package). Chunks up to this size load only their routed experts, the CPU computing part of the misses (`--moe-prefill-fetch`), instead of streaming every expert over PCIe (~2.4 s per chunk at x8 gen4). Re-tune on another link or CPU with `calibrate.sh` | one GPU `4096` (FP4, 4k new tokens on a cached 16k prefix 4.78 -> 3.26 s; an 8k chunk is faster streamed), two `3072` (each GPU streams half of every expert, so streaming wins sooner); about `1280` with `--moe-prefill-fetch 1` | two GPUs `1069` (1069 tokens 1.76 s routed vs 2.62 streamed; 2093 2.96 vs 2.82), one `2048` |
-| `--moe-decode-fetch` | the model's measured share, for NVFP4 / W4A16 experts (W4A16 needs AVX-512 BF16): decode fetches that share of its expert-cache misses over PCIe and the CPU computes the rest. `calibrate.sh` finds the best value for your machine; `1` = plain decode | one GPU `0.1` (FP4 28 -> 53 tok/s at 4k, 20 -> 46 at 261k); two GPUs plain (misses too rare to pay; with MTP pass `0.5`) | `0.1` (two GPUs 23.6 -> 32.2 tok/s at 4k) |
 | `--moe-vram-only` (RAM saver) | on when the expert banks + 8 GiB do not fit in the host RAM free at start (and under the cgroup cap); `--no-moe-vram-only` turns it off. Refuses to start when RAM is short by more than the GPUs' VRAM | off (63.6 GiB banks) | on with 96 GB (78.2 GiB banks) |
 | `--prefill-batch-max` | where the RAM saver is on because RAM is short: free RAM sits near `--host-ram-keep-free-gb` once the cache is warm, so the longest chunk's worst case (every expert its workspace pushes out of VRAM needs a host cell back) must fit in it less 2 GiB, in steps of 1024. An explicit `--prefill-batch-max` or `--max-prefill-length` wins | `16384` (unchanged) | `4096` at the default 4 GiB floor (a 20k prompt in 14.9 s; 16384-token chunks ran the box out of RAM) |
+
+### Runtime-tuned settings
+
+Two CPU-assist knobs depend on the PCIe link, the CPU, the RAM and the GPU count, so `ft serve` measures them on the running server instead of taking a number from a table. At start a probe of under a second times one expert fetch over PCIe and the CPU expert kernel for 1 and 32 tokens, which gives the starting values; from then on the measured step and chunk times move them. Nothing is saved, and an explicit flag fixes a knob and turns its tuning off. The log line `autotune probe (...)` shows the starting values and every change prints `autotune: <flag> old -> new (...)`.
+
+| Setting | How it is tuned |
+|---|---|
+| `--moe-decode-fetch` | NVFP4 / W4A16 experts (W4A16 needs AVX-512 BF16): the share of each decode step's expert-cache misses fetched over PCIe, the CPU computing the rest. The tuner walks the ladder 0.06 / 0.12 / 0.25 / 0.5 / plain decode, comparing the current share with a neighbour on CUDA-event times of single decode steps in interleaved 8-step blocks (ABBA, so a warming cache cancels out), and moves when the neighbour is 1% faster. Settled, it re-checks every 4096 steps. The decode graphs are captured with and without the CPU split, so plain decode is a real option (on 2x RTX 3080 it wins on two GPUs for Qwen3.8 and Ling, while 0.12 wins on one GPU and for Hy4-flash on two). `1` = plain decode only, as before |
+| `--moe-routed-prefill-tokens` | Where the CPU computes part of a routed chunk (`--moe-prefill-fetch` below 1): chunks up to the cutoff load only their routed experts, longer ones stream every expert over PCIe. After each chunk the cutoff moves, at most 1.5x, toward where a line through the latest routed chunks' times reaches the time of the latest streamed chunk. Without the CPU part it stays at the flag's value (`0` when unset), so `--moe-prefill-fetch 1 --moe-decode-fetch 1` runs stay bit-reproducible |
+
+`--moe-prefill-fetch` (0.35) is not tuned: its best value depends on the chunk size and it shifts the routed-chunk cost the cutoff tuner learns from, so tuning both from a handful of prefill chunks would not settle.
 
 Prefill chunks (`ft serve` defaults, so `serve.sh` passes nothing): a chunk needs 256 MiB + 230 KiB per token of VRAM for its activations. The standing reserve covers `--prefill-batch-min` (2048) tokens at any context length, and it alone bounds the context (one 16 GB GPU: about 208k tokens). A longer prompt takes what its chunk needs beyond that from the expert cache, coldest experts first, up to `--prefill-batch-max` (16384; less where the RAM saver is on because RAM is short, see above) tokens or whatever the KV cache leaves room for, and gives it back as empty slots before its first decode step. So a 5k-token agent turn retires about 290 expert slots instead of the 1040 a fixed 16384-token borrow took. Long chunks matter because a chunk past `--moe-routed-prefill-tokens` streams every expert over PCIe once: FP4 16k prompt 12.1 -> 6.7 s on one RTX 3080 with 16384- instead of 8192-token chunks, 7.8 -> 5.3 s on two (64k: 47.5 -> 28.1 s, 30.4 -> 21.0 s). An explicit `--max-prefill-length` caps both.
 
@@ -132,34 +140,3 @@ FTW conversion notes:
 - **CUDA OOM during or right after a long prompt:** raise `--vram-keep-free-mb`, or fix the workspace with `--prefill-reserve-gb` (every chunk is then `--prefill-batch-max` tokens).
 - **Load peak too high:** `FREETOKEN_FTW_READ_CONCURRENCY=1` (about -5 GiB).
 - **Per-prefill CPU/GPU split timing:** `FREETOKEN_WNA16_CPU_PREFILL_STATS=1`.
-
-## `calibrate.sh`: CPU-assisted decode
-
-How much of decode's expert-cache misses the CPU should compute depends on the CPU, the RAM, the GPUs and the PCIe link. `calibrate.sh` measures this machine once, with the `MODEL` and `GPUS` you serve with, and prints the flags to pass to `serve.sh`:
-
-```bash
-MODEL=~/models/ftw/q38-fp4 GPUS=0 scripts/calibrate.sh
-...
-Recommendation: scripts/serve.sh --moe-decode-fetch 0.15 --threads 7
-
-MODEL=~/models/ftw/q38-fp4 GPUS=0 scripts/serve.sh --moe-decode-fetch 0.15 --threads 7
-```
-
-It needs idle GPUs and the same free RAM as the server. On 2x RTX 3080 it takes about 12 min with one GPU and 6 min with two. Calibrate again after changing the CPU, RAM, GPUs, PCIe slots or the BIOS memory settings.
-
-1. **Probe, without the server (~5 s):** pinned host->device bandwidth per GPU and of all at once, the CPU's ISA, and the CPU expert kernel's time per expert on one layer of real experts. Without AVX2 (FP4) or AVX-512 BF16 (INT4) it stops here and recommends `--moe-decode-fetch 1`.
-2. **Reference load:** `serve.sh` on `CALIBRATION_PORT` with `--moe-decode-fetch 1`. Three greedy streaming decodes each at about 4k and 100k tokens of context.
-3. **Sweep load:** the server restarts with CPU help and `FREETOKEN_CPU_DECODE_TUNABLE=1`, under which a loopback-only endpoint changes the share (0.5, 0.25, 0.15, 0.1, 0.05) and the thread count between requests. The decode path is fixed per load (the CUDA graphs are captured at start), which is why plain decode gets its own load.
-4. **Pick:** the highest share within 2% of the fastest among those that lose nowhere, the fewest threads within 2% of the fastest, and `--moe-decode-fetch 1` unless the pick beats plain decode by 5% at every context length. The pick and the fastest share then run twice more and the choice is made again from the means of three runs.
-
-It prints a report (hardware, the speed of every share tried, the choice and why) ending with the recommended flags. The server logs and the raw numbers stay in the scratch dir it names (`/tmp/ft-calibrate.*`).
-
-| Var | Default | Meaning |
-|---|---|---|
-| `MODEL`, `GPUS`, `FT_BIN` | as for `serve.sh` | other `serve.sh` variables pass through |
-| `LONG_CONTEXT_TOKENS` | `100000` | long-context length; `0` skips it (about half the time on one GPU) |
-| `SHORT_CONTEXT_TOKENS` | `4096` | short-context length |
-| `MEASURED_TOKENS`, `WARMUP_TOKENS` | `192`, `48` | measured decode tokens per prompt, after this many warm-up tokens |
-| `FIXED_CPU_THREADS` | | fix the CPU thread count instead of sweeping it |
-| `CALIBRATION_PORT` | `18080` | the calibration server's port |
-| `LOAD_TIMEOUT_S` | `900` | seconds to wait for each model load |
