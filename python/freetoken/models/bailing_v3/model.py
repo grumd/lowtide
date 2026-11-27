@@ -86,5 +86,22 @@ class BailingV3ForCausalLM(BaseLLMModel):
     def forward(self) -> torch.Tensor:
         return self.lm_head.forward(self.model.forward(get_global_ctx().batch.input_ids))
 
+    # ----- speculative verify (--ngram-spec, MTP): scheduler/ngram_spec.py, engine/verify_graph.py
+    def forward_logits_all(self) -> torch.Tensor:
+        """``forward`` without the last-row selection: logits for every forwarded row."""
+        return self.lm_head.forward_all(self.model.forward(get_global_ctx().batch.input_ids))
+
+    def _kda_layers(self):
+        return [layer.attention for layer in self.model.layers.op_list if isinstance(layer.attention, BailingV3KDA)]
+
+    def select_verify_width(self, t: int) -> None:
+        for kda in self._kda_layers():
+            kda.select_verify_width(t)
+
+    def commit_mtp_verify(self, pool, slots: torch.Tensor, lens: torch.Tensor) -> None:
+        """Commit each request's accepted verify prefix (``lens``) into every KDA layer's live state."""
+        for kda in self._kda_layers():
+            kda.commit_verify(pool, slots, lens)
+
 
 __all__ = ["BailingV3ForCausalLM", "BailingV3Model"]

@@ -12,8 +12,8 @@ import triton.language as tl
 @triton.jit
 def _stage_kernel(
     x_ptr, s_x, a_ptr, s_a, b_ptr, s_b, cs_ptr, s_cs_slot, s_cs_c, s_cs_k, slots_ptr,
-    win_ptr, s_w_n, s_w_c, mix_ptr, s_m_n, s_m_t, abuf_ptr, bbuf_ptr, C, HV,
-    T: tl.constexpr, KM1: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_H: tl.constexpr,
+    win_ptr, s_w_n, s_w_c, mix_ptr, s_m_n, s_m_t, abuf_ptr, bbuf_ptr, C, HA, HB,
+    T: tl.constexpr, KM1: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_A: tl.constexpr, BLOCK_B: tl.constexpr,
 ):
     n = tl.program_id(0)
     c = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
@@ -28,19 +28,20 @@ def _stage_kernel(
         tl.store(win + KM1 + t, v, mask=cm)
         tl.store(mix_ptr + n * s_m_n + t * s_m_t + c, v, mask=cm)
     if tl.program_id(1) == 0:
-        h = tl.arange(0, BLOCK_H)
-        hm = h < HV
+        ha = tl.arange(0, BLOCK_A)
+        hb = tl.arange(0, BLOCK_B)
         for t in tl.static_range(T):
             row = (n * T + t).to(tl.int64)
-            tl.store(abuf_ptr + row * HV + h, tl.load(a_ptr + row * s_a + h, mask=hm), mask=hm)
-            tl.store(bbuf_ptr + row * HV + h, tl.load(b_ptr + row * s_b + h, mask=hm), mask=hm)
+            tl.store(abuf_ptr + row * HA + ha, tl.load(a_ptr + row * s_a + ha, mask=ha < HA), mask=ha < HA)
+            tl.store(bbuf_ptr + row * HB + hb, tl.load(b_ptr + row * s_b + hb, mask=hb < HB), mask=hb < HB)
 
 
 def stage_verify(conv_in, a, b, conv_state, slots, conv_win, mixed, abuf, bbuf, n: int, t: int) -> None:
     """``conv_win[:n] = [conv_state[slots] | raw^T]``, ``mixed[:n] = raw``, ``abuf/bbuf[:n] = a/b``
-    with ``raw = conv_in`` [n*t, C] (row-strided views are fine)."""
+    with ``raw = conv_in`` [n*t, C] (row-strided views are fine); ``a`` and ``b`` may differ in width
+    (GDN: both per head; KDA: the gate per channel, beta per head)."""
     C = conv_in.shape[1]
-    HV = a.shape[1]
+    HA, HB = a.shape[1], b.shape[1]
     km1 = conv_state.shape[-1]
     assert conv_in.stride(1) == 1 and a.stride(1) == 1 and b.stride(1) == 1 and conv_win.stride(2) == 1
     assert mixed.stride(2) == 1 and abuf.is_contiguous() and bbuf.is_contiguous()
@@ -49,7 +50,8 @@ def stage_verify(conv_in, a, b, conv_state, slots, conv_win, mixed, abuf, bbuf, 
         conv_in, conv_in.stride(0), a, a.stride(0), b, b.stride(0),
         conv_state, conv_state.stride(0), conv_state.stride(1), conv_state.stride(2), slots,
         conv_win, conv_win.stride(0), conv_win.stride(1), mixed, mixed.stride(0), mixed.stride(1),
-        abuf, bbuf, C, HV, T=t, KM1=km1, BLOCK_C=BLOCK_C, BLOCK_H=triton.next_power_of_2(HV),
+        abuf, bbuf, C, HA, HB, T=t, KM1=km1, BLOCK_C=BLOCK_C,
+        BLOCK_A=triton.next_power_of_2(HA), BLOCK_B=triton.next_power_of_2(HB),
         num_warps=4,
     )
 

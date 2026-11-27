@@ -136,3 +136,47 @@ def test_tp2_head_shards_sum_to_the_tp1_output(rig, monkeypatch):
     tp2 = partials[0] + partials[1]
     assert rel(tp2, y64) <= 1.15 * rel(yhf, y64)
     assert rel(tp2, full) < 1e-2
+
+
+def _verify_run(monkeypatch, op, pool, x, slots, n, t):
+    ctx = SimpleNamespace(
+        batch=SimpleNamespace(is_decode=False, mtp_verify=True, mtp_verify_n=n, mtp_verify_t=t,
+                              fla_metadata=fla_meta([t] * n, slots, fresh=False)),
+        linear_state_pool=pool,
+    )
+    monkeypatch.setattr("freetoken.models.bailing_v3.kda.get_global_ctx", lambda: ctx)
+    return op.forward(x)
+
+
+@pytest.mark.parametrize("lens", [(1, 4), (3, 2), (4, 4)])
+def test_verify_window_is_decode_and_the_commit_keeps_the_accepted_rows(rig, monkeypatch, lens):
+    """A speculative verify of t rows per request (n = 2) gives each row the output of a step-at-a-time
+    decode bit for bit, leaves the live recurrent state untouched, and the commit of an accepted prefix L
+    leaves conv and recurrent state exactly where L decode steps would."""
+    config, model = rig
+    op = model.model.layers.op_list[3].attention
+    li, slots, t = 2, [2, 3], 4
+    x, _, _ = _case(316, 3)
+    pool = linear_pool(config)
+    _run(monkeypatch, op, pool, torch.cat([x[:100], x[100:200]]), fla_meta([100, 100], slots, [False, False]))
+    start = (pool.conv_states.clone(), pool.recurrent_states.clone())
+    win = torch.stack([x[200 : 200 + t], x[250 : 250 + t]])  # [n, t, hidden]
+
+    steps, states = [], []
+    for j in range(t):
+        steps.append(_run(monkeypatch, op, pool, win[:, j], fla_meta([1, 1], slots, fresh=False), decode=True))
+        states.append((pool.conv_states[li].clone(), pool.recurrent_states[li].clone()))
+    seq = torch.stack(steps, dim=1)  # [n, t, hidden]
+
+    pool.conv_states.copy_(start[0])
+    pool.recurrent_states.copy_(start[1])
+    out = _verify_run(monkeypatch, op, pool, win.reshape(n := 2, -1).view(n * t, -1), slots, n, t).view(n, t, -1)
+    assert torch.equal(pool.recurrent_states, start[1]), "the verify wrote the live recurrent state"
+    assert torch.equal(out, seq), rel(out, seq)
+
+    op.commit_verify(pool, torch.tensor(slots, dtype=torch.int32, device="cuda"),
+                     torch.tensor(lens, dtype=torch.int32, device="cuda"))
+    for i, (s, L) in enumerate(zip(slots, lens)):
+        conv, rec = states[L - 1]
+        assert torch.equal(pool.conv_states[li, s], conv[s]), (i, L)
+        assert torch.equal(pool.recurrent_states[li, s], rec[s]), (i, L)
