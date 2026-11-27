@@ -56,8 +56,10 @@ class BailingV3Model(BaseOP):
         )
         self.norm = RMSNorm(size=config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = embed_input_ids(self.word_embeddings, input_ids, get_global_ctx().batch)
+    def forward(self, input_ids: torch.Tensor, batch=None) -> torch.Tensor:
+        """``batch``: the running batch (the global context's when omitted; the engine's logit-dump
+        diagnostics pass it)."""
+        x = embed_input_ids(self.word_embeddings, input_ids, batch if batch is not None else get_global_ctx().batch)
         for layer in self.layers.op_list:
             x = layer.forward(x)
         return self.norm.forward(x)

@@ -186,7 +186,7 @@ class ModelRig:
         )
         self.ctx.batch = batch
         self.ctx.attn_backend.prepare_metadata(batch)
-        return self.model.model.forward(batch.input_ids)
+        return self.model.model.forward(batch.input_ids, batch)  # as the engine's logit-dump path calls it
 
     def logits(self, ids: torch.Tensor, t0: int = 0) -> torch.Tensor:
         return self.model.lm_head.logits(self.hidden(ids, t0)).float()
