@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -108,3 +109,70 @@ def use_tp(rank: int, size: int) -> None:
 
     info._TP_INFO = None
     info.set_tp_info(rank, size)
+
+
+def attach_tiny_experts(model, config) -> None:
+    """Resident bf16 expert banks from the tiny checkpoint (Engine._load_resident_experts' path)."""
+    from freetoken.layers import iter_moe_layers
+    from freetoken.layers.quantization.method import finalize_quant
+    from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks
+
+    finalize_quant(model)
+    layers = list(iter_moe_layers(model))
+    banks = load_expert_banks(
+        tiny_ckpt(), config, method=layers[0].quant_method, device=torch.device("cuda"), parallel=False, resident=True,
+    )
+    attach_resident_banks(layers, banks)
+
+
+class ModelRig:
+    """The whole model over one request: MLA latent pool, KDA state pool, the Ling backend, batches."""
+
+    PAGE, ROWS = 64, 1024
+
+    def __init__(self, config, model, monkeypatch):
+        from freetoken.kvcache.dsa_pool import MLAKVCache
+        from freetoken.models.bailing_v3.backend import BailingV3AttnBackend
+
+        self.config, self.model = config, model
+        full = next(g for g in config.attention_groups if g.name == "full")
+        self.kv = MLAKVCache(
+            latent_dim=config.bailing_args.latent_dim, num_layers=len(full.layer_ids), num_pages=self.ROWS // self.PAGE,
+            page_size=self.PAGE, dtype=torch.bfloat16, device=torch.device("cuda"), layer_ids=full.layer_ids,
+        )
+        self.page_table = torch.full((2, self.ROWS), -1, dtype=torch.int32, device="cuda")
+        self.page_table[0] = torch.arange(self.ROWS, dtype=torch.int32, device="cuda")
+        self.pool = linear_pool(config)
+        self.ctx = SimpleNamespace(kv_cache=self.kv, page_table=self.page_table, linear_state_pool=self.pool, attn_backend=None, batch=None)
+        for mod in ("freetoken.attention.dsa", "freetoken.models.bailing_v3.kda", "freetoken.models.bailing_v3.attention",
+                    "freetoken.models.bailing_v3.model", "freetoken.layers.embedding", "freetoken.layers.moe"):
+            monkeypatch.setattr(f"{mod}.get_global_ctx", lambda: self.ctx)
+        self.ctx.attn_backend = BailingV3AttnBackend(config)
+
+    def hidden(self, ids: torch.Tensor, t0: int) -> torch.Tensor:
+        """Final hidden (after model.norm) of every row of this chunk, continuing the request at t0."""
+        from freetoken.attention.linear import FLAMetadata
+
+        t1 = t0 + ids.shape[0]
+        decode = t1 - t0 == 1 and t0 > 0
+        phase = "decode" if decode else "prefill"
+        req = SimpleNamespace(table_idx=0, device_len=t1, extend_len=t1 - t0, cached_len=t0)
+        batch = SimpleNamespace(
+            phase=phase, is_prefill=not decode, is_decode=decode, size=1, reqs=[req], padded_reqs=[req],
+            input_ids=ids.to("cuda"), positions=torch.arange(t0, t1, device="cuda"),
+            out_loc=self.page_table[0, t0:t1].long(),
+            active_table_idx=torch.tensor([0], device="cuda") if decode else None,
+            features=None, mm_embeds=None,
+            fla_metadata=FLAMetadata(
+                cu_seqlens=torch.tensor([0, t1 - t0], dtype=torch.int32, device="cuda"),
+                cache_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+                has_initial_state=None if decode else torch.tensor([t0 > 0], device="cuda"),
+                fresh_state_indices=None if t0 > 0 else torch.tensor([1], dtype=torch.int64, device="cuda"),
+            ),
+        )
+        self.ctx.batch = batch
+        self.ctx.attn_backend.prepare_metadata(batch)
+        return self.model.model.forward(batch.input_ids)
+
+    def logits(self, ids: torch.Tensor, t0: int = 0) -> torch.Tensor:
+        return self.model.lm_head.logits(self.hidden(ids, t0)).float()
