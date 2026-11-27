@@ -51,6 +51,8 @@ void bind_locked_fetch(pybind11::module_& m);
 namespace {
 
 constexpr int kMaxTopK = 64;
+// Routes per down() call of a pass 2 item grouped by expert (at least kMaxTopK, so one token always fits).
+constexpr int kMaxGroupedRoutes = 256;
 
 // One MoE layer on the first num_tokens rows of the pinned IO.
 // It is also the doorbell word the GPU writes, a constant baked into each captured graph; num_tokens >= 1 keeps it nonzero, since 0 means no doorbell.
@@ -153,6 +155,8 @@ struct CpuMoeExecutor {
   // Hybrid hands the CPU a few routes of a step: only these get work items, since a claim that finds nothing still costs a contended atomic.
   std::vector<int64_t> active_routes;  // intermediate rows tok * top_k + k whose route names an expert
   std::vector<int> active_tokens;      // tokens with at least one such route
+  std::vector<int64_t> token_routes;   // active_routes[token_routes[i], token_routes[i + 1]) are active token i's
+  std::vector<int> route_at;           // route_at[r] = the place of route r in active_routes
   // Pass 1 splits the work by expert: one item computes a block for every token on that expert, so the block is read from DRAM once.
   // Only a step where some expert has two or more routes is grouped; otherwise pass 1 item u is active route u.
   bool grouped = false;
@@ -207,6 +211,8 @@ struct CpuMoeExecutor {
     g_scratch.assign(static_cast<size_t>(params.max_tokens) * params.top_k * params.I, 0);
     active_routes.reserve(static_cast<size_t>(params.max_tokens) * params.top_k);
     active_tokens.reserve(params.max_tokens);
+    token_routes.reserve(params.max_tokens + 1);
+    route_at.assign(static_cast<size_t>(params.max_tokens) * params.top_k, 0);
     const size_t max_routes = static_cast<size_t>(params.max_tokens) * params.top_k;
     expert_routes.reserve(max_routes);
     expert_start.reserve(max_routes + 1);
@@ -285,7 +291,8 @@ struct CpuMoeExecutor {
   }
 
   // Pass 1 item p = one kRowBlock block of one expert's intermediate rows, for each active route on that expert (one if
-  // ungrouped). The routes run back to back on one worker, so every token after the first reads the block from cache.
+  // ungrouped). The routes run back to back on one worker, so every token after the first reads the block from cache, and
+  // a format with a multi-token kernel decodes it once for all of them (gate_up_routes).
   void do_pass1(const MoeTask& t, int64_t p) {
     const int top_k = params.top_k, H = params.H, I = params.I;
     const MoeFormat& f = format_of(t);
@@ -296,11 +303,21 @@ struct CpuMoeExecutor {
     const int i1 = std::min(I, i0 + rb);
     const int64_t* routes = grouped ? expert_routes.data() + expert_start[u] : active_routes.data() + u;
     const int64_t n = grouped ? expert_start[u + 1] - expert_start[u] : 1;
-    for (int64_t j = 0; j < n; ++j) {
-      const int64_t r = routes[j];
-      const int tok = static_cast<int>(r / top_k);
-      const float w_in = apply_on_input ? io_w[r] : 1.0f;
-      f.gate_up(static_cast<int>(t.layer), io_ids[r], tok, i0, i1, io_x + (size_t)tok * H, w_in, g_scratch.data() + (size_t)r * I);
+    constexpr int kBatch = 16;
+    int toks[kBatch];
+    const bf16_t* xs[kBatch];
+    float w_in[kBatch];
+    bf16_t* gs[kBatch];
+    for (int64_t j0 = 0; j0 < n; j0 += kBatch) {
+      const int m = static_cast<int>(std::min<int64_t>(kBatch, n - j0));
+      for (int j = 0; j < m; ++j) {
+        const int64_t r = routes[j0 + j];
+        toks[j] = static_cast<int>(r / top_k);
+        xs[j] = io_x + (size_t)toks[j] * H;
+        w_in[j] = apply_on_input ? io_w[r] : 1.0f;
+        gs[j] = g_scratch.data() + (size_t)r * I;
+      }
+      f.gate_up_routes(static_cast<int>(t.layer), io_ids[routes[j0]], i0, i1, m, toks, xs, w_in, gs);
     }
   }
 
@@ -310,7 +327,51 @@ struct CpuMoeExecutor {
     const int64_t hb = p % n_hblk;
     const int64_t first = p / n_hblk * p2_tokens;
     const int64_t last = std::min<int64_t>(static_cast<int64_t>(active_tokens.size()), first + p2_tokens);
+    if (grouped && format_of(t).down_shares_experts()) return down_tokens_by_expert(t, first, last, hb);
     for (int64_t i = first; i < last; ++i) down_block(t, active_tokens[i], hb);
+  }
+
+  // down_block for active tokens [first, last) at once: down() gets their routes grouped by expert, so it can decode a
+  // shared expert's rows once, and each token still sums its own routes in route order, as down_block does.
+  void down_tokens_by_expert(const MoeTask& t, int64_t first, int64_t last, int64_t hb) {
+    const int top_k = params.top_k, H = params.H, I = params.I;
+    const MoeFormat& f = format_of(t);
+    const int rb = f.row_block();
+    const int h0 = static_cast<int>(hb) * rb;
+    const int h1 = std::min(H, h0 + rb);
+    const bool rounds_routes = f.rounds_routes();
+    DownRoute routes[kMaxGroupedRoutes];
+    int at[kMaxGroupedRoutes];  // at[q - q0] = the place of active route q in routes
+    float part[kMaxGroupedRoutes * kMaxRowBlock];
+    for (int64_t a = first; a < last;) {
+      int64_t b = a + 1;
+      while (b < last && token_routes[b + 1] - token_routes[a] <= kMaxGroupedRoutes) ++b;
+      const int64_t q0 = token_routes[a];
+      const int lo = active_tokens[a], hi = active_tokens[b - 1];
+      int n = 0;
+      for (const int64_t r : expert_routes) {
+        const int tok = static_cast<int>(r / top_k);
+        if (tok < lo || tok > hi) continue;
+        at[route_at[r] - q0] = n;
+        routes[n++] = {io_ids[r], r, g_scratch.data() + (size_t)r * I};
+      }
+      f.down(static_cast<int>(t.layer), h0, h1, routes, n, part);
+      for (int64_t i = a; i < b; ++i) {
+        const int tok = active_tokens[i];
+        for (int h = h0; h < h1; ++h) {
+          float acc = 0.0f;
+          for (int64_t q = token_routes[i]; q < token_routes[i + 1]; ++q) {
+            const float v = part[at[q - q0] * rb + h - h0] * (apply_on_input ? 1.0f : io_w[active_routes[q]]);
+            acc += rounds_routes ? bf16_to_f32(f32_to_bf16(v)) : v;
+          }
+          if (io_y32)
+            io_y32[(size_t)tok * H + h] = acc;
+          else
+            io_y[(size_t)tok * H + h] = f32_to_bf16(acc);
+        }
+      }
+      a = b;
+    }
   }
 
   // One kRowBlock block of token tok's output row, summed over its routes.
@@ -486,17 +547,24 @@ struct CpuMoeExecutor {
     n_hblk = (params.H + fmt.row_block() - 1) / fmt.row_block();
     active_routes.clear();
     active_tokens.clear();
+    token_routes.clear();
     for (int tok = 0; tok < num_tokens; ++tok) {
       const size_t before = active_routes.size();
       for (int k = 0; k < params.top_k; ++k) {
         const int64_t r = static_cast<int64_t>(tok) * params.top_k + k;
-        if (io_ids[r] >= 0 && io_ids[r] < num_experts) active_routes.push_back(r);
+        if (io_ids[r] >= 0 && io_ids[r] < num_experts) {
+          route_at[r] = static_cast<int>(active_routes.size());
+          active_routes.push_back(r);
+        }
       }
-      if (active_routes.size() > before)
+      if (active_routes.size() > before) {
         active_tokens.push_back(tok);
-      else
+        token_routes.push_back(static_cast<int64_t>(before));
+      } else {
         clear_y(tok, 1);
+      }
     }
+    token_routes.push_back(static_cast<int64_t>(active_routes.size()));
     group_routes_by_expert();
     // When some expert serves several tokens, pass 2 puts as many tokens in an item as still leaves each worker about
     // four items; otherwise there is nothing to reuse and an item stays one token, as finer items balance better.

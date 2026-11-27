@@ -22,8 +22,9 @@ namespace freetoken::cpu_moe {
 //   - AMX-bf16: a GEMM tile engine; decode is M=1 GEMV so tiles sit idle. It would
 //     only pay off in a grouped/batched (multi-token) path.
 //   - multi-token kernels for bs>1: the executor groups a step's routes by expert, so a
-//     shared expert's block comes from DRAM once, but each token still decodes it. Decoding
-//     once for several tokens only pays off where decode, not bandwidth, bounds the GEMV.
+//     shared expert's block comes from DRAM once. Only nvfp4's vdpbf16ps dot also decodes
+//     it once for several tokens (gate_up_routes, down_shares_experts); elsewhere each token
+//     still decodes it, which only costs where decode, not bandwidth, bounds the GEMV.
 //   - NUMA: a single node is assumed. Multi-socket machines would split each
 //     expert's K dimension per node (banks are already per-row contiguous).
 constexpr int kRowBlock = 32;
@@ -123,9 +124,17 @@ class MoeFormat {
   // w_in scales the gate and up dots: the router weight when it applies on the input, else 1.
   virtual void gate_up(int layer, int e, int tok, int i0, int i1, const bf16_t* x, float w_in,
                        bf16_t* g) const = 0;
+  // Pass 1 for n routes on expert e: route j runs gate_up on token toks[j] (input x[j], weight w_in[j]) into g[j].
+  // A format whose kernel takes several tokens per weight block decodes each block once for all n.
+  virtual void gate_up_routes(int layer, int e, int i0, int i1, int n, const int* toks, const bf16_t* const* x,
+                              const float* w_in, bf16_t* const* g) const {
+    for (int j = 0; j < n; ++j) gate_up(layer, e, toks[j], i0, i1, x[j], w_in[j], g[j]);
+  }
   // Pass 2: out[j * row_block() + h - h0] for h in [h0, h1) (at most row_block() rows) and each of the n routes, before the router weight.
   // Visiting the routes' rows h together keeps n weight streams in flight, which the down GEMV needs to reach DRAM bandwidth.
   virtual void down(int layer, int h0, int h1, const DownRoute* routes, int n, float* out) const = 0;
+  // Whether down() decodes a weight block once for consecutive routes on one expert, so pass 2 should hand it routes grouped by expert.
+  virtual bool down_shares_experts() const { return false; }
   // Round each router-weighted down output to bf16 before the sum over routes.
   virtual bool rounds_routes() const { return false; }
 

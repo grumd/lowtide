@@ -405,6 +405,116 @@ void quant_i8_avx512(const bf16_t* x, int K, int8_t* q, float* scale, int32_t* c
 #endif  // avx512vnni available
 #endif
 
+// ---- NVFP4 x bf16 activations via vdpbf16ps, M <= 8 routes of one expert per pass ----
+// The same math as nvfp4_cpu.h (CPU prefill), with per-function targets since this build sets no -march.
+// A 64-k chunk of a row is 32 bytes: the low nibbles index an exact e2m1 -> bf16 table for k = 64c + 2i, the
+// high ones for k = 64c + 2i + 1, and vdpbf16ps pairs words (2j, 2j+1), so lane j covers k in [64c+4j, 64c+4j+3]
+// (one 16-k scale block) and the block scale multiplies the fresh lane sums in fp32.
+// Each route keeps its own accumulator, so a route's result does not depend on M or on the other routes.
+constexpr int kBf16MaxRoutes = 8;
+
+// bf16 activations [K] (K % 64 == 0) -> the lane pairs: lo[K/4] takes (k, k+2), hi[K/4] takes (k+1, k+3)
+void bf16_pack_pairs(const bf16_t* x, int K, uint32_t* lo, uint32_t* hi) {
+  for (int c = 0; c < K / 64; ++c)
+    for (int j = 0; j < 16; ++j) {
+      const bf16_t* b = x + 64 * c + 4 * j;
+      lo[16 * c + j] = uint32_t(b[0]) | (uint32_t(b[2]) << 16);
+      hi[16 * c + j] = uint32_t(b[1]) | (uint32_t(b[3]) << 16);
+    }
+}
+
+#ifdef CPU_MOE_HAS_AVX512BF16
+#define CPU_MOE_BF16DOT_TARGET CPU_MOE_TARGET("avx512bf16,avx512vl,avx512bw,avx512f,fma,f16c")
+
+CPU_MOE_BF16DOT_TARGET
+inline __m512i e2m1_bf16_lut() {
+  // index = 4-bit code (the table repeats: vpermw reads 5 index bits)
+  return _mm512_set_epi16(
+      int16_t(0xC0C0), int16_t(0xC080), int16_t(0xC040), int16_t(0xC000), int16_t(0xBFC0), int16_t(0xBF80),
+      int16_t(0xBF00), int16_t(0x8000), 0x40C0, 0x4080, 0x4040, 0x4000, 0x3FC0, 0x3F80, 0x3F00, 0x0000,
+      int16_t(0xC0C0), int16_t(0xC080), int16_t(0xC040), int16_t(0xC000), int16_t(0xBFC0), int16_t(0xBF80),
+      int16_t(0xBF00), int16_t(0x8000), 0x40C0, 0x4080, 0x4040, 0x4000, 0x3FC0, 0x3F80, 0x3F00, 0x0000);
+}
+
+// four e4m3 scale bytes -> 16 lanes (lane j takes byte j / 4) as fp32 * 2^-8, exact for every e4m3 code
+CPU_MOE_BF16DOT_TARGET
+inline __m512 e4m3_scale_lanes(const uint8_t* s4) {
+  const __m128i spread = _mm_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+  uint32_t v;
+  std::memcpy(&v, s4, 4);
+  const __m512i b = _mm512_cvtepu8_epi32(_mm_shuffle_epi8(_mm_cvtsi32_si128(int(v)), spread));
+  const __m512i h = _mm512_or_si512(_mm512_slli_epi32(_mm512_and_si512(b, _mm512_set1_epi32(0x80)), 8),
+                                    _mm512_slli_epi32(_mm512_and_si512(b, _mm512_set1_epi32(0x7F)), 7));
+  return _mm512_cvtph_ps(_mm512_cvtepi32_epi16(h));
+}
+
+// out[m * ld + r] = global[r] * sum_k W[r, k] * x_m[k] for rows [0, rows), K = 64 * nchunks
+template <int M>
+CPU_MOE_BF16DOT_TARGET void nvfp4_rows_dot_bf16(const uint8_t* P, const uint8_t* S, const float* G, int rows,
+                                                 int nchunks, const uint32_t* const* xlo, const uint32_t* const* xhi,
+                                                 float* out, int ld) {
+  const __m512i lut = e2m1_bf16_lut();
+  const __m512i low4 = _mm512_set1_epi16(0xF);
+  const int64_t prow = int64_t(nchunks) * 32, srow = int64_t(nchunks) * 4;
+  // Prefetch inside this call's rows only: past them lies another work item's block.
+  const int pfb = nvfp4_pf_blocks();
+  const int64_t pf_bytes = pfb < 0 ? 1024 : int64_t(pfb) * 8, pf_s_bytes = pfb < 0 ? 128 : pfb;
+  const uint8_t* const p_end = P + rows * prow;
+  const uint8_t* const s_end = S + rows * srow;
+  for (int r = 0; r < rows; ++r) {
+    const uint8_t* pr = P + r * prow;
+    const uint8_t* sr = S + r * srow;
+    __m512 acc[M];
+    for (int m = 0; m < M; ++m) acc[m] = _mm512_setzero_ps();
+    for (int c = 0; c < nchunks; ++c) {
+      if (pf_bytes > 0 && (c & 1) == 0) {
+        if (const uint8_t* pp = pr + 32 * c + pf_bytes; pp < p_end) _mm_prefetch(reinterpret_cast<const char*>(pp), _MM_HINT_T0);
+        if ((c & 15) == 0)
+          if (const uint8_t* ps = sr + 4 * c + pf_s_bytes; ps < s_end) _mm_prefetch(reinterpret_cast<const char*>(ps), _MM_HINT_T0);
+      }
+      const __m512i w = _mm512_cvtepu8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(pr + 32 * c)));
+      const __m512bh wlo = (__m512bh)_mm512_permutexvar_epi16(_mm512_and_si512(w, low4), lut);
+      const __m512bh whi = (__m512bh)_mm512_permutexvar_epi16(_mm512_srli_epi16(w, 4), lut);
+      const __m512 sv = e4m3_scale_lanes(sr + 4 * c);
+#pragma GCC unroll 8
+      for (int m = 0; m < M; ++m) {
+        __m512 t = _mm512_dpbf16_ps(_mm512_setzero_ps(), wlo, (__m512bh)_mm512_loadu_si512(xlo[m] + 16 * c));
+        t = _mm512_dpbf16_ps(t, whi, (__m512bh)_mm512_loadu_si512(xhi[m] + 16 * c));
+        acc[m] = _mm512_fmadd_ps(t, sv, acc[m]);
+      }
+    }
+    const float g = G[r] * kE4m3ViaF16;
+    for (int m = 0; m < M; ++m) out[m * ld + r] = _mm512_reduce_add_ps(acc[m]) * g;
+  }
+}
+
+void nvfp4_rows_dot_bf16_n(int M, const uint8_t* P, const uint8_t* S, const float* G, int rows, int nchunks,
+                           const uint32_t* const* xlo, const uint32_t* const* xhi, float* out, int ld) {
+  switch (M) {
+    case 1: return nvfp4_rows_dot_bf16<1>(P, S, G, rows, nchunks, xlo, xhi, out, ld);
+    case 2: return nvfp4_rows_dot_bf16<2>(P, S, G, rows, nchunks, xlo, xhi, out, ld);
+    case 3: return nvfp4_rows_dot_bf16<3>(P, S, G, rows, nchunks, xlo, xhi, out, ld);
+    case 4: return nvfp4_rows_dot_bf16<4>(P, S, G, rows, nchunks, xlo, xhi, out, ld);
+    case 5: return nvfp4_rows_dot_bf16<5>(P, S, G, rows, nchunks, xlo, xhi, out, ld);
+    case 6: return nvfp4_rows_dot_bf16<6>(P, S, G, rows, nchunks, xlo, xhi, out, ld);
+    case 7: return nvfp4_rows_dot_bf16<7>(P, S, G, rows, nchunks, xlo, xhi, out, ld);
+    default: return nvfp4_rows_dot_bf16<8>(P, S, G, rows, nchunks, xlo, xhi, out, ld);
+  }
+}
+#endif  // CPU_MOE_HAS_AVX512BF16
+
+// Whether the vdpbf16ps dot serves this shape here: it needs K % 64 == 0 on both GEMVs; FREETOKEN_CPU_MOE_ISA below
+// avx512bf16 keeps the fp32 dot.
+bool use_bf16_dot(int H, int I) {
+#ifdef CPU_MOE_HAS_AVX512BF16
+  return H % 64 == 0 && I % 64 == 0 && pick_isa() >= ISA_AVX512BF16 && __builtin_cpu_supports("avx512vl") &&
+         __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("f16c") && __builtin_cpu_supports("fma");
+#else
+  (void)H, (void)I;
+  return false;
+#endif
+}
+
 #if CPU_MOE_X86
 // a 32-bit lane holds one (even, odd) bf16 pair: even in the low half
 CPU_MOE_TARGET("avx512f")
@@ -483,9 +593,15 @@ class Nvfp4Format final : public MoeFormat {
     dn_scale_ = a.bank("down_scale");
     dn_global_ = a.bank("down_global");
     const size_t tokens = p.max_tokens, routes = (size_t)p.max_tokens * p.top_k;
+    bf16_dot_ = w4a8_.dot == nullptr && use_bf16_dot(p.H, p.I);
     if (w4a8_.dot != nullptr) {
       xq_.resize(tokens, p.H);
       gq_.resize(routes, p.I);
+    } else if (bf16_dot_) {
+      xlo_.resize(tokens * (p.H / 4));
+      xhi_.resize(tokens * (p.H / 4));
+      glo_.resize(routes * (p.I / 4));
+      ghi_.resize(routes * (p.I / 4));
     } else {
       xe_.resize(tokens * (p.H / 2));
       xo_.resize(tokens * (p.H / 2));
@@ -505,6 +621,10 @@ class Nvfp4Format final : public MoeFormat {
 
 
   void prep_input(int tok, const bf16_t* x) override {
+    if (bf16_dot_) {
+      bf16_pack_pairs(x, p.H, xlo_.data() + (size_t)tok * (p.H / 4), xhi_.data() + (size_t)tok * (p.H / 4));
+      return;
+    }
     if (w4a8_.dot != nullptr) {
       xq_.quant(w4a8_.quant, tok, x);
       return;
@@ -517,6 +637,10 @@ class Nvfp4Format final : public MoeFormat {
   bool preps_inter() const override { return true; }
 
   void prep_inter(int64_t r, bf16_t* g) override {
+    if (bf16_dot_) {
+      bf16_pack_pairs(g, p.I, glo_.data() + (size_t)r * (p.I / 4), ghi_.data() + (size_t)r * (p.I / 4));
+      return;
+    }
     if (w4a8_.dot != nullptr) {
       gq_.quant(w4a8_.quant, r, g);
       return;
@@ -526,8 +650,9 @@ class Nvfp4Format final : public MoeFormat {
     deinterleave(g, ge, go, p.I);
   }
 
-  void gate_up(int layer, int e, int tok, int i0, int i1, const bf16_t* /*x*/, float w_in,
+  void gate_up(int layer, int e, int tok, int i0, int i1, const bf16_t* x, float w_in,
                bf16_t* g) const override {
+    if (bf16_dot_) return gate_up_routes(layer, e, i0, i1, 1, &tok, &x, &w_in, &g);
     const int H = p.H;
     const uint8_t* packed = static_cast<const uint8_t*>(tbl_at(gate_up_, layer));
     const uint8_t* scale = static_cast<const uint8_t*>(tbl_at(gu_scale_, layer));
@@ -549,11 +674,67 @@ class Nvfp4Format final : public MoeFormat {
     });
   }
 
+  // Routes that share the expert decode each block of its rows once.
+  void gate_up_routes(int layer, int e, int i0, int i1, int n, const int* toks, const bf16_t* const* x,
+                      const float* w_in, bf16_t* const* g) const override {
+#ifdef CPU_MOE_HAS_AVX512BF16
+    if (bf16_dot_) {
+      const int H = p.H, I = p.I, ni = i1 - i0;
+      const uint8_t* packed = static_cast<const uint8_t*>(tbl_at(gate_up_, layer));
+      const uint8_t* scale = static_cast<const uint8_t*>(tbl_at(gu_scale_, layer));
+      const float* global = static_cast<const float*>(tbl_at(gu_global_, layer));
+      const size_t gate = (size_t)e * (2 * I) + i0, up = gate + I;
+      alignas(64) float gate_out[kBf16MaxRoutes * kMaxRowBlock], up_out[kBf16MaxRoutes * kMaxRowBlock];
+      for (int j0 = 0; j0 < n; j0 += kBf16MaxRoutes) {
+        const int m = std::min(kBf16MaxRoutes, n - j0);
+        const uint32_t* xl[kBf16MaxRoutes];
+        const uint32_t* xh[kBf16MaxRoutes];
+        for (int j = 0; j < m; ++j) {
+          xl[j] = xlo_.data() + (size_t)toks[j0 + j] * (H / 4);
+          xh[j] = xhi_.data() + (size_t)toks[j0 + j] * (H / 4);
+        }
+        nvfp4_rows_dot_bf16_n(m, packed + gate * (H / 2), scale + gate * (H / 16), global + gate, ni, H / 64, xl, xh,
+                              gate_out, ni);
+        nvfp4_rows_dot_bf16_n(m, packed + up * (H / 2), scale + up * (H / 16), global + up, ni, H / 64, xl, xh,
+                              up_out, ni);
+        for (int j = 0; j < m; ++j)
+          gated_rows(p, i0, i1, w_in[j0 + j], g[j0 + j],
+                     [&](int row) { return row < I ? gate_out[j * ni + row - i0] : up_out[j * ni + row - I - i0]; });
+      }
+      return;
+    }
+#endif
+    MoeFormat::gate_up_routes(layer, e, i0, i1, n, toks, x, w_in, g);
+  }
+
+  bool down_shares_experts() const override { return bf16_dot_; }
+
   void down(int layer, int h0, int h1, const DownRoute* routes, int n, float* out) const override {
     const int I = p.I;
     const uint8_t* packed = static_cast<const uint8_t*>(tbl_at(down_, layer));
     const uint8_t* scale = static_cast<const uint8_t*>(tbl_at(dn_scale_, layer));
     const float* global = static_cast<const float*>(tbl_at(dn_global_, layer));
+#ifdef CPU_MOE_HAS_AVX512BF16
+    if (bf16_dot_) {
+      const int rb = row_block();
+      for (int j0 = 0; j0 < n;) {
+        // a run of routes on one expert, at most kBf16MaxRoutes
+        int m = 1;
+        while (j0 + m < n && m < kBf16MaxRoutes && routes[j0 + m].e == routes[j0].e) ++m;
+        const uint32_t* gl[kBf16MaxRoutes];
+        const uint32_t* gh[kBf16MaxRoutes];
+        for (int j = 0; j < m; ++j) {
+          gl[j] = glo_.data() + (size_t)routes[j0 + j].r * (I / 4);
+          gh[j] = ghi_.data() + (size_t)routes[j0 + j].r * (I / 4);
+        }
+        const size_t row = (size_t)routes[j0].e * p.H + h0;
+        nvfp4_rows_dot_bf16_n(m, packed + row * (I / 2), scale + row * (I / 16), global + row, h1 - h0, I / 64, gl,
+                              gh, out + j0 * rb, rb);
+        j0 += m;
+      }
+      return;
+    }
+#endif
     for (int h = h0; h < h1; ++h) {
       for (int j = 0; j < n; ++j) {
         const size_t r = (size_t)routes[j].r;
@@ -575,6 +756,7 @@ class Nvfp4Format final : public MoeFormat {
   }
 
   bool simd_prep_ = false;
+  bool bf16_dot_ = false;  // the vdpbf16ps dot on bf16 lane pairs instead of the fp32 one
   nvdot_fn nvdot_;
   const W4a8Kernel w4a8_;  // null dot -> use fp32 nvdot
   // ModelOpt rows: packed e2m1 [E,2I,H/2], e4m3 scales per 16 along K [E,2I,H/16], fp32 row globals [E,2I]; down likewise with K = I.
@@ -587,8 +769,9 @@ class Nvfp4Format final : public MoeFormat {
   std::string isa_;
   float e2m1_lut_[16];
   float e4m3_lut_[256];
-  // fp32 even/odd activations for the fp32 dot, or the W4A8 int8 rows.
+  // fp32 even/odd activations for the fp32 dot, bf16 lane pairs for the bf16 dot, or the W4A8 int8 rows.
   AlignedVector<float> xe_, xo_, ge_, go_;
+  AlignedVector<uint32_t> xlo_, xhi_, glo_, ghi_;
   W4a8Rows xq_, gq_;
 };
 

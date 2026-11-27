@@ -1430,7 +1430,6 @@ def test_nvfp4_tiled_multitoken_shared_experts(T, out_fp32, activation):
         w4a8=False,
     )
     io = ex.stage(0, T)
-    task = ex._task_for(0, T)
 
     g = torch.Generator().manual_seed(1000 + T + int(out_fp32) * 17)
     x = (torch.randn(T, H, generator=g) * 2.0).bfloat16()
@@ -1450,7 +1449,7 @@ def test_nvfp4_tiled_multitoken_shared_experts(T, out_fp32, activation):
     io["ids"].copy_(ids)
     io["w"].copy_(w)
     io["y"].fill_(999.0)  # sentinel: inactive rows must be overwritten with 0
-    ex._ext.run_task(task)
+    ex._ext.run(0, T)
     got = io["y"].clone()
 
     ref = _nvfp4_exact_ref(
@@ -1468,7 +1467,7 @@ def test_nvfp4_tiled_multitoken_shared_experts(T, out_fp32, activation):
     # Empty active-route batch: every token has all -1 routes -> strict zeros
     io["ids"].fill_(-1)
     io["y"].fill_(777.0)
-    ex._ext.run_task(task)
+    ex._ext.run(0, T)
     assert torch.equal(io["y"], torch.zeros_like(io["y"])), "empty active batch must zero output"
 
 
@@ -1494,7 +1493,6 @@ def test_nvfp4_tiled_pooled_high_expert_ids_and_epilogues():
         w4a8=False,
     )
     io = ex.stage(0, T)
-    task = ex._task_for(0, T)
 
     g = torch.Generator().manual_seed(99)
     high_pools = [
@@ -1514,7 +1512,7 @@ def test_nvfp4_tiled_pooled_high_expert_ids_and_epilogues():
         io["ids"].copy_(ids)
         io["w"].copy_(w)
         io["y"].fill_(-123.0)
-        ex._ext.run_task(task)
+        ex._ext.run(0, T)
         got = io["y"].clone()
         ref = _nvfp4_exact_ref(
             cache, 0, x, ids, w,
@@ -1527,5 +1525,5 @@ def test_nvfp4_tiled_pooled_high_expert_ids_and_epilogues():
         for nthr in (1, 2, 4):
             ex.set_active_threads(nthr)
             io["y"].zero_()
-            ex._ext.run_task(task)
+            ex._ext.run(0, T)
             assert torch.equal(io["y"], got), f"step={step} nthr={nthr} non-deterministic"
