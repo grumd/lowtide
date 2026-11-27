@@ -61,3 +61,50 @@ def rel(a: torch.Tensor, b: torch.Tensor) -> float:
     """Relative Frobenius error of ``a`` against ``b``."""
     a, b = a.double().cpu(), b.double().cpu()
     return ((a - b).norm() / b.norm()).item()
+
+
+def build_tiny_model(config=None):
+    """The tiny checkpoint's model on the current CUDA device, dense weights through the real reader
+    (resident experts are attached separately, see ``attach_tiny_experts``)."""
+    from freetoken.models.bailing_v3.model import BailingV3ForCausalLM
+    from freetoken.models.bailing_v3.weight import iter_weights
+    from freetoken.utils.torch_utils import torch_dtype
+
+    config = config or tiny_config()
+    with torch.device("cuda"), torch_dtype(torch.bfloat16):
+        model = BailingV3ForCausalLM(config)
+    model.load_state_dict(dict(iter_weights(tiny_ckpt(), torch.device("cuda"), include_moe_experts=False, include_non_moe=True)))
+    return config, model
+
+
+def linear_pool(config, num_slots: int = 6):
+    from freetoken.distributed import get_tp_info
+    from freetoken.kvcache.linear_state_pool import LinearStatePool
+
+    return LinearStatePool(
+        config.linear_attention_group(), num_slots, dtype=torch.bfloat16, device=torch.device("cuda"),
+        tp_size=get_tp_info().size,
+    )
+
+
+def fla_meta(lens, slots, has_init=None, fresh=True, track=None):
+    """FLAMetadata for one forward: ``lens`` tokens per request into linear ``slots``."""
+    from freetoken.attention.linear import FLAMetadata
+
+    cu = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
+    meta = FLAMetadata(
+        cu_seqlens=cu, cache_indices=torch.tensor(slots, dtype=torch.int32, device="cuda"),
+        has_initial_state=None if has_init is None else torch.tensor(has_init, device="cuda"),
+        fresh_state_indices=torch.tensor(slots, dtype=torch.int64, device="cuda") if fresh else None,
+    )
+    if track is not None:
+        meta.track_dst, meta.track_h_row, meta.track_conv_src = track
+    return meta
+
+
+def use_tp(rank: int, size: int) -> None:
+    """set_tp_info is one-shot per process; reset the module state (tests only)."""
+    from freetoken.distributed import info
+
+    info._TP_INFO = None
+    info.set_tp_info(rank, size)
