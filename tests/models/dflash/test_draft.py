@@ -308,7 +308,7 @@ def test_gguf_rope_dimension_sections(tmp_path, sections, accepted):
 ])
 @pytest.mark.parametrize("block", [4, 8])
 def test_block_forward_matches_reference(tmp_path, block, dtype, source, tol):
-    """Two requests in one block forward: one with a context shorter than the window (positions before 0 masked), one longer than the ring (wrapped slots). The fp32 safetensors draft pins the math (tf32 dots); every bf16 draft, the serving dtype, is held to bf16 noise. A ring rebuilt from only the window rows gives the same hidden, bitwise. The GGUF fixtures repeat the run from the real file's tensor names, so a wrong leaf, k/v order, gate/up order or conv-base orientation cannot hide behind the safetensors reader; the Q8_0 one reads its layer matrices through the ggml kernels against the file's own dequantized values."""
+    """Two requests in one block forward: one with a context shorter than the window (positions before 0 masked), one longer than the ring (wrapped slots). The fp32 safetensors draft pins the math (tf32 dots); every bf16 draft, the serving dtype, is held to bf16 noise. The block reads nothing older than the window: with every other slot zeroed the hidden is the same, bitwise; a ring rebuilt from only the window rows holds the same K/V up to the projection's rounding and drafts the same block. The GGUF fixtures repeat the run from the real file's tensor names, so a wrong leaf, k/v order, gate/up order or conv-base orientation cannot hide behind the safetensors reader; the Q8_0 one reads its layer matrices through the ggml kernels against the file's own dequantized values."""
     w = _weights(Q8_RANK, Q8_SEED) if source == "gguf-q8" else _weights()
     ref_w = _quantized_weights(tmp_path / "oracle", w) if source == "gguf-q8" else w
     draft, ref = _load_draft(tmp_path, w, dtype, source), _Reference(ref_w)
@@ -335,17 +335,31 @@ def test_block_forward_matches_reference(tmp_path, block, dtype, source, tol):
     hidden = draft.forward_block(bonus, starts, rows_t, dflash_ring)
 
     assert hidden.shape == (2 * block, H) and hidden.dtype == dtype
+    wants = [ref.block(int(bonus[b]), lengths[b], contexts[b], block) for b in range(2)]
     for b in range(2):
-        want = ref.block(int(bonus[b]), lengths[b], contexts[b], block)
-        torch.testing.assert_close(hidden[b * block : (b + 1) * block].float(), want, atol=tol, rtol=tol)
+        torch.testing.assert_close(hidden[b * block : (b + 1) * block].float(), wants[b], atol=tol, rtol=tol)
 
-    # a restore from the window loses nothing, and the block reads nothing older
+    # the block reads nothing older than the window
+    windows = [torch.arange(max(0, n - WINDOW + 1), n, device=DEV) for n in lengths]
+    stored_k, stored_v = dflash_ring.k.clone(), dflash_ring.v.clone()
     dflash_ring.k.zero_()
     dflash_ring.v.zero_()
-    for n, row, ctx in zip(lengths, rows, draft_contexts):
-        window = torch.arange(max(0, n - WINDOW + 1), n, device=DEV)
-        draft.store_context(ctx[window], window, torch.full((len(window),), row, device=DEV), dflash_ring)
+    for row, window in zip(rows, windows):
+        dflash_ring.k[:, row, window % RING] = stored_k[:, row, window % RING]
+        dflash_ring.v[:, row, window % RING] = stored_v[:, row, window % RING]
     assert torch.equal(draft.forward_block(bonus, starts, rows_t, dflash_ring), hidden)
+
+    # a restore from the window loses nothing, up to rounding: cuBLAS picks the projection GEMM by row count,
+    # so the 15-row restore may round differently from the 80-row store (fp32 does on an RTX 3080)
+    dflash_ring.k.zero_()
+    dflash_ring.v.zero_()
+    for row, window, ctx in zip(rows, windows, draft_contexts):
+        draft.store_context(ctx[window], window, torch.full((len(window),), row, device=DEV), dflash_ring)
+        torch.testing.assert_close(dflash_ring.k[:, row, window % RING], stored_k[:, row, window % RING])
+        torch.testing.assert_close(dflash_ring.v[:, row, window % RING], stored_v[:, row, window % RING])
+    restored = draft.forward_block(bonus, starts, rows_t, dflash_ring)
+    for b in range(2):
+        torch.testing.assert_close(restored[b * block : (b + 1) * block].float(), wants[b], atol=tol, rtol=tol)
 
 
 @pytest.mark.parametrize("source", ["safetensors", "gguf", "gguf-q8"])
