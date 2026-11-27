@@ -38,24 +38,34 @@ needs_golden = pytest.mark.skipif(golden_dir() is None, reason=f"{GOLDEN_ENV} is
 _GOLDEN: dict = {}
 
 
-def golden() -> dict:
-    if "g" not in _GOLDEN:
-        _GOLDEN["g"] = torch.load(golden_dir() / "tiny.pt", weights_only=False)
-    return _GOLDEN["g"]
+def golden(name: str = "tiny.pt") -> dict:
+    """``tiny.pt`` (the FP8 tiny checkpoint's goldens) or ``tiny_nvfp4.pt`` (``ling32/ref/nvfp4_fixture.py``:
+    the same model with NVFP4A16 experts, ``tiny_nvfp4_ckpt/``)."""
+    if name not in _GOLDEN:
+        _GOLDEN[name] = torch.load(golden_dir() / name, weights_only=False)
+    return _GOLDEN[name]
 
 
-def tiny_ckpt() -> str:
-    return str(golden_dir() / "tiny_ckpt")
+def tiny_ckpt(name: str = "tiny_ckpt") -> str:
+    return str(golden_dir() / name)
 
 
-def tiny_config(moe_strategy: str = "fused"):
+def tiny_config(moe_strategy: str = "fused", ckpt: str | None = None):
     import dataclasses
 
     from freetoken.models.bailing_v3.config import parse_config
     from freetoken.models.bailing_v3.weight import adjust_hf_config
     from freetoken.utils import cached_load_hf_config
 
-    return dataclasses.replace(parse_config(adjust_hf_config(tiny_ckpt(), cached_load_hf_config(tiny_ckpt()))), moe_strategy=moe_strategy)
+    ckpt = ckpt or tiny_ckpt()
+    hf = adjust_hf_config(ckpt, cached_load_hf_config(ckpt))
+    config = dataclasses.replace(parse_config(hf), moe_strategy=moe_strategy)
+    if getattr(hf, "quantization_config", None) is None:
+        return config
+    from freetoken.models.register import checkpoint_quant_config, get_model_spec
+
+    # the quantization the engine builds the modules with (EngineConfig.model_config)
+    return dataclasses.replace(config, quant=checkpoint_quant_config(ckpt, hf, get_model_spec(hf.architectures[0])))
 
 
 def rel(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -64,17 +74,20 @@ def rel(a: torch.Tensor, b: torch.Tensor) -> float:
     return ((a - b).norm() / b.norm()).item()
 
 
-def build_tiny_model(config=None):
+def build_tiny_model(config=None, ckpt: str | None = None):
     """The tiny checkpoint's model on the current CUDA device, dense weights through the real reader
-    (resident experts are attached separately, see ``attach_tiny_experts``)."""
+    (``load_weight``: an FTW replays its stored stream; resident experts are attached separately, see
+    ``attach_tiny_experts``)."""
     from freetoken.models.bailing_v3.model import BailingV3ForCausalLM
-    from freetoken.models.bailing_v3.weight import iter_weights
+    from freetoken.models.weight import load_weight
     from freetoken.utils.torch_utils import torch_dtype
 
-    config = config or tiny_config()
+    ckpt = ckpt or tiny_ckpt()
+    config = config or tiny_config(ckpt=ckpt)
     with torch.device("cuda"), torch_dtype(torch.bfloat16):
         model = BailingV3ForCausalLM(config)
-    model.load_state_dict(dict(iter_weights(tiny_ckpt(), torch.device("cuda"), include_moe_experts=False, include_non_moe=True)))
+    # an FTW replays host tensors (the engine pins the host-resident embedding itself)
+    model.load_state_dict({k: v.to("cuda") for k, v in load_weight(ckpt, torch.device("cuda"), include_moe_experts=False)})
     return config, model
 
 
@@ -111,8 +124,9 @@ def use_tp(rank: int, size: int) -> None:
     info.set_tp_info(rank, size)
 
 
-def attach_tiny_experts(model, config) -> None:
-    """Resident bf16 expert banks from the tiny checkpoint (Engine._load_resident_experts' path)."""
+def attach_tiny_experts(model, config, ckpt: str | None = None) -> None:
+    """Resident expert banks from the tiny checkpoint (Engine._load_resident_experts' path): bf16 from
+    the FP8 checkpoint, NVFP4 from the NVFP4A16 one or its FTW."""
     from freetoken.layers import iter_moe_layers
     from freetoken.layers.quantization.method import finalize_quant
     from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks
@@ -120,7 +134,7 @@ def attach_tiny_experts(model, config) -> None:
     finalize_quant(model)
     layers = list(iter_moe_layers(model))
     banks = load_expert_banks(
-        tiny_ckpt(), config, method=layers[0].quant_method, device=torch.device("cuda"), parallel=False, resident=True,
+        ckpt or tiny_ckpt(), config, method=layers[0].quant_method, device=torch.device("cuda"), parallel=False, resident=True,
     )
     attach_resident_banks(layers, banks)
 

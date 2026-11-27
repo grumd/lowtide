@@ -105,7 +105,11 @@ def load_args(hf_config: Any) -> BailingV3Args:
     _require(bool(_get(text, "no_kda_lora", False)), "low-rank KDA gates (no_kda_lora=false)")
     _require(bool(_get(text, "kda_safe_gate", False)), "the unbounded KDA gate (kda_safe_gate=false)")
     _require(_get(text, "gated_attention_proj_granularity_type") == "head_wise", "an MLA output gate other than head_wise")
-    _require(_get(text, "rope_scaling") is None, "rope_scaling")
+    # transformers 5 normalizes an absent rope_scaling to {"rope_type": "default", "rope_theta": ..., ...}
+    rope = _get(text, "rope_scaling") or {}
+    _require(rope.get("rope_type", rope.get("type", "default")) == "default", f"rope_scaling {rope}")
+    rope_theta = _get(text, "rope_theta", None)
+    rope_theta = rope.get("rope_theta") if rope_theta is None else rope_theta
     _require(not _get(text, "use_qkv_bias", False), "attention biases")
     _require(_get(text, "hidden_act", "silu") == "silu", f"hidden_act {_get(text, 'hidden_act')!r}")
     lower_bound = _get(text, "kda_lower_bound")
@@ -120,7 +124,7 @@ def load_args(hf_config: Any) -> BailingV3Args:
         qk_nope_head_dim=int(_get(text, "qk_nope_head_dim")),
         qk_rope_head_dim=int(_get(text, "qk_rope_head_dim")),
         v_head_dim=int(_get(text, "v_head_dim")),
-        rope_theta=float(_get(text, "rope_theta")),
+        rope_theta=float(rope_theta),
         rope_interleave=bool(_get(text, "rope_interleave", True)),
         mrope_section=tuple(int(x) for x in (_get(text, "mrope_section") or ())),
         linear_head_dim=int(_get(text, "head_dim") or int(_get(text, "hidden_size")) // int(_get(text, "num_attention_heads"))),

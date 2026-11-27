@@ -1,9 +1,11 @@
-"""bailing_v3 config parsing off the release's config.json (through RawConfigShim, as production loads it)."""
+"""bailing_v3 config parsing off the release's config.json (through RawConfigShim here; production loads it through the
+checkpoint's remote-code config class under transformers 5, which normalizes rope_scaling)."""
 
 from __future__ import annotations
 
 import dataclasses
 
+import pytest
 import torch
 
 from freetoken.models.bailing_v3.args import KDA_LAYER, MLA_LAYER, load_args
@@ -56,3 +58,15 @@ def test_every_moe_layer_runs_swiglustep_with_its_own_limits():
         assert layer.mlp.experts.layer_id == i - 2
         assert layer.mlp.experts.limit == (4.0 if i >= 35 else None), i
         assert layer.mlp.shared_experts.limit == ({40: 7.0, 41: 7.0}.get(i, 5.0) if i >= 34 else None), i
+
+
+def test_transformers5_default_rope_scaling_parses():
+    """transformers 5 loads the release's config with rope_scaling = {"rope_type": "default", "rope_theta": ...}
+    (the theta may only be there); a non-default rope type is refused."""
+    from freetoken.models.bailing_v3.args import load_args
+
+    rope = {"rope_type": "default", "rope_theta": 6000000, "partial_rotary_factor": 0.5}
+    assert load_args(hf_config(rope_scaling=rope)).rope_theta == 6e6
+    assert load_args(hf_config(rope_scaling=rope, rope_theta=None)).rope_theta == 6e6
+    with pytest.raises(NotImplementedError, match="rope_scaling"):
+        load_args(hf_config(rope_scaling={"rope_type": "yarn", "factor": 4.0}))

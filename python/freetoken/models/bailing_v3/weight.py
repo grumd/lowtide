@@ -83,14 +83,16 @@ class _Reader:
         return w.to(self.device)
 
 
-def _rows(w: torch.Tensor, tp, n_full: int) -> torch.Tensor:
-    """This rank's contiguous rows of a head-major / column-parallel output axis."""
-    loc = div_even(n_full, tp.size)
-    return w[tp.rank * loc : (tp.rank + 1) * loc].contiguous()
+def _part_rows(w: torch.Tensor, tp, parts: int = 1) -> torch.Tensor:
+    """This rank's rows of each of ``parts`` equal, head-major / column-parallel blocks of the output axis
+    (a fused projection keeps every part's own slice)."""
+    loc = div_even(div_even(w.shape[0], parts), tp.size)
+    blocks = w.chunk(parts)
+    return torch.cat([b[tp.rank * loc : (tp.rank + 1) * loc] for b in blocks]).contiguous()
 
 
-def _cols(w: torch.Tensor, tp, n_full: int) -> torch.Tensor:
-    loc = div_even(n_full, tp.size)
+def _cols(w: torch.Tensor, tp) -> torch.Tensor:
+    loc = div_even(w.shape[1], tp.size)
     return w[:, tp.rank * loc : (tp.rank + 1) * loc].contiguous()
 
 
@@ -103,34 +105,62 @@ def _vocab_rows(w: torch.Tensor, tp, vocab: int) -> torch.Tensor:
     return out
 
 
-def _iter_kda(r: _Reader, args: BailingV3Args, layer: int, tp) -> Iterator[tuple[str, torch.Tensor]]:
+# TP rule per state-dict leaf: (rows | cols, fused parts); everything else is replicated
+_ROW_PARTS = {
+    "attention.in_proj.weight": len(KDA_IN_PROJ), "attention.conv1d.weight": 3, "gate_up_proj.weight": 2,
+    "attention.b_proj.weight": 1, "attention.A_log": 1, "attention.dt_bias": 1,
+    "attention.q_proj.weight": 1, "attention.kv_b_proj.weight": 1, "attention.g_proj.weight": 1,
+}
+_COLS = ("attention.o_proj.weight", "attention.dense.weight", "down_proj.weight")
+_VOCAB = ("model.word_embeddings.weight", "lm_head.weight")
+
+
+def shard_dense(name: str, w: torch.Tensor, config, tp) -> torch.Tensor:
+    """This rank's slice of a dense tensor as ``iter_dense`` builds it unsharded (an FTW stores that form).
+    Per-head projections (KDA q/k/v/f/g/b, convs, A_log, dt_bias; MLA q_proj, kv_b_proj, g_proj) keep this
+    rank's heads, gate/up this rank's intermediate rows, each fused part separately; o_proj / dense /
+    down_proj keep this rank's input columns; embeddings and lm_head this rank's vocab rows; the MLA latent
+    projection, norms and routers are replicated."""
+    if tp.size == 1 and name not in _VOCAB:
+        return w
+    if name in _VOCAB:
+        return _vocab_rows(w, tp, config.vocab_size)
+    for leaf, parts in _ROW_PARTS.items():
+        if name.endswith("." + leaf):
+            return _part_rows(w, tp, parts)
+    if name.endswith(tuple("." + leaf for leaf in _COLS)):
+        return _cols(w, tp)
+    return w
+
+
+def shard_ftw_weight(name: str, w: torch.Tensor, model_path: str, tp) -> torch.Tensor:
+    """FTW replay hook: the FTW stores the TP=1 dense stream, sliced here per rank."""
+    return shard_dense(name, w, parse_config(cached_load_hf_config(model_path)), tp)
+
+
+def _iter_kda(r: _Reader, args: BailingV3Args, layer: int) -> Iterator[tuple[str, torch.Tensor]]:
     base = f"model.layers.{layer}.attention"
-    h, d = args.num_heads, args.linear_head_dim
-    p = h * d
-    yield f"{base}.in_proj.weight", torch.cat([_rows(r.linear(f"{base}.{n}"), tp, p) for n in KDA_IN_PROJ])
-    yield f"{base}.b_proj.weight", _rows(r.linear(f"{base}.b_proj"), tp, h)
-    convs = [_rows(r.tensor(f"{base}.{n}_conv1d.weight", torch.bfloat16), tp, p) for n in ("q", "k", "v")]
-    yield f"{base}.conv1d.weight", torch.cat(convs)
-    yield f"{base}.A_log", _rows(r.tensor(f"{base}.A_log", torch.float32), tp, h)
-    yield f"{base}.dt_bias", _rows(r.tensor(f"{base}.dt_bias", torch.float32), tp, p)
+    yield f"{base}.in_proj.weight", torch.cat([r.linear(f"{base}.{n}") for n in KDA_IN_PROJ])
+    yield f"{base}.b_proj.weight", r.linear(f"{base}.b_proj")
+    yield f"{base}.conv1d.weight", torch.cat([r.tensor(f"{base}.{n}_conv1d.weight", torch.bfloat16) for n in ("q", "k", "v")])
+    yield f"{base}.A_log", r.tensor(f"{base}.A_log", torch.float32)
+    yield f"{base}.dt_bias", r.tensor(f"{base}.dt_bias", torch.float32)
     yield f"{base}.o_norm.weight", r.tensor(f"{base}.o_norm.weight", torch.bfloat16)
-    yield f"{base}.o_proj.weight", _cols(r.linear(f"{base}.o_proj"), tp, p)
+    yield f"{base}.o_proj.weight", r.linear(f"{base}.o_proj")
 
 
-def _iter_mla(r: _Reader, args: BailingV3Args, layer: int, tp) -> Iterator[tuple[str, torch.Tensor]]:
+def _iter_mla(r: _Reader, args: BailingV3Args, layer: int) -> Iterator[tuple[str, torch.Tensor]]:
     base = f"model.layers.{layer}.attention"
-    h = args.num_heads
-    yield f"{base}.q_proj.weight", _rows(r.linear(f"{base}.q_proj"), tp, h * args.qk_head_dim)
-    yield f"{base}.kv_a_proj_with_mqa.weight", r.linear(f"{base}.kv_a_proj_with_mqa")
+    for name in ("q_proj", "kv_a_proj_with_mqa"):
+        yield f"{base}.{name}.weight", r.linear(f"{base}.{name}")
     yield f"{base}.kv_a_layernorm.weight", r.tensor(f"{base}.kv_a_layernorm.weight", torch.bfloat16)
-    yield f"{base}.kv_b_proj.weight", _rows(r.linear(f"{base}.kv_b_proj"), tp, h * (args.qk_nope_head_dim + args.v_head_dim))
-    yield f"{base}.g_proj.weight", _rows(r.linear(f"{base}.g_proj"), tp, h)
-    yield f"{base}.dense.weight", _cols(r.linear(f"{base}.dense"), tp, h * args.v_head_dim)
+    for name in ("kv_b_proj", "g_proj", "dense"):
+        yield f"{base}.{name}.weight", r.linear(f"{base}.{name}")
 
 
-def _iter_gated_mlp(r: _Reader, base: str, inter: int, tp) -> Iterator[tuple[str, torch.Tensor]]:
-    yield f"{base}.gate_up_proj.weight", torch.cat([_rows(r.linear(f"{base}.{p}"), tp, inter) for p in ("gate_proj", "up_proj")])
-    yield f"{base}.down_proj.weight", _cols(r.linear(f"{base}.down_proj"), tp, inter)
+def _iter_gated_mlp(r: _Reader, base: str) -> Iterator[tuple[str, torch.Tensor]]:
+    yield f"{base}.gate_up_proj.weight", torch.cat([r.linear(f"{base}.{p}") for p in ("gate_proj", "up_proj")])
+    yield f"{base}.down_proj.weight", r.linear(f"{base}.down_proj")
 
 
 def classify(name: str, config) -> str:
@@ -146,24 +176,30 @@ def classify(name: str, config) -> str:
 
 
 def iter_dense(src: TensorSource, config, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
-    args: BailingV3Args = config.bailing_args
     tp = get_tp_info()
+    for name, w in _iter_dense_full(src, config, device):
+        yield name, shard_dense(name, w, config, tp)
+
+
+def _iter_dense_full(src: TensorSource, config, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The dense state dict unsharded (FP8 dequantized, fusions applied)."""
+    args: BailingV3Args = config.bailing_args
     r = _Reader(src, device)
     for i in range(config.num_layers):
         base = f"model.layers.{i}"
         for norm in ("input_layernorm", "post_attention_layernorm"):
             yield f"{base}.{norm}.weight", r.tensor(f"{base}.{norm}.weight", torch.bfloat16)
-        yield from (_iter_kda if args.is_kda_layer(i) else _iter_mla)(r, args, i, tp)
+        yield from (_iter_kda if args.is_kda_layer(i) else _iter_mla)(r, args, i)
         if i < config.first_k_dense_replace:
-            yield from _iter_gated_mlp(r, f"{base}.mlp", config.intermediate_size, tp)
+            yield from _iter_gated_mlp(r, f"{base}.mlp")
         else:
             yield f"{base}.mlp.gate.weight", r.tensor(f"{base}.mlp.gate.weight", torch.bfloat16)
             yield f"{base}.mlp.gate.expert_bias", r.tensor(f"{base}.mlp.gate.expert_bias", torch.float32)
             if config.shared_expert_intermediate_size:
-                yield from _iter_gated_mlp(r, f"{base}.mlp.shared_experts", config.shared_expert_intermediate_size, tp)
-    yield "model.word_embeddings.weight", _vocab_rows(r.tensor("model.word_embeddings.weight", torch.bfloat16), tp, config.vocab_size)
+                yield from _iter_gated_mlp(r, f"{base}.mlp.shared_experts")
+    yield "model.word_embeddings.weight", r.tensor("model.word_embeddings.weight", torch.bfloat16)
     yield "model.norm.weight", r.tensor("model.norm.weight", torch.bfloat16)
-    yield "lm_head.weight", _vocab_rows(r.tensor("lm_head.weight", torch.bfloat16), tp, config.vocab_size)
+    yield "lm_head.weight", r.tensor("lm_head.weight", torch.bfloat16)
     _check_consumed(src, config)
 
 
@@ -264,6 +300,36 @@ def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
     )
 
 
+RAW_FTW_KIND = "bailing_raw"
+
+
+def _raw_side_name(name: str, num_hidden_layers: int) -> bool:
+    """The checkpoint tensors the text model never reads: the vision tower, its projector, the MTP layer."""
+    if name.startswith(SKIP_PREFIXES):
+        return True
+    m = _LAYER_RE.match(name)
+    return m is not None and int(m.group(1)) >= num_hidden_layers
+
+
+def ftw_side_tensors(model_path: str) -> Iterator[tuple[str, torch.Tensor, str]]:
+    """ft checkpoint hook: the tensors the text model does not read (vision tower, ``linear_proj``, the MTP
+    layer with its NVFP4 experts) as FTW kind ``bailing_raw``, under their checkpoint names and bytes, so the
+    FTW stays a complete copy of the checkpoint for MTP and vision later. Never loaded at serve time."""
+    text = getattr(cached_load_hf_config(model_path), "text_config", None)
+    n = int(getattr(text, "num_hidden_layers"))
+    src = CheckpointSource(download_hf_weight(model_path))
+    try:
+        for name in sorted(k for k in src.keys() if _raw_side_name(k, n)):
+            yield name, src.get(name), RAW_FTW_KIND
+    finally:
+        src.close()
+
+
+def ftw_side_owns(name: str) -> bool:
+    """No dense-stream name is replaced by the raw side tensors."""
+    return False
+
+
 def adjust_hf_config(model_path: str, hf_config):
     """Engine hook: the quantization this reader serves. The release's block-FP8 declaration is dropped
     (dense dequantized to bf16 at load, experts bf16); other declarations (NVFP4 experts) pass through."""
@@ -279,7 +345,11 @@ def adjust_hf_config(model_path: str, hf_config):
 
 
 __all__ = [
+    "RAW_FTW_KIND",
     "adjust_hf_config",
+    "ftw_side_owns",
+    "ftw_side_tensors",
+    "shard_ftw_weight",
     "classify",
     "dequant_fp8",
     "iter_dense",
