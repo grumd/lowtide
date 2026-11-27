@@ -110,7 +110,11 @@ Measured on the same box as above. The flags column adds `--moe-decode-fetch 0.1
 | 1x RTX 3080 20 GB | 41 tok/s | 65 tok/s | 1,260 tok/s | 1,990 tok/s | 262k |
 | 2x RTX 3080 20 GB | 118 tok/s | 118 tok/s | 2,700 tok/s | 3,510 tok/s | 262k |
 
-`--ngram-spec` (on in `serve.sh`) pays off on code edits that copy text back: 196 tok/s on two GPUs, and 110 tok/s on one with the CPU flags. `--mtp on` builds the checkpoint's own MTP head. Its first draft is accepted about 70% of the time, but each verify pass pulls in more experts than a plain step, so with the default 3 drafts it is a loss on one GPU and about even on two. On two GPUs `--mtp on --mtp-draft-tokens 1` came out about 8% ahead in one run. The KV formats (`--kv-cache-dtype fp8_mla` and friends) cut the KV by 43–49% for a KLD of 0.006–0.010 against bf16 KV; at 2 GiB for 262k tokens that is rarely worth it.
+Decode is a 512-token reply at temperature 1.0, the second request after loading; prefill is a fresh 16.5k-token prompt. Single runs, so read differences under ~5% as noise.
+
+`--ngram-spec` (on in `serve.sh`) pays off on code edits that copy text back: 196 tok/s on two GPUs, and 110 tok/s on one with the flags above. `--mtp on` builds the checkpoint's own MTP head and turns `--ngram-spec` off. Its first draft is accepted about 70% of the time, but each verify pass pulls in more experts than a plain step, so with the default 3 drafts it is a loss on one GPU and about even on two, and code edits drop to 109 tok/s on two GPUs without n-gram. In one run `--mtp-draft-tokens 1` was 8% ahead on two GPUs. MTP was only measured at short context.
+
+The KV formats (`--kv-cache-dtype fp8_mla` and friends) cut the KV by 43–49% at a KLD of 0.006–0.010 against bf16 KV, measured on a 1.2k-token prompt. At 2 GiB for 262k tokens that is rarely worth it.
 
 ## Citation & Acknowledgments
 
