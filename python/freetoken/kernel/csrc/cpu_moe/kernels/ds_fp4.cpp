@@ -157,6 +157,7 @@ void fp8_roundtrip_bf16(const bf16_t* src, bf16_t* dst, int K, int block) {
 class DsFp4Format final : public MoeFormat {
  public:
   DsFp4Format(const MoeParams& p, const FormatArgs& a) : MoeFormat(p), dot_(select_dsdot()) {
+    if (p.act == ACT_SWIGLUSTEP) throw std::runtime_error("ds_fp4 CPU MoE computes silu(clamp(gate)) * clamp(up) only");
     gate_up_ = a.bank("gate_up");
     gu_scale_ = a.bank("gate_up_scale");
     down_ = a.bank("down");
@@ -204,7 +205,7 @@ class DsFp4Format final : public MoeFormat {
     const float* xo = xo_.data() + (size_t)tok * (H / 2);
     const uint8_t* gp = gu_packed_l + (size_t)e * N2 * Hh;
     const uint8_t* gs = gu_scale_l + (size_t)e * N2 * Hs;
-    const float lim = p.swiglu_limit;
+    const float lim = p.limit(layer);
     for (int i = i0; i < i1; ++i) {
       // gate_up is stored bf16 by the reference GEMV before swiglu; round to match.
       float gate = bf16_to_f32(f32_to_bf16(

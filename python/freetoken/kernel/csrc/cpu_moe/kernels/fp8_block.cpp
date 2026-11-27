@@ -157,7 +157,7 @@ class Fp8BlockFormat final : public MoeFormat {
     const bf16_t* scale = static_cast<const bf16_t*>(tbl_at(gu_scale_, layer));
     const float* xe = xe_.data() + (size_t)tok * (H / 2);
     const float* xo = xo_.data() + (size_t)tok * (H / 2);
-    gated_rows(p, i0, i1, w_in, g, [&](int row) {
+    gated_rows(p, layer, i0, i1, w_in, g, [&](int row) {
       const uint8_t* w = packed + ((size_t)e * (2 * I) + row) * (size_t)H;
       const bf16_t* sc = scale + ((size_t)e * ((2 * I + FP8_BLK - 1) / FP8_BLK) + row / FP8_BLK) *
                                      (size_t)gu_scale_stride_;

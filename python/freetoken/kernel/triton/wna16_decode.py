@@ -80,10 +80,11 @@ def _reduce_silu_mul_kernel(
     part_ptr, out_ptr, R, INTER, SPLIT: tl.constexpr, BLOCK: tl.constexpr,
     ids_ptr=None, copy_slots_ptr=None, num_copy_ptr=None,
     ROUTES: tl.constexpr = 0, MAX_COPY: tl.constexpr = 16, SKIP_NEG: tl.constexpr = False,
-    alpha=None, limit=None, CLAMP: tl.constexpr = False,
+    alpha=None, limit=None, CLAMP: tl.constexpr = False, STEP: tl.constexpr = False,
 ):
     # ROUTES 1 / 2: only the routes whose expert slot is resident / still being copied in;
-    # SKIP_NEG: not the routes whose slot is -1 (computed on the CPU); CLAMP: swiglu_clamp
+    # SKIP_NEG: not the routes whose slot is -1 (computed on the CPU); CLAMP: swiglu_clamp;
+    # STEP: swiglustep (the silu output, not the gate, is capped at limit; no alpha)
     r = tl.program_id(0)
     if SKIP_NEG:
         if tl.load(ids_ptr + r) < 0:
@@ -103,6 +104,9 @@ def _reduce_silu_mul_kernel(
         gate = tl.minimum(gate, limit)
         up = tl.minimum(tl.maximum(up, -limit), limit)
         y = gate / (1.0 + tl.exp(-gate * alpha)) * up
+    elif STEP:
+        up = tl.minimum(tl.maximum(up, -limit), limit)
+        y = tl.minimum(gate / (1.0 + tl.exp(-gate)), limit) * up
     else:
         y = gate / (1.0 + tl.exp(-gate)) * up
     tl.store(out_ptr + r * INTER + offs, y.to(out_ptr.dtype.element_ty), mask=m)

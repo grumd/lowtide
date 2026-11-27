@@ -66,12 +66,15 @@ inline bf16_t f32_to_bf16(float f) {
 // the mxfp4 kernel additionally fuses its own copy of the same math).
 // ACT_SWIGLU_CLAMP (GLM-5.3 "swiglu_limit") is the same clamped form WITHOUT
 // the (up + 1) bias: clamp(gate, max=lim) * sigmoid(alpha*gate) * clamp(up, +-lim).
+// ACT_SWIGLUSTEP (Ling-3.2 "swiglustep") clamps AFTER the silu and has no alpha:
+// min(silu(gate), lim) * clamp(up, +-lim). Also handled in gated_rows.
 enum ActKind {
   ACT_SILU = 0,
   ACT_GELU = 1,
   ACT_GELU_TANH = 2,
   ACT_SWIGLUOAI = 3,
   ACT_SWIGLU_CLAMP = 4,
+  ACT_SWIGLUSTEP = 5,
 };
 
 inline float act_apply(int act, float x) {

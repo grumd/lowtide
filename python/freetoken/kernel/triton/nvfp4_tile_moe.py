@@ -129,10 +129,12 @@ def _prefill_nvfp4_gate_up_silu_kernel(
     GROUP_SIZE_M: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
+    limit=None,
+    STEP: tl.constexpr = False,
 ):
     """gate_up GEMM with SiLU(gate) * up fused: rows n (gate) and INTER + n (up) accumulate
     side by side in fp32, so neither half is rounded before the activation. Writes the
-    activation ``[route, INTER]``."""
+    activation ``[route, INTER]``. STEP: swiglustep, min(silu(gate), limit) * clamp(up, +-limit)."""
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(INTER, BLOCK_SIZE_N)
@@ -176,7 +178,11 @@ def _prefill_nvfp4_gate_up_silu_kernel(
 
     gate = acc_g * (tl.load(g_ptr + slot * stride_ge + offs_n) * 128.0)[None, :]
     up = acc_u * (tl.load(g_ptr + slot * stride_ge + INTER + offs_n) * 128.0)[None, :]
-    y = gate / (1.0 + tl.exp(-gate)) * up
+    if STEP:
+        up = tl.minimum(tl.maximum(up, -limit), limit)
+        y = tl.minimum(gate / (1.0 + tl.exp(-gate)), limit) * up
+    else:
+        y = gate / (1.0 + tl.exp(-gate)) * up
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     tl.store(c_ptrs, y.to(compute_type), mask=token_mask[:, None] & (offs_cn[None, :] < INTER))

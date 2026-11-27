@@ -133,7 +133,7 @@ class Bf16Format final : public MoeFormat {
   void gate_up(int layer, int e, int /*tok*/, int i0, int i1, const bf16_t* x, float w_in,
                bf16_t* g) const override {
     const bf16_t* w = static_cast<const bf16_t*>(tbl_at(gate_up_, layer)) + (size_t)e * (2 * p.I) * p.H;
-    gated_rows(p, i0, i1, w_in, g, [&](int row) { return dot_(w + (size_t)row * p.H, x, p.H); });
+    gated_rows(p, layer, i0, i1, w_in, g, [&](int row) { return dot_(w + (size_t)row * p.H, x, p.H); });
   }
 
   void down(int layer, int h0, int h1, const DownRoute* routes, int n, float* out) const override {

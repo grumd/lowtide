@@ -13,7 +13,7 @@
 // against the low vector and (x[64c+4j+1], x[64c+4j+3]) against the high one. Every lane then
 // covers k in [64c+4j, 64c+4j+3], one 16-group (4c + j/4), so the block scale multiplies the
 // fresh lane sums in fp32: the weights stay exact, as on the GPU. gate/up stay fp32 into
-// SiLU * up (or the clamped swiglu); the activation is rounded to bf16 where the GPU stores it.
+// SiLU * up (or the clamped swiglu, or swiglustep); the activation is rounded to bf16 where the GPU stores it.
 #pragma once
 
 #include "wna16_cpu.h"
@@ -30,13 +30,15 @@ struct Layer {
   const uint8_t* dn_p;
   const uint8_t* dn_s;
   const float* dn_g;
+  float limit;  // this layer's clamp limit (+inf: none)
 };
 
 struct Dims {
   int H, I;
   int64_t gu_p_s, gu_s_s, gu_g_s, dn_p_s, dn_s_s, dn_g_s;  // per-expert strides (elements)
   // clamp (swiglu_clamp): g = min(gate, limit); g * sigmoid(alpha * g) * clamp(up, +-limit)
-  bool clamp = false;
+  // step (swiglustep): min(silu(gate), limit) * clamp(up, +-limit); the limit is per layer (Layer::limit)
+  bool clamp = false, step = false;
   float alpha = 1.0f, limit = 0.0f;
 };
 
@@ -137,12 +139,19 @@ void expert_tile(const Layer& L, const Dims& d, int e, const Route* rt, const ui
   const uint32_t* hh[MT];
   for (int m = 0; m < M; ++m) {
     const float* g = s.gu.data() + m * 2 * I;
-    if (!d.clamp) {
+    if (d.step) {
+      // the GPU expression (kernel/triton/activation.py SWIGLUSTEP)
+      const float lim = L.limit;
+      for (int i = 0; i < I; ++i) {
+        const float up = std::min(std::max(g[I + i], -lim), lim);
+        s.hb[i] = f32_to_bf16(std::min(g[i] / (1.0f + std::exp(-g[i])), lim) * up);
+      }
+    } else if (!d.clamp) {
       for (int i = 0; i < I; ++i) s.hb[i] = f32_to_bf16(g[i] / (1.0f + std::exp(-g[i])) * g[I + i]);
     } else {
       // the GPU expression (kernel/triton/activation.py SWIGLU_CLAMP), gate/up kept in fp32
       for (int i = 0; i < I; ++i) {
-        const float gate = std::min(g[i], d.limit), up = std::min(std::max(g[I + i], -d.limit), d.limit);
+        const float gate = std::min(g[i], L.limit), up = std::min(std::max(g[I + i], -L.limit), L.limit);
         s.hb[i] = f32_to_bf16(gate / (1.0f + std::exp(-gate * d.alpha)) * up);
       }
     }

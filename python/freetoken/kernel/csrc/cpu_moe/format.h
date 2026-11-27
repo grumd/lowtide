@@ -5,6 +5,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "common.h"
 
@@ -37,6 +38,10 @@ struct MoeParams {
   int act = ACT_SILU;
   float swiglu_alpha = 1.0f;
   float swiglu_limit = INFINITY;  // +inf == no clamp
+  // Per-layer limits (indexed like the executor's layers); empty: swiglu_limit on every layer.
+  std::vector<float> layer_limit;
+
+  float limit(int layer) const { return layer_limit.empty() ? swiglu_limit : layer_limit[layer]; }
 };
 
 // What cpu_executor.py passes for one format, by name: banks map canonical roles (gate_up, gate_up_scale, ...) to per-layer tables, options hold small integers.
@@ -79,17 +84,23 @@ struct DownRoute {
 };
 
 // g[i] for i in [i0, i1) from the gate row i and the up row I + i; dot(row) is the row's GEMV.
-// ACT_SWIGLUOAI and ACT_SWIGLU_CLAMP clamp both inputs; the other kinds go through act_apply.
+// ACT_SWIGLUOAI and ACT_SWIGLU_CLAMP clamp both inputs, ACT_SWIGLUSTEP the silu output and up;
+// the other kinds go through act_apply. `layer` picks the clamp limit (MoeParams::limit).
 template <class RowDot>
-inline void gated_rows(const MoeParams& p, int i0, int i1, float w_in, bf16_t* g, RowDot dot) {
+inline void gated_rows(const MoeParams& p, int layer, int i0, int i1, float w_in, bf16_t* g, RowDot dot) {
   const bool clamped = p.act == ACT_SWIGLUOAI || p.act == ACT_SWIGLU_CLAMP;
   const float up_bias = p.act == ACT_SWIGLUOAI ? 1.0f : 0.0f;
-  const float lim = p.swiglu_limit, alpha = p.swiglu_alpha;
+  const float lim = p.limit(layer), alpha = p.swiglu_alpha;
   for (int i = i0; i < i1; ++i) {
     // gate = row i, up = row I+i
     float gate = dot(i) * w_in;
     float up = dot(p.I + i) * w_in;
-    if (clamped) {
+    if (p.act == ACT_SWIGLUSTEP) {
+      // the GPU expression (kernel/triton/activation.py SWIGLUSTEP); lim == +inf: plain silu * up
+      if (up > lim) up = lim;
+      else if (up < -lim) up = -lim;
+      g[i] = f32_to_bf16(std::min(gate / (1.0f + std::exp(-gate)), lim) * up);
+    } else if (clamped) {
       // clamp(gate, max=lim) * sigmoid(alpha * gate) * (clamp(up, +-lim) + up_bias)
       // -- swigluoai carries the +1 up bias (gpt-oss/MiniMax); swiglu_clamp
       // (GLM-5.3) does not. lim == +inf: no clamp.

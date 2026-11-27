@@ -185,7 +185,7 @@ struct CpuMoeExecutor {
                  int apply_router_weight_on_input, std::vector<FormatSpec> formats,
                  std::vector<int> layer_formats, double swiglu_alpha_, double swiglu_limit_,
                  std::vector<int> core_ids_, uintptr_t x_ptr, uintptr_t ids_ptr, uintptr_t w_ptr,
-                 uintptr_t y_ptr, bool y_fp32)
+                 uintptr_t y_ptr, bool y_fp32, std::vector<float> layer_limits)
       : num_layers(num_layers_),
         num_experts(num_experts_),
         apply_on_input(apply_router_weight_on_input != 0),
@@ -199,6 +199,9 @@ struct CpuMoeExecutor {
         num_threads(num_threads_ > 0 ? num_threads_ : 1),
         core_ids(std::move(core_ids_)) {
     if (params.top_k > kMaxTopK) throw std::invalid_argument("CPU MoE supports top_k <= " + std::to_string(kMaxTopK));
+    if (!layer_limits.empty() && static_cast<int>(layer_limits.size()) != num_layers)
+      throw std::invalid_argument("CPU MoE needs the clamp limit of every layer (or none)");
+    params.layer_limit = std::move(layer_limits);
     for (auto& [name, banks, options] : formats)
       fmts.push_back(make_format(name, params, FormatArgs{name, std::move(banks), std::move(options)}));
     if (static_cast<int>(layer_formats.size()) != num_layers)
@@ -760,14 +763,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<CpuMoeExecutor>(m, "CpuMoeExecutor")
       .def(py::init<int, int, int, int, int, int, int, int, int, std::vector<freetoken::cpu_moe::FormatSpec>,
                     std::vector<int>, double, double, std::vector<int>, uintptr_t, uintptr_t, uintptr_t,
-                    uintptr_t, bool>(),
+                    uintptr_t, bool, std::vector<float>>(),
            py::arg("num_threads"), py::arg("num_layers"), py::arg("num_experts"),
            py::arg("top_k"), py::arg("hidden_size"), py::arg("inter_size"),
            py::arg("max_tokens"), py::arg("activation_id"),
            py::arg("apply_router_weight_on_input"), py::arg("formats"), py::arg("layer_formats"),
            py::arg("swiglu_alpha"), py::arg("swiglu_limit"),
            py::arg("core_ids"), py::arg("x_ptr"), py::arg("ids_ptr"), py::arg("w_ptr"),
-           py::arg("y_ptr"), py::arg("y_fp32") = false)
+           py::arg("y_ptr"), py::arg("y_fp32") = false, py::arg("layer_limits") = std::vector<float>{})
       .def("submit_with_cuda_stream", &CpuMoeExecutor::submit_with_cuda_stream,
            py::arg("stream"), py::arg("layer_id"), py::arg("num_tokens"),
            py::call_guard<py::gil_scoped_release>())
@@ -811,7 +814,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // accepts id 3 without error and silently computes the wrong activation
   // (act_apply falls through to gelu_tanh); the probe turns a stale extension
   // into a loud rebuild instruction instead of wrong model outputs.
-  m.def("max_generic_act_id", []() { return static_cast<int>(freetoken::cpu_moe::ACT_SWIGLU_CLAMP); });
+  m.def("max_generic_act_id", []() { return static_cast<int>(freetoken::cpu_moe::ACT_SWIGLUSTEP); });
   // The ggml-cpu variant the gguf format calls: the kernel table address that freetoken.kernel.ggml_cpu.select() returns.
   m.def("set_ggml_cpu", &freetoken::cpu_moe::set_ggml_cpu, py::arg("api"));
   m.def("weight_formats", []() {

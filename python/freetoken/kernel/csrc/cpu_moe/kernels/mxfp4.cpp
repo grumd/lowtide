@@ -165,6 +165,7 @@ mxgemv_fn select_mxgemv() {
 class Mxfp4Format final : public MoeFormat {
  public:
   Mxfp4Format(const MoeParams& p, const FormatArgs& a) : MoeFormat(p), gemv_(select_mxgemv()) {
+    if (p.act == ACT_SWIGLUSTEP) throw std::runtime_error("mxfp4 CPU MoE computes the gpt-oss clamped swiglu only");
     gate_up_ = a.bank("gate_up");
     gu_scale_ = a.bank("gate_up_scale");
     gu_bias_ = a.bank("gate_up_bias");
@@ -194,7 +195,7 @@ class Mxfp4Format final : public MoeFormat {
     float gu[2 * kRowBlock];
     gemv_(gu, blk_e + col0, scl_e + col0, x, Hh, N2, ncol, e2m1_lut_, e8m0_lut_);
     const bf16_t* bias_e = gu_bias_l + (size_t)e * N2 + col0;
-    const float lim = p.swiglu_limit, alpha = p.swiglu_alpha;
+    const float lim = p.limit(layer), alpha = p.swiglu_alpha;
     for (int j = 0; j < nunit; ++j) {
       float gate = gu[2 * j] + bf16_to_f32(bias_e[2 * j]);
       float up = gu[2 * j + 1] + bf16_to_f32(bias_e[2 * j + 1]);

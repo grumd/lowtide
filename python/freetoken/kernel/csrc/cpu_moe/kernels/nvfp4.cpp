@@ -659,7 +659,7 @@ class Nvfp4Format final : public MoeFormat {
     const float* global = static_cast<const float*>(tbl_at(gu_global_, layer));
     if (w4a8_.dot != nullptr) {
       const W4a8Act act = xq_.at(tok);
-      gated_rows(p, i0, i1, w_in, g, [&](int row) {
+      gated_rows(p, layer, i0, i1, w_in, g, [&](int row) {
         const size_t r = (size_t)e * (2 * p.I) + row;
         return w4a8_.dot(packed + r * (size_t)(H / 2), scale + r * (size_t)(H / 16), global[r], act, H);
       });
@@ -667,7 +667,7 @@ class Nvfp4Format final : public MoeFormat {
     }
     const float* xe = xe_.data() + (size_t)tok * (H / 2);
     const float* xo = xo_.data() + (size_t)tok * (H / 2);
-    gated_rows(p, i0, i1, w_in, g, [&](int row) {
+    gated_rows(p, layer, i0, i1, w_in, g, [&](int row) {
       const size_t r = (size_t)e * (2 * p.I) + row;
       return nvdot_(packed + r * (size_t)(H / 2), scale + r * (size_t)(H / 16),
                     global[r], xe, xo, H, e2m1_lut_, e4m3_lut_);
@@ -698,7 +698,7 @@ class Nvfp4Format final : public MoeFormat {
         nvfp4_rows_dot_bf16_n(m, packed + up * (H / 2), scale + up * (H / 16), global + up, ni, H / 64, xl, xh,
                               up_out, ni);
         for (int j = 0; j < m; ++j)
-          gated_rows(p, i0, i1, w_in[j0 + j], g[j0 + j],
+          gated_rows(p, layer, i0, i1, w_in[j0 + j], g[j0 + j],
                      [&](int row) { return row < I ? gate_out[j * ni + row - i0] : up_out[j * ni + row - I - i0]; });
       }
       return;

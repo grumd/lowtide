@@ -1740,11 +1740,16 @@ class Engine:
             reason = f"expert banks {sorted(cache.bank_sources)} are neither W4A16 nor NVFP4"
         elif cache.decode_target != "gpu" or cache.cpu_layer_ids or cache.verify_cpu:
             reason = "it needs the plain GPU decode target"
+        elif reason := _moe_activation_mismatch(layers):
+            unsupported = True
         elif (sample.activation not in kind.ACTIVATIONS or sample.apply_router_weight_on_input
               or sample.interleaved or sample.has_bias):
             reason = (f"the {'NVFP4' if nvfp4 else 'W4A16'} CPU kernel computes {' / '.join(kind.ACTIVATIONS)} "
                       f"experts (router weight after down) of concatenated, bias-free gate/up rows, not "
                       f"{sample.activation!r}")
+            unsupported = True
+        elif not nvfp4 and len({layer.limit for layer in layers}) > 1:
+            reason = "the W4A16 CPU kernel takes one clamp limit for every layer"
             unsupported = True
         elif not wcp.cpu_supported():
             reason = "the CPU lacks AVX-512 BF16"
@@ -1775,8 +1780,13 @@ class Engine:
         except Exception as exc:  # the JIT build needs a host C++ toolchain
             logger.warning(f"CPU prefill off: {exc}")
             return
+        # where the layers' clamp limits differ (Ling-3.2), the NVFP4 kernel takes each layer's own
+        limits = {}
+        if nvfp4 and isinstance(_executor_limits(layers), list):
+            limits = {layer.layer_id: layer.limit for layer in layers}
         for layer_id in range(cache.num_layers):
-            executor.set_layer(layer_id, {r: sources[r][layer_id] for r in roles})
+            lim = {"limit": limits[layer_id]} if layer_id in limits else {}
+            executor.set_layer(layer_id, {r: sources[r][layer_id] for r in roles}, **lim)
         cache.cpu_prefill = executor
         cache.cpu_prefill_fetch = fetch
 
@@ -1802,9 +1812,11 @@ class Engine:
             reason = "it needs --moe-strategy offload with GPU decode"
         elif fmt not in ("nvfp4", "w4a16") or not hasattr(kernel, "decode_overlapped"):
             reason = "it serves NVFP4 and W4A16 experts on the triton kernels only"
-        elif not _cpu_split_decodes(kernel, fmt, sample):
+        elif mismatch := _moe_activation_mismatch(layers):
+            reason = mismatch
+        elif not all(_cpu_split_decodes(getattr(layer.quant_method, "kernel", None), fmt, layer) for layer in layers):
             reason = (f"the {fmt} GPU / CPU decode split computes "
-                      f"{'silu or swiglu_clamp' if fmt == 'nvfp4' else 'silu'} experts with the router "
+                      f"{'silu, swiglu_clamp or swiglustep' if fmt == 'nvfp4' else 'silu'} experts with the router "
                       f"weight after down, not {sample.activation!r}")
         elif fmt == "w4a16" and not wna16_cpu_supported():
             reason = "the W4A16 CPU kernel needs AVX-512 BF16"
@@ -1840,7 +1852,7 @@ class Engine:
             activation=sample.activation,
             apply_router_weight_on_input=False,
             swiglu_alpha=float(sample.alpha),
-            swiglu_limit=sample.limit,
+            swiglu_limit=_executor_limits(layers),
             num_threads=len(cpus),
             # an --ngram-spec verify window computes its CPU routes in the same task
             max_tokens=max(config.max_running_req, 1) * (1 + _spec_depth(self.model)),
@@ -1911,6 +1923,8 @@ class Engine:
                 "CPU MoE backend is not yet supported for this model architecture "
                 f"(MoE layer {type(sample).__name__} is missing {required})."
             )
+        if mismatch := _moe_activation_mismatch(layers):
+            raise NotImplementedError(f"CPU MoE backend: {mismatch}")
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both. --moe-verify-cpu
         # additionally packs max_running_req * (k+1) tokens into one verify call.
@@ -1942,7 +1956,7 @@ class Engine:
             activation_dtype=self.dtype,
             graph_enabled=graph_enabled,
             swiglu_alpha=float(sample.alpha),
-            swiglu_limit=sample.limit,
+            swiglu_limit=_executor_limits(layers),
             layer_formats=layer_formats,
         )
         cache.set_cpu_executor(executor)
@@ -2658,6 +2672,28 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
             override("cuda_graph_bs", kept)
 
 
+def _moe_activation_mismatch(layers) -> str | None:
+    """Why the MoE layers cannot share one CPU expert executor, or None. The executors take one
+    activation, alpha and router-weight placement for every layer (the clamp limit may differ per
+    layer, see :func:`_executor_limits`), so every layer is checked, not the first one only."""
+    def key(layer):
+        return (layer.activation, getattr(layer, "alpha", None), bool(layer.apply_router_weight_on_input),
+                bool(getattr(layer, "interleaved", False)), bool(getattr(layer, "has_bias", False)))
+
+    kinds = sorted({key(layer) for layer in layers}, key=repr)
+    if len(kinds) > 1:
+        return f"the MoE layers disagree on (activation, alpha, router weight on input, interleaved, bias): {kinds}"
+    return None
+
+
+def _executor_limits(layers) -> float | None | list[float | None]:
+    """The CPU executor's clamp limit: one value when every layer agrees, else one per layer by
+    bank layer id (Ling-3.2 clamps its last routed layers only)."""
+    if len({layer.limit for layer in layers}) == 1:
+        return layers[0].limit
+    return [layer.limit for layer in sorted(layers, key=lambda layer: layer.layer_id)]
+
+
 def _cpu_split_decodes(kernel, fmt: str, sample) -> bool:
     """Whether both halves of the CPU-assisted decode compute ``sample``'s experts: the GPU tile
     decode (``tile_decodes``; the W4A16 kernel has silu only) and the CPU executor (cpu_moe_ext.cpp:
@@ -2799,7 +2835,7 @@ def _decode_target(config: EngineConfig) -> str:
 # expert activations the CPU MoE executor supports (csrc ActKind)
 _CPU_MOE_ACTS = (
     "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
-    "swiglu_clamp",
+    "swiglu_clamp", "swiglustep",
 )
 
 

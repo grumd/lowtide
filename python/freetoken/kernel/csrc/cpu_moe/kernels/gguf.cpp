@@ -65,7 +65,7 @@ class GgufFormat final : public MoeFormat {
     const uint8_t* w = static_cast<const uint8_t*>(tbl_at(gate_up_, layer)) + static_cast<size_t>(e) * 2 * p.I * gu_.row_bytes;
     const uint8_t* xq = xq_.data() + static_cast<size_t>(tok) * gu_.act_row_bytes;
     const float* sc = expert_scales(layer, e);
-    gated_rows(p, i0, i1, w_in, g, [&](int row) {
+    gated_rows(p, layer, i0, i1, w_in, g, [&](int row) {
       float s;
       gu_.vec_dot(p.H, &s, 0, w + static_cast<size_t>(row) * gu_.row_bytes, 0, xq, 0, 1);
       return sc == nullptr ? s : s * sc[row < p.I ? 0 : 1];

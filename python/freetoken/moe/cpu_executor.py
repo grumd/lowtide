@@ -65,6 +65,7 @@ _ACT_IDS = {
     "gpt_oss_swiglu": 3,
     "swigluoai": 3,
     "swiglu_clamp": 4,
+    "swiglustep": 5,
 }
 
 
@@ -175,7 +176,7 @@ class CpuMoeExecutor:
         activation_dtype: torch.dtype = torch.bfloat16,
         graph_enabled: bool = True,
         swiglu_alpha: float = 1.702,
-        swiglu_limit: float | None = None,
+        swiglu_limit: float | None | list[float | None] = None,
         layer_formats: list[tuple[str, dict[str, int]]] | None = None,
         fmt: str | None = None,
         cpus: list[int] | None = None,
@@ -189,7 +190,9 @@ class CpuMoeExecutor:
         the first is the coordinator's, which with ``coordinator_joins`` also computes. ``out_fp32``
         returns the expert sum unrounded (fp32 ``y``). ``w4a8``: nvfp4 GEMVs on int8 activations
         (VNNI) instead of fp32 ones, lossy. ``w4a16_down_k_off``: w4a16 only, the offset of this
-        rank's down band inside its first quantization group (0 without TP)."""
+        rank's down band inside its first quantization group (0 without TP). ``swiglu_limit`` may be
+        a list with one limit per layer (by bank layer id; None: no clamp) for experts whose clamp
+        differs between layers."""
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
 
@@ -237,6 +240,13 @@ class CpuMoeExecutor:
                 )
 
         self.num_layers = int(cache.num_layers)
+        per_layer = {}
+        if isinstance(swiglu_limit, (list, tuple)):
+            if len(swiglu_limit) != self.num_layers:
+                raise ValueError(f"CPU MoE: {len(swiglu_limit)} clamp limits for {self.num_layers} layers")
+            # an older extension has no layer_limits argument and fails here instead of clamping wrong
+            per_layer = {"layer_limits": [float("inf") if v is None else float(v) for v in swiglu_limit]}
+            swiglu_limit = None
         bank_layers, self.num_experts = cache.bank_sources, int(cache.num_experts)
         if getattr(cache, "pooled", False):
             # every layer reads the one host pool, and routes carry pool rows (OffloadMoeCache.cpu_banks)
@@ -343,6 +353,7 @@ class CpuMoeExecutor:
             w_ptr=self._io["w"].data_ptr(),
             y_ptr=self._io["y"].data_ptr(),
             y_fp32=self.out_fp32,
+            **per_layer,
         )
         self.num_threads = nthreads
         self.core_ids = core_ids

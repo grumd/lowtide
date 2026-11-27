@@ -140,7 +140,7 @@ class Nvfp4CpuPrefill(Wna16CpuPrefill):
     """The NVFP4 executor (nvfp4_cpu.h) behind the same staging buffers and interface."""
 
     BANK_ROLES = ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")
-    ACTIVATIONS = ("silu", "swiglu_clamp")
+    ACTIVATIONS = ("silu", "swiglu_clamp", "swiglustep")
 
     def __init__(self, *, hidden: int, inter: int, num_experts: int, top_k: int, max_tokens: int,
                  threads: int, cpus: list[int], activation: str = "silu", alpha: float = 1.0,
@@ -149,13 +149,16 @@ class Nvfp4CpuPrefill(Wna16CpuPrefill):
         clamp = activation == "swiglu_clamp"
         ext = load_nvfp4_extension()
         impl = ext.Nvfp4CpuPrefill(threads, cpus, hidden, inter, num_experts, clamp=clamp, alpha=float(alpha),
-                                   limit=float("inf") if limit is None else float(limit))
+                                   limit=float("inf") if limit is None else float(limit),
+                                   step=activation == "swiglustep")
         self._init_buffers(impl, hidden, top_k, max_tokens)
         logger.info(f"nvfp4 CPU prefill experts: {threads} threads on cpus {cpus}")
 
-    def set_layer(self, layer_id: int, banks: dict[str, torch.Tensor]) -> None:
+    def set_layer(self, layer_id: int, banks: dict[str, torch.Tensor], limit: float | None = ...) -> None:
+        """``limit``: this layer's clamp limit (None: none); left out, the executor's."""
         self.last_layer = max(getattr(self, "last_layer", 0), layer_id)
-        self.impl.set_layer(layer_id, *(banks[r] for r in self.BANK_ROLES))
+        lim = {} if limit is ... else {"limit": float("inf") if limit is None else float(limit)}
+        self.impl.set_layer(layer_id, *(banks[r] for r in self.BANK_ROLES), **lim)
 
 
 __all__ = ["Nvfp4CpuPrefill", "Wna16CpuPrefill", "cpu_supported", "load_extension", "load_nvfp4_extension",

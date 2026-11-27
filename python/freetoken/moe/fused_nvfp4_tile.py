@@ -70,7 +70,8 @@ def _prefill_gemm(a, packed, scale, glob, c, tw, sorted_ids, expert_ids, ntpp, n
 
 
 def _prefill_gate_up_silu(a, packed, scale, glob, c, sorted_ids, expert_ids, ntpp, num_valid,
-                          top_k, cfg=None) -> None:
+                          top_k, cfg=None, step_limit: float | None = None) -> None:
+    """``step_limit``: swiglustep with that limit (+inf: none) instead of silu."""
     cfg = cfg or _tile_silu_config(sorted_ids.shape[0] // max(1, top_k))
     inter, K = packed.shape[1] // 2, packed.shape[2] * 2
     EM = sorted_ids.shape[0]
@@ -85,6 +86,7 @@ def _prefill_gate_up_silu(a, packed, scale, glob, c, sorted_ids, expert_ids, ntp
         glob.stride(0),
         c.stride(0), c.stride(1),
         top_k=top_k, compute_type=_tl_dtype(c.dtype), **cfg,
+        **({} if step_limit is None else dict(limit=float(step_limit), STEP=True)),
     )
 
 
@@ -109,7 +111,7 @@ def fused_experts_nvfp4_tile(
     dev, dt = hidden_states.device, hidden_states.dtype
     cfg_dn = cfg_dn or _tile_down_config(M)
     if fuse_act is None:
-        fuse_act = activation == "silu" and not apply_router_weight_on_input
+        fuse_act = activation in ("silu", "swiglustep") and not apply_router_weight_on_input
     cfg_gu = cfg_gu or (_tile_silu_config(M) if fuse_act else _TILE_GATE_UP)
 
     aligned: Dict[int, Any] = {}
@@ -127,7 +129,8 @@ def fused_experts_nvfp4_tile(
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
     if fuse_act:
         _prefill_gate_up_silu(hidden_states, gate_up_packed, gate_up_scale, gate_up_global, ic2,
-                              *align(cfg_gu["BLOCK_SIZE_M"]), num_valid, top_k, cfg_gu)
+                              *align(cfg_gu["BLOCK_SIZE_M"]), num_valid, top_k, cfg_gu,
+                              step_limit=act_limit if activation == "swiglustep" else None)
     else:
         ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
         _prefill_gemm(hidden_states, gate_up_packed, gate_up_scale, gate_up_global, ic1, tw,
@@ -185,7 +188,7 @@ def _gemv(a, packed, scale, glob, ids, R, top_k, a_row_is_route, tile, routes=0,
 
 
 # the activations nvfp4_decode_silu computes (its reduce epilogue)
-DECODE_ACTIVATIONS = ("silu", "swiglu_clamp")
+DECODE_ACTIVATIONS = ("silu", "swiglu_clamp", "swiglustep")
 
 
 def decode_supported(gate_up_packed: torch.Tensor, down_packed: torch.Tensor, gu_tile=None, dn_tile=None) -> bool:
@@ -201,8 +204,8 @@ def nvfp4_decode_silu(
     copy=None, join=None, cpu_y: torch.Tensor | None = None, cpu_wait=None,
     activation: str = "silu", alpha: float = 1.0, limit: float = float("inf"),
 ) -> torch.Tensor:
-    """SiLU-gated (or ``swiglu_clamp``: gate <= limit, |up| <= limit, sigmoid(alpha * gate)) NVFP4
-    expert MLP for a few tokens; ``topk_ids`` are cache slots, ``x`` [M, H]. gate/up stay fp32.
+    """SiLU-gated (or ``swiglu_clamp``: gate <= limit, |up| <= limit, sigmoid(alpha * gate); or
+    ``swiglustep``: silu(gate) <= limit, |up| <= limit) NVFP4 expert MLP for a few tokens; ``topk_ids`` are cache slots, ``x`` [M, H]. gate/up stay fp32.
 
     With ``copy = (copy_slots, num_copy)`` (this step's expert copy, still running) the routes
     already resident go first, then ``join()`` waits for the copy and the rest follow. Every
@@ -218,7 +221,11 @@ def nvfp4_decode_silu(
     gu_tile, dn_tile = gu_tile or _GU_TILE, dn_tile or _DN_TILE
     skip = cpu_y is not None
     assert activation in DECODE_ACTIVATIONS, activation
-    clamp = {} if activation == "silu" else dict(alpha=float(alpha), limit=float(limit), CLAMP=True)
+    clamp = {
+        "silu": {},
+        "swiglu_clamp": dict(alpha=float(alpha), limit=float(limit), CLAMP=True),
+        "swiglustep": dict(limit=float(limit), STEP=True),
+    }[activation]
     part1 = act = part2 = None
     for routes in ((1, 2) if copy is not None else (0,)):
         if routes == 2:
