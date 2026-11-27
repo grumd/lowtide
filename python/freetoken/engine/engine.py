@@ -532,10 +532,6 @@ def _materialize_loaded_weight_state_dict(
     return state_dict
 
 
-class CpuDecodeTuneRejected(RuntimeError):
-    """A runtime CPU-assisted decode change the engine refuses; it keeps serving unchanged."""
-
-
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
@@ -1068,6 +1064,10 @@ class Engine:
             from freetoken.engine.autotune import AutoTune
 
             self.autotune = AutoTune(self.moe_offload_cache, *self._autotune_start)
+            ngram = getattr(self, "ngram_verify_graphs", None)
+            for runner in (getattr(self, "verify_graph_runner", None), *(ngram.runners.values() if ngram else ())):
+                if runner is not None:
+                    runner.tune = self.autotune
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -1878,12 +1878,6 @@ class Engine:
         mine = cores[tp.rank * per:(tp.rank + 1) * per]
         threads = _rank_cpu_threads(config)
         cpus = mine[len(mine) - threads:] if threads <= len(mine) else mine
-        # FREETOKEN_CPU_DECODE_TUNABLE=1 (manual runs through /v1/admin/decode-tune):
-        # tune_cpu_decode changes the share and the thread count at runtime
-        tunable = os.environ.get("FREETOKEN_CPU_DECODE_TUNABLE", "0").strip() == "1"
-        if tunable:
-            # the pool spans every core of this rank; the ones past `threads` park until raised
-            cpus = cpus + [c for c in mine if c not in cpus]
         executor = CpuMoeExecutor(
             cache,
             top_k=sample.top_k,
@@ -1902,50 +1896,16 @@ class Engine:
             w4a8=False,  # fp32 activations: as close to exact W4 math as the GPU kernel
             w4a16_down_k_off=k_off,
         )
-        if tunable:
-            executor.set_active_threads(min(threads, executor.max_threads))
         cache.cpu_decode = executor
         cache.decode_fetch_tuned = tuned
         cache.set_decode_fetch(fetch)
         if self.cpu_moe_executor is None:
             self.cpu_moe_executor = executor  # its flag watchdog is checked after every forward
-        self._cpu_decode_tunable = tunable
         logger.info_rank0(
             ("CPU-assisted decode (share tuned at runtime)" if tuned else
              f"--moe-decode-fetch {fetch}: decode fetches {fetch:.0%} of its expert-cache misses over PCIe and")
-            + f" computes the rest on cpus {cpus[:executor.active_threads]} ({executor.isa})"
-            + (f"; runtime-tunable, up to {executor.max_threads} threads" if tunable else "")
+            + f" computes the rest on cpus {cpus} ({executor.isa})"
         )
-
-    def tune_cpu_decode(self, fetch: float | None = None, threads: int | None = None) -> dict:
-        """Calibration only (FREETOKEN_CPU_DECODE_TUNABLE=1 with a share below 1): change the
-        CPU-assisted decode's fetched share and thread count between requests. The share is read
-        from device memory by the captured graphs; switching to 1 (plain decode) needs a restart.
-        Every TP rank must call it at the same point, with the scheduler idle."""
-        cache = self.moe_offload_cache
-        executor = getattr(cache, "cpu_decode", None)
-        if executor is None or not getattr(self, "_cpu_decode_tunable", False):
-            raise CpuDecodeTuneRejected(
-                "the server was not started for calibration (FREETOKEN_CPU_DECODE_TUNABLE=1 and "
-                "--moe-decode-fetch below 1, with NVFP4 experts and --moe-strategy offload)"
-            )
-        if fetch is not None and not 0.0 <= fetch < 1.0:
-            raise CpuDecodeTuneRejected(
-                f"decode fetch share must be in [0, 1) at runtime, got {fetch}; 1 (plain decode) needs a restart"
-            )
-        if threads is not None and not 1 <= threads <= executor.max_threads:
-            raise CpuDecodeTuneRejected(f"threads must be in [1, {executor.max_threads}], got {threads}")
-        torch.cuda.synchronize(self.device)
-        if threads is not None:
-            executor.set_active_threads(threads)
-        if fetch is not None:
-            cache.set_decode_fetch(fetch)
-        return {
-            "decode_fetch": cache.decode_fetch,
-            "threads": executor.active_threads,
-            "max_threads": executor.max_threads,
-            "isa": executor.isa,
-        }
 
     def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
         """Build the persistent CPU MoE executor (decode-time expert compute).

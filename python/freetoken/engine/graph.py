@@ -300,6 +300,9 @@ class GraphRunner:
     def _variant(self) -> bool:
         return getattr(self.moe_offload_cache, "cpu_decode_on", True)
 
+    def captured(self, bs: int) -> bool:
+        return (bs, self._variant()) in self.graph_map
+
     def pad_batch(self, batch: Batch) -> None:
         padded_size = (  # choose the first available batch size
             next(bs for bs in self.graph_bs_list if bs >= batch.size)

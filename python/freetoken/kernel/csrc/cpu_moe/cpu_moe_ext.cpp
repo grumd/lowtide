@@ -115,17 +115,8 @@ struct CpuMoeExecutor {
 
   // Worker pool.
   int num_threads;
-  // Workers [0, active_workers) take tasks; the rest park on park_cv (set_active_workers, only while no task is in
-  // flight). cur_active is the count the current task uses; bar_n the barrier participants (+ a joining coordinator).
-  // seen_gen / parked let set_active_workers wait until every worker it activates has caught up: one that read the
-  // generation after the next submit would skip that task and strand the others in the barrier.
-  std::atomic<int> active_workers{0};
-  int cur_active = 0, bar_n = 1;
+  int bar_n = 1;  // barrier participants of the current task: the workers (+ a joining coordinator)
   bool coord_joins = false;  // the doorbell coordinator computes alongside the workers
-  std::mutex park_mtx;
-  std::condition_variable park_cv;
-  std::unique_ptr<std::atomic<uint64_t>[]> seen_gen;
-  std::unique_ptr<std::atomic<int>[]> parked;
   // coordinator totals since the last take_flag_stats: tasks, routes computed, ns from doorbell to done
   std::atomic<int64_t> st_tasks{0}, st_routes{0}, st_ns{0};
   std::vector<int> core_ids;          // worker tid -> logical CPU to pin to (may be empty)
@@ -224,14 +215,7 @@ struct CpuMoeExecutor {
     slot_order.assign(max_routes, 0);
     size_at.assign(max_routes + 1, 0);
     slot_fill.assign(max_routes, 0);
-    active_workers.store(num_threads);
-    cur_active = bar_n = num_threads;
-    seen_gen.reset(new std::atomic<uint64_t>[num_threads]);
-    parked.reset(new std::atomic<int>[num_threads]);
-    for (int t = 0; t < num_threads; ++t) {
-      seen_gen[t].store(0);
-      parked[t].store(0);
-    }
+    bar_n = num_threads;
     for (int t = 0; t < num_threads; ++t)
       workers.emplace_back([this, t] { worker_loop(t); });
   }
@@ -248,10 +232,6 @@ struct CpuMoeExecutor {
       stop = true;
     }
     task_cv.notify_all();
-    {
-      std::lock_guard<std::mutex> lk(park_mtx);
-    }
-    park_cv.notify_all();
     for (auto& th : workers)
       if (th.joinable()) th.join();
   }
@@ -444,16 +424,6 @@ struct CpuMoeExecutor {
     using wclk = std::chrono::steady_clock;
     auto last_active = wclk::now();
     for (;;) {
-      if (tid >= active_workers.load(std::memory_order_acquire)) {
-        std::unique_lock<std::mutex> lk(park_mtx);
-        parked[tid].store(1);
-        park_cv.wait(lk, [&] { return stop.load() || tid < active_workers.load(); });
-        if (stop.load()) return;
-        my_gen = submitted.load(std::memory_order_acquire);  // never run a task from before
-        seen_gen[tid].store(my_gen);
-        parked[tid].store(0);
-        continue;
-      }
       uint64_t gen = submitted.load(std::memory_order_acquire);
       if (gen == my_gen && spin_wait.load(std::memory_order_relaxed)) {
         unsigned polls = 0;
@@ -472,11 +442,9 @@ struct CpuMoeExecutor {
       }
       // submit() writes cur_task before the release store to `submitted`.
       my_gen = gen;
-      seen_gen[tid].store(gen);
-      if (tid >= cur_active) continue;  // parked since its last task: not part of this one
       run_task_body(cur_task);
       last_active = wclk::now();
-      if (done_count.fetch_add(1) + 1 == cur_active) {
+      if (done_count.fetch_add(1) + 1 == num_threads) {
         completed.store(my_gen, std::memory_order_release);
         {
           std::lock_guard<std::mutex> lk(sync_mtx);
@@ -484,21 +452,6 @@ struct CpuMoeExecutor {
         sync_cv.notify_all();
       }
     }
-  }
-
-  // Runtime pool size: workers beyond n park until raised again. With none left the joining coordinator, or else the
-  // submitting thread, computes alone. Call only while no task is in flight.
-  void set_active_workers(int n) {
-    if (n < 0 || n > num_threads)
-      throw std::invalid_argument("active workers must be in [0, " + std::to_string(num_threads) + "]");
-    {
-      std::lock_guard<std::mutex> lk(park_mtx);
-      active_workers.store(n);
-    }
-    park_cv.notify_all();
-    const uint64_t g = submitted.load();
-    for (int t = 0; t < n; ++t)
-      while (parked[t].load() || seen_gen[t].load() != g) std::this_thread::yield();
   }
 
   // Groups active_routes by expert, larger groups first so heavy pass 1 items do not run last; counts only the experts the
@@ -543,8 +496,7 @@ struct CpuMoeExecutor {
   void submit(MoeTask t, bool joins = false) {
     const int num_tokens = static_cast<int>(t.num_tokens);
     MoeFormat& fmt = *fmts[layer_fmt[t.layer]];
-    cur_active = active_workers.load();
-    bar_n = std::max(1, cur_active + (joins ? 1 : 0));
+    bar_n = std::max(1, num_threads + (joins ? 1 : 0));
     n_iblk = (params.I + fmt.row_block() - 1) / fmt.row_block();
     n_hblk = (params.H + fmt.row_block() - 1) / fmt.row_block();
     active_routes.clear();
@@ -594,7 +546,7 @@ struct CpuMoeExecutor {
       submitted.store(cur_gen, std::memory_order_release);
     }
     task_cv.notify_all();
-    if (cur_active == 0) {
+    if (num_threads == 0) {
       // no worker takes it: the joining coordinator computes it next, else this thread does now
       if (!joins) run_task_body(t);
       completed.store(gen, std::memory_order_release);
@@ -795,8 +747,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("enabled"))
       .def("get_spin_wait", [](const CpuMoeExecutor& e) { return e.spin_wait.load(); })
       .def("set_coordinator_joins", [](CpuMoeExecutor& e, bool v) { e.coord_joins = v; }, py::arg("value"))
-      .def("set_active_workers", &CpuMoeExecutor::set_active_workers, py::arg("n"))
-      .def("active_workers", [](const CpuMoeExecutor& e) { return e.active_workers.load(); })
       .def("take_flag_stats", [](CpuMoeExecutor& e) {
         return py::make_tuple(e.st_tasks.exchange(0), e.st_routes.exchange(0), e.st_ns.exchange(0));
       });

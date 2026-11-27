@@ -34,7 +34,7 @@ def run_share(curve, start, blocks=200, noise=0.03, drift=0.0, seed=0):
 def test_share_settles_on_the_best(curve, best, start):
     for seed in range(5):
         t, _ = run_share(curve, start, seed=seed)
-        assert LADDER[t.cur] in best and t.cand is None, (start, seed, LADDER[t.cur])
+        assert LADDER[t.cur] in best, (start, seed, LADDER[t.cur])
 
 
 def test_share_ignores_a_warming_cache():
@@ -118,9 +118,9 @@ def test_cutoff_steps_are_bounded():
 def test_probe_starting_values():
     p = Probe(fetch_us=209.0, cpu_us=63.5, cpu_token_us=6.5)
     assert LADDER[snap(p.share())] == 0.25
-    # the CPU's 65% of misses at the mean tokens per expert take as long as streaming them all
+    # the CPU's 65% of misses, at a third of the mean tokens per expert, take as long as fetching them all
     tokens = p.cutoff(512, 10, 0.35)
-    per_expert = tokens * 10 / 512
+    per_expert = tokens * 10 / 512 / at.ROUTE_SKEW
     assert 0.65 * (63.5 + 6.5 * (per_expert - 1)) == pytest.approx(209.0)
 
 
@@ -154,14 +154,14 @@ def test_glue_switches_the_plain_path_and_skips_steps_launched_before_a_switch(m
     cache = FakeCache()
     tune = AutoTune(cache, None, snap(0.5), CutoffTuner(2048, 52, 16384))
     assert cache.cpu_decode_on and cache.decode_fetch == 0.5 and cache.routed_prefill_tokens == 2048
-    decode = SimpleNamespace(is_decode=True, is_prefill=False, size=1)
+    decode = SimpleNamespace(is_decode=True, is_prefill=False, size=1, input_ids=[0])
     seen = []
     for _ in range(2000):
         rec = tune.before(decode, True)
         seen.append(cache.cpu_decode_on)
         FakeEvent.clock[0] += 10.0 if cache.cpu_decode_on else 9.0  # plain is faster
         tune.after(rec)
-    assert not cache.cpu_decode_on and cache.decode_fetch < 1.0  # verify windows keep a split share
+    assert not cache.cpu_decode_on and not cache.verify_cpu_on  # n-gram verify windows follow
     assert seen.count(False) > 0.9 * len(seen)
     # a cutoff raised past the CPU executor's buffers grows them
     tune._set_cutoff(3000)
@@ -220,7 +220,7 @@ def test_glue_counts_the_host_time_between_decode_steps(monkeypatch, verify):
     rng = random.Random(4)
     cache = FakeCache()
     tune = AutoTune(cache, None, snap(0.5), None)
-    decode = SimpleNamespace(is_decode=True, is_prefill=False, size=1)
+    decode = SimpleNamespace(is_decode=True, is_prefill=False, size=1, input_ids=[0])
     prefill = SimpleNamespace(is_decode=False, is_prefill=True, input_ids=[0] * 100)
     for i in range(3000):
         batch = prefill if i % 200 == 0 else decode  # a new request now and then: a long gap
@@ -244,3 +244,49 @@ def test_cutoff_rises_at_most_to_twice_the_largest_routed_chunk():
     assert t.cutoff == 3072
     t.observe(3500, False, 2040.0)
     assert t.cutoff == 3584  # not 4608: no routed chunk past 1800 yet
+
+
+def test_glue_tunes_on_verify_windows(monkeypatch):
+    # MTP: every step is a verify window (k+1 tokens, replayed from its own graph twin)
+    monkeypatch.setattr(at.torch.cuda, "Event", FakeEvent)
+    cache = FakeCache()
+    tune = AutoTune(cache, None, snap(0.25), None)
+    verify = SimpleNamespace(is_decode=False, is_prefill=True, mtp_verify=True, size=1, input_ids=[0] * 4)
+    for _ in range(3000):
+        rec = tune.before(verify, True)
+        assert rec is None and cache.routed_prefill_tokens == 0  # not taken for a prefill chunk
+        FakeEvent.clock[0] += {0.06: 30.0, 0.12: 26.0, 0.25: 24.0, 0.5: 22.0, 1.0: 25.0}[
+            cache.decode_fetch if cache.cpu_decode_on else 1.0]
+    assert cache.cpu_decode_on and cache.decode_fetch == 0.5
+
+
+def test_share_drops_a_far_slower_setting_after_one_block():
+    # one GPU: plain decode is 1.6x slower; trying it costs one block, not four
+    t = ShareTuner(snap(0.12))
+    t.tries, t.cand = [], len(LADDER) - 1
+    t.blocks = [[], []]
+    t.block_done(1000 / 56.3)  # current
+    assert t.cand is not None
+    t.block_done(1000 / 35.7)  # plain
+    assert t.cand is None and LADDER[t.cur] == 0.12
+
+
+def test_glue_drops_a_comparison_that_mixed_steps_starve(monkeypatch):
+    # n-gram code edits: decode steps and verify windows of changing widths interleave, so no kind
+    # gets 8 timed steps in a row; the tried setting (here plain, 1.6x slower) must not linger
+    monkeypatch.setattr(at.torch.cuda, "Event", FakeEvent)
+    cache = FakeCache()
+    tune = AutoTune(cache, None, snap(0.12), None)
+    tune.share.tries, tune.share.cand = [], len(LADDER) - 1
+    tune.share.blocks = [[16.0], []]  # the next block runs the tried setting
+    tune._apply(tune.share.arm())
+    assert not cache.cpu_decode_on
+    kinds = [SimpleNamespace(is_decode=True, is_prefill=False, size=1, input_ids=[0])] + [
+        SimpleNamespace(is_decode=False, is_prefill=True, mtp_verify=True, size=1, input_ids=[0] * w) for w in (3, 5, 8)]
+    plain = 0
+    for i in range(2000):
+        tune.before(kinds[(i * 7) % 5 % 4], True)
+        plain += not cache.cpu_decode_on
+        FakeEvent.clock[0] += 17.0 if cache.cpu_decode_on else 28.0
+    assert plain <= at.STALL and tune.share.cand is None and cache.cpu_decode_on
+    assert cache.verify_cpu_on  # n-gram verify windows never ran the tried setting

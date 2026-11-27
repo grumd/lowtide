@@ -116,23 +116,6 @@ class CacheRebuildResultMsg(BaseTokenizerMsg):
 
 
 @dataclass
-class DecodeTuneMsg(BaseTokenizerMsg):
-    # api server -> tokenizer worker (passthrough to DecodeTuneBackendMsg).
-    request_id: str
-    decode_fetch: float | None = None
-    threads: int | None = None
-
-
-@dataclass
-class DecodeTuneResultMsg(BaseTokenizerMsg):
-    # scheduler -> detokenizer worker (passthrough to DecodeTuneReply).
-    request_id: str
-    status: str  # "ok" | "rejected"
-    result: Dict[str, Any] | None = None
-    error: str | None = None
-
-
-@dataclass
 class FlushCacheMsg(BaseTokenizerMsg):
     # api server -> tokenizer worker (pure passthrough to FlushCacheBackendMsg).
     request_id: str

@@ -33,8 +33,14 @@ LADDER = (0.06, 0.12, 0.25, 0.5, 1.0)
 BLOCK = 8  # decode steps per block
 PATTERN = (0, 1, 1, 0, 1, 0, 0, 1)  # 0 = current setting, 1 = the neighbour being tried
 RECHECK = 1024  # steps between re-checks of a settled share
+STALL = 4 * BLOCK  # steps a comparison may go without a block of its kind
+REJECT = 1.2  # a tried setting whose first block is this much slower loses at once
 CUTOFF_STEP = 1.5  # most the cutoff moves per chunk
 CUTOFF_WINDOW = 6  # latest chunks remembered per path
+# the GPU takes the most-routed misses of a routed chunk, so the experts left to the CPU see about
+# this many times fewer tokens than the chunk's mean per expert (fitted to the crossovers measured
+# on q38, Ling-3.2 air and Hy4-flash at one and two GPUs: 2.5-4)
+ROUTE_SKEW = 3.0
 
 
 def snap(share: float) -> int:
@@ -66,6 +72,16 @@ class ShareTuner:
         self.blocks: list[list[float]] = [[], []]
         self.idle = 0
 
+    def started(self) -> bool:
+        return bool(self.blocks[0] or self.blocks[1])
+
+    def restart(self) -> None:
+        self.blocks = [[], []]
+
+    def drop(self) -> None:
+        """Give up on the setting being tried, keeping the current one."""
+        self._next()
+
     def arm(self) -> int:
         if self.cand is None:
             return self.cur
@@ -80,6 +96,11 @@ class ShareTuner:
                 self._search()
             return False
         self.blocks[PATTERN[len(self.blocks[0]) + len(self.blocks[1])]].append(ms)
+        if self.blocks[0] and self.blocks[1] and self.blocks[1][0] > REJECT * self.blocks[0][0]:
+            # far slower (plain decode on a PCIe-bound GPU): no need to finish the comparison
+            self.last = (self.blocks[0][0], self.blocks[1][0])
+            self._next()
+            return False
         if len(self.blocks[0]) + len(self.blocks[1]) < len(PATTERN):
             return False
         cur, cand = (sum(b) / len(b) for b in self.blocks)
@@ -182,9 +203,9 @@ class Probe:
 
     def cutoff(self, num_experts: int, top_k: int, prefill_fetch: float) -> float:
         """Prefill: the chunk at which the CPU's share of the misses (``1 - prefill_fetch``), each
-        expert with the chunk's mean tokens, takes as long as fetching every miss."""
+        expert with ``1 / ROUTE_SKEW`` of the chunk's mean tokens, takes as long as fetching every miss."""
         tokens = (self.fetch_us / (1 - prefill_fetch) - self.cpu_us + self.cpu_token_us) / self.cpu_token_us
-        return max(tokens, 1.0) * num_experts / top_k
+        return max(tokens, 1.0) * ROUTE_SKEW * num_experts / top_k
 
 
 def probe(cache, group) -> Probe | None:
@@ -246,8 +267,9 @@ class AutoTune:
         self.share = ShareTuner(share_start) if share_start is not None else None
         self.pending: deque = deque()
         self.n = 0
-        self.block: list[float] = []
-        self.block_key = None
+        self.blocks: dict = {}  # step kind -> times at the applied setting
+        self.cmp_key = None  # the step kind the running comparison's blocks were timed on
+        self.stalled = 0  # decode steps since the running comparison last got a block
         self.applied = None
         self.prev = None  # the last forward if it was a timed decode step: (size, arm, start event)
         if self.share is not None:
@@ -262,14 +284,22 @@ class AutoTune:
             end.synchronize()
             ms = rec[-1].elapsed_time(end)
             (self._step if rec[0] == "decode" else self._chunk)(rec[1], rec[2], ms)
-        if batch.is_decode and self.share is not None and graph:
-            # a decode step lasts from its start to the next one's, so the time includes the host
-            # work between forwards (sampling, scheduling), which the CPU split's workers can slow
+        verify = getattr(batch, "mtp_verify", False)  # an n-gram / MTP verify window
+        if (batch.is_decode or verify) and self.share is not None and graph:
+            if self.share.cand is not None:
+                self.stalled += 1
+                if self.stalled > STALL:  # mixed step kinds starve the comparison: drop it
+                    self.share.drop()
+                    self.stalled = 0
+                    self._apply(self.share.arm())
+            # a step lasts from its start to the next one's of the same kind, so the time includes
+            # the host work between forwards (sampling, scheduling, drafting), which the CPU split's
+            # workers can slow
             start = torch.cuda.Event(enable_timing=True)
             start.record()
-            prev, self.prev = self.prev, (batch.size, self.applied, start)
+            prev, self.prev = self.prev, ((batch.size, len(batch.input_ids)), self.applied, start)
             if prev is not None and prev[:2] == self.prev[:2]:
-                self.pending.append((self.n, ("decode", batch.size, self.applied, prev[2]), start))
+                self.pending.append((self.n, ("decode", self.prev[0], self.applied, prev[2]), start))
             return None
         self.prev = None
         if not (batch.is_prefill and self.cutoff is not None):
@@ -282,6 +312,10 @@ class AutoTune:
         start = torch.cuda.Event(enable_timing=True)
         start.record()
         return ("prefill", tokens, routed, start)
+
+    def untimed(self) -> None:
+        """A forward between decode steps that is not timed: the next step starts a new interval."""
+        self.prev = None
 
     def after(self, rec) -> None:
         if rec is not None:
@@ -296,18 +330,23 @@ class AutoTune:
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX, group=self.group)
         return float(t)
 
-    def _step(self, size: int, arm: int, ms: float) -> None:
-        if arm != self.applied or size != self.block_key:
-            self.block, self.block_key = [], size
-            if arm != self.applied:  # launched before the last switch
-                return
-        self.block.append(ms)
-        if len(self.block) < BLOCK:
+    def _step(self, key, arm: int, ms: float) -> None:
+        if arm != self.applied:  # launched before the last switch
             return
+        block = self.blocks.setdefault(key, [])
+        block.append(ms)
+        if len(block) < BLOCK:
+            return
+        self.blocks = {}
         t = self.share
+        if t.cand is not None:
+            if t.started() and key != self.cmp_key:
+                t.restart()  # blocks of different step kinds (decode, verify widths) do not compare
+            else:
+                self.stalled = 0
+            self.cmp_key = key
         # the median drops a step that waited on something else (a new request, a slow sample)
-        mid = self._max(sorted(self.block)[BLOCK // 2]) if t.cand is not None else 0.0
-        self.block = []
+        mid = self._max(sorted(block)[BLOCK // 2]) if t.cand is not None else 0.0
         old = LADDER[t.cur]
         if t.block_done(mid):
             logger.info_rank0(f"autotune: --moe-decode-fetch {_share(old)} -> {_share(LADDER[t.cur])} "
@@ -318,8 +357,9 @@ class AutoTune:
         if i != self.applied:
             self.applied = i
             self.cache.cpu_decode_on = LADDER[i] < 1
-            if LADDER[i] < 1:  # plain keeps the last split share for the verify windows, whose
-                self.cache.set_decode_fetch(LADDER[i])  # graphs always take the CPU split
+            if LADDER[i] < 1:
+                self.cache.set_decode_fetch(LADDER[i])
+        self.cache.verify_cpu_on = LADDER[self.share.cur] < 1
 
     def _chunk(self, tokens: int, routed: bool, ms: float) -> None:
         old = self.cutoff.cutoff

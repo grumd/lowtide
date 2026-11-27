@@ -82,15 +82,6 @@ class CacheRebuildReply(BaseFrontendMsg):
 
 
 @dataclass
-class DecodeTuneReply(BaseFrontendMsg):
-    # detokenizer worker -> api server: result of a /v1/admin/decode-tune request.
-    request_id: str
-    status: str  # "ok" | "rejected"
-    result: Dict[str, Any] | None = None
-    error: str | None = None
-
-
-@dataclass
 class FlushCacheReply(BaseFrontendMsg):
     # detokenizer worker -> api server: result of a /v1/cache/flush request.
     request_id: str

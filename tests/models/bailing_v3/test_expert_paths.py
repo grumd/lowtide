@@ -449,7 +449,6 @@ def _decode(monkeypatch, layers):
     built = []
 
     class Fake:
-        max_threads = active_threads = 2
         isa = "fake"
 
         def __init__(self, cache, **kw):

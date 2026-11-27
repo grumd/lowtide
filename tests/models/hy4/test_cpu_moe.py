@@ -330,7 +330,6 @@ def test_engine_passes_the_clamp_to_the_cpu_decode_executor(monkeypatch):
     built = []
 
     class Fake:
-        max_threads = active_threads = 2
         isa = "fake"
 
         def __init__(self, cache, **kw):

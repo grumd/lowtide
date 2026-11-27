@@ -87,7 +87,7 @@ def _rank_main(rank: int, out: Path) -> None:
     )
     engine = llm.engine
     model, dev = engine.model, engine.device
-    res = {"rank": rank, "graphs": sorted(engine.graph_runner.graph_map), "slots": engine.moe_offload_cache.cache_size}
+    res = {"rank": rank, "graphs": sorted({bs for bs, _ in engine.graph_runner.graph_map}), "slots": engine.moe_offload_cache.cache_size}
 
     faulthandler.dump_traceback_later(STEP_TIMEOUT_S, exit=True)
     hidden = []

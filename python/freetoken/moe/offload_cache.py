@@ -236,6 +236,7 @@ class OffloadMoeCache:
     # plain arm turns it off; the decode graphs are captured both ways, see ``decode_variants``).
     cpu_decode_on: bool = True
     decode_fetch_tuned: bool = False
+    verify_cpu_on: bool = True  # the CPU split for n-gram verify windows: the tuner's settled mode
     # Elastic VRAM: ``bank_alloc(name, shape, dtype)`` returns each bank's slot
     # cache (a CUDA-VMM tensor sized for cache_size with only the active prefix backed), and
     # slots >= ``active_slots`` are fenced off. None keeps plain torch.empty banks, all active.

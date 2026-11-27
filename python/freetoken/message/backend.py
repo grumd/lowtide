@@ -98,15 +98,6 @@ class CacheRebuildBackendMsg(BaseBackendMsg):
 
 
 @dataclass
-class DecodeTuneBackendMsg(BaseBackendMsg):
-    # tokenizer worker -> scheduler (every rank): change the CPU-assisted decode at the next idle
-    # point (calibration only, see Engine.tune_cpu_decode). None leaves a setting as it is.
-    request_id: str
-    decode_fetch: float | None = None
-    threads: int | None = None
-
-
-@dataclass
 class FlushCacheBackendMsg(BaseBackendMsg):
     # tokenizer worker -> scheduler: drop every unlocked prefix-cache entry. timeout > 0 waits that many seconds for the scheduler to go idle.
     request_id: str

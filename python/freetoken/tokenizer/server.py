@@ -17,10 +17,6 @@ from freetoken.message import (
     CacheRebuildMsg,
     CacheRebuildReply,
     CacheRebuildResultMsg,
-    DecodeTuneBackendMsg,
-    DecodeTuneMsg,
-    DecodeTuneReply,
-    DecodeTuneResultMsg,
     DetokenizeMsg,
     ErrorReplyMsg,
     FlushCacheBackendMsg,
@@ -192,18 +188,6 @@ def tokenize_worker(
                             mode=m.mode,
                         )
                     )
-                elif isinstance(m, DecodeTuneMsg):
-                    send_backend.put(
-                        DecodeTuneBackendMsg(
-                            request_id=m.request_id, decode_fetch=m.decode_fetch, threads=m.threads
-                        )
-                    )
-                elif isinstance(m, DecodeTuneResultMsg):
-                    send_frontend.put(
-                        DecodeTuneReply(
-                            request_id=m.request_id, status=m.status, result=m.result, error=m.error
-                        )
-                    )
                 elif isinstance(m, CacheRebuildResultMsg):
                     send_frontend.put(
                         CacheRebuildReply(
@@ -230,8 +214,6 @@ def tokenize_worker(
                     (
                         CacheRebuildMsg,
                         CacheRebuildResultMsg,
-                        DecodeTuneMsg,
-                        DecodeTuneResultMsg,
                         FlushCacheMsg,
                         FlushCacheResultMsg,
                         ErrorReplyMsg,
