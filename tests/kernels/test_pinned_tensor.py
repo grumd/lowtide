@@ -115,22 +115,29 @@ def test_host_device_ptr_is_identity_under_uva():
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
 
-    from freetoken.kernel.pinned import _host_ptr_identity, _load_pinned_extension
+    from freetoken.kernel.pinned import _host_ptr_identity, _load_pinned_extension, alloc_pinned_tensor
 
     torch.cuda.init()
     if not _host_ptr_identity():
         pytest.skip("non-UVA platform: host_device_ptr rejects unregistered memory instead")
-    # Under UVA cudaHostGetDevicePointer degenerates to identity for any host pointer
-    # (no registration validation); rejection of pageable memory only exists on
-    # non-identity CUDA platforms (Windows/WDDM), where the translation is real.
+    ext = _load_pinned_extension()
+    pinned = alloc_pinned_tensor(64, dtype=torch.uint8)
+    assert ext.host_device_ptr(pinned.data_ptr()) == pinned.data_ptr()
     # HIP validates registration even though registered/pinned memory uses the
     # identity address on Linux. Calling it with pageable memory also leaves a
     # sticky HIP error, so the pinned identity case above is the relevant check.
     if torch.version.hip is not None:
         return
+    # Pageable memory is driver-dependent under UVA: some drivers hand back the host
+    # address, others (e.g. 620.x with HMM disabled) reject it. A rejection must not
+    # stay pending for the next kernel launch to report.
     pageable = torch.empty(64, dtype=torch.uint8)
-    ext = _load_pinned_extension()
-    assert ext.host_device_ptr(pageable.data_ptr()) == pageable.data_ptr()
+    try:
+        assert ext.host_device_ptr(pageable.data_ptr()) == pageable.data_ptr()
+    except RuntimeError as e:
+        assert "pinned+mapped" in str(e)
+    torch.randn(64, device="cuda")
+    torch.cuda.synchronize()
 
 
 def test_host_bank_pin_registers_and_translates():

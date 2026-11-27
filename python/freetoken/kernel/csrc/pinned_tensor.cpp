@@ -92,6 +92,10 @@ int64_t host_device_ptr(int64_t host_ptr) {
   void *dev_ptr = nullptr;
   const cudaError_t err =
       cudaHostGetDevicePointer(&dev_ptr, reinterpret_cast<void *>(host_ptr), 0);
+  if (err != cudaSuccess) {
+    // the refusal is reported here; left pending, the next launch check would report it again
+    (void)cudaGetLastError();
+  }
   TORCH_CHECK(err == cudaSuccess,
               "cudaHostGetDevicePointer failed (host memory must be pinned+mapped): ",
               cudaGetErrorString(err));
