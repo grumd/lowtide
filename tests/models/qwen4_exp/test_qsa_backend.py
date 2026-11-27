@@ -144,20 +144,31 @@ def test_flashinfer_dense_matches_the_sparse_path():
 
 @requires_cuda
 @pytest.mark.parametrize("cut", [1001, 4096, 4097], ids=["unaligned", "page-boundary", "boundary+1"])
-def test_chunked_prefill_matches_one_shot(cut: int):
-    """Cut points that are not multiples of index_ratio exercise the dual-source compress."""
+def test_chunked_prefill_matches_one_shot(monkeypatch, cut: int):
+    """Cut points that are not multiples of index_ratio exercise the dual-source compress.
+
+    The backend's attention output must be bit-identical. The layer output can differ by an
+    ulp: ``o_proj`` is a cuBLAS bf16 GEMM whose kernel choice depends on M (the chunk's row
+    count), and with torch's default ``allow_bf16_reduced_precision_reduction`` the split-K
+    variant it picks for some M rounds its partial sums to bf16 (2**-11 max here)."""
     config = parsed_config()
     fixture = Fixture(config, num_pages=512)
     attn = fixture.layer(QSA_LAYER)
     length = 5000
     x = _inputs(fixture, [length])[0]
+    attended = []
+    qsa_forward = fixture.backend.qsa_forward
+    monkeypatch.setattr(
+        fixture.backend, "qsa_forward", lambda *args: attended.append(qsa_forward(*args)) or attended[-1]
+    )
 
     one_shot = attn.forward(x, fixture.batch([fixture.req(0, 0, length)], "prefill"))
     head = fixture.req(1, 0, cut)
     attn.forward(x[:cut], fixture.batch([head], "prefill"))
     tail = fixture.req(1, cut, length)
     got = attn.forward(x[cut:], fixture.batch([tail], "prefill"))
-    assert torch.equal(got, one_shot[cut:])
+    assert torch.equal(attended[2], attended[0][cut:])
+    torch.testing.assert_close(got, one_shot[cut:], rtol=0, atol=2**-10)
 
 
 @requires_cuda
