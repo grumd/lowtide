@@ -1790,6 +1790,23 @@ class OffloadMoeCache:
         self._pending_whole_layer = True
         materialize_layer(self, layer_id)
 
+    def warm_ensure(self) -> None:
+        """Launch the ensure kernel once at its widest query (every expert of a layer: a routed extend dedups to
+        at most that) and put every map back. The driver reserves local memory for a kernel's spills on its
+        first launch and keeps it: ~600 MiB for the 512-wide variant on an RTX 3080. Elastic VRAM calls this
+        before it sizes its pool, so a short prompt's first routed prefill does not take the VRAM later."""
+        state = {
+            name: t.clone() for name, t in vars(self).items()
+            if isinstance(t, torch.Tensor) and t.is_cuda and t.nbytes <= 64 << 20
+        }
+        ids = torch.arange(self.num_experts, dtype=torch.int32, device=self.device)
+        self.ensure_experts(0, ids)
+        torch.cuda.synchronize(self.device)
+        for name, t in state.items():
+            getattr(self, name).copy_(t)
+        self._pending_src_layer = None
+        self._pending_planned = False
+
     def reset(self) -> None:
         from freetoken.moe.offload_kernels import reset_cache
 

@@ -392,6 +392,18 @@ def test_page_moves_carry_every_kv_tier():
         assert rows[4 * 16 : 5 * 16].tolist() == [4.0] * 16
 
 
+@CUDA
+def test_warming_the_ensure_kernel_leaves_the_cache_as_it_was():
+    el, cache, kv = _build()
+    _decode(cache, 2, seed=3)
+    before = {k: v.clone() for k, v in vars(cache).items() if isinstance(v, torch.Tensor) and v.is_cuda and v.nbytes <= 64 << 20}
+    cache.warm_ensure()
+    for k, v in before.items():
+        assert torch.equal(getattr(cache, k), v), k
+    _decode(cache, 2, seed=4)
+    _coherent(cache)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_compact_small_weights_releases_interleaved_holes():
     """--dense-mxfp8-groups frees bf16 weights that sit between per-layer tensors that stay; the

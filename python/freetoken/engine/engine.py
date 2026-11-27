@@ -1048,6 +1048,7 @@ class Engine:
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
         if self.elastic is not None:
+            self.moe_offload_cache.warm_ensure()
             # last: everything the graphs and the warm-ups hold is resident by now
             self.elastic.finalize(
                 self._sync_get_memory()[0], self._elastic_reserve, self._elastic_keep_free,
