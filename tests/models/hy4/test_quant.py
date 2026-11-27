@@ -581,7 +581,8 @@ def real_layers():
 
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
-    dev = _device()
+    prev_device = torch.cuda.current_device()
+    dev = _device()  # stays current for the module's tests; restored once they are done
     config = parsed_config()
     layers = []
     for bank, (layer, cap) in enumerate(_captures().items()):
@@ -621,7 +622,8 @@ def real_layers():
     method = _nvfp4_experts().quant_method
     banks = build_expert_banks(method, len(layers), pieces(), device=dev)
     torch.cuda.synchronize()
-    return SimpleNamespace(dev=dev, layers=layers, banks=banks, method=method, teeth=teeth[0])
+    yield SimpleNamespace(dev=dev, layers=layers, banks=banks, method=method, teeth=teeth[0])
+    torch.cuda.set_device(prev_device)
 
 
 @pytest.mark.parametrize("layer", REQUIRED_LAYERS + OPTIONAL_LAYERS)
