@@ -148,11 +148,13 @@ def _verify_run(monkeypatch, op, pool, x, slots, n, t):
     return op.forward(x)
 
 
+@pytest.mark.parametrize("wider_first", [False, True])
 @pytest.mark.parametrize("lens", [(1, 4), (3, 2), (4, 4)])
-def test_verify_window_is_decode_and_the_commit_keeps_the_accepted_rows(rig, monkeypatch, lens):
+def test_verify_window_is_decode_and_the_commit_keeps_the_accepted_rows(rig, monkeypatch, lens, wider_first):
     """A speculative verify of t rows per request (n = 2) gives each row the output of a step-at-a-time
     decode bit for bit, leaves the live recurrent state untouched, and the commit of an accepted prefix L
-    leaves conv and recurrent state exactly where L decode steps would."""
+    leaves conv and recurrent state exactly where L decode steps would. ``wider_first``: a width-8 window ran
+    and was selected before (n-gram windows of several widths): the t=4 verify and its commit use t=4's buffers."""
     config, model = rig
     op = model.model.layers.op_list[3].attention
     li, slots, t = 2, [2, 3], 4
@@ -168,6 +170,9 @@ def test_verify_window_is_decode_and_the_commit_keeps_the_accepted_rows(rig, mon
         states.append((pool.conv_states[li].clone(), pool.recurrent_states[li].clone()))
     seq = torch.stack(steps, dim=1)  # [n, t, hidden]
 
+    if wider_first:
+        _verify_run(monkeypatch, op, pool, x[:16], slots, 2, 8)
+        op.select_verify_width(8)
     pool.conv_states.copy_(start[0])
     pool.recurrent_states.copy_(start[1])
     out = _verify_run(monkeypatch, op, pool, win.reshape(n := 2, -1).view(n * t, -1), slots, n, t).view(n, t, -1)

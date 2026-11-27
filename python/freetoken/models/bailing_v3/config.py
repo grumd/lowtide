@@ -66,9 +66,14 @@ def parse_config(hf_config: Any) -> ModelConfig:
         output_gate="sigmoid",
         variant="kda",
     )
+    # The MTP layer (``--mtp on``, the checkpoint's layer ``num_hidden_layers``) is an MLA layer whose KV
+    # slab takes the id after the served stack; the slab costs VRAM only when the head is built.
+    mtp_num_layers = args.num_nextn_predict_layers
+    mtp_enabled = mtp_num_layers > 0 and os.environ.get("FREETOKEN_ENABLE_MTP", "") == "1"
+    mtp_ids = tuple(range(num_layers, num_layers + mtp_num_layers)) if mtp_enabled else ()
     full_group = FullAttentionGroupConfig(
         name="full",
-        layer_ids=tuple(i for i in args.mla_layer_ids if i < num_layers),
+        layer_ids=tuple(i for i in args.mla_layer_ids if i < num_layers) + mtp_ids,
         num_kv_heads=1,
         head_dim=args.latent_dim,
         rotary_config=rotary_config,
@@ -108,6 +113,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         topk_group=int(getattr(text, "topk_group", 1) or 1),
         attn_sm_scale=args.qk_head_dim**-0.5,
         prefill_workspace=PREFILL_WORKSPACE,
+        mtp_enabled=mtp_enabled,
+        mtp_num_layers=mtp_num_layers,
         bailing_args=args,
     )
 

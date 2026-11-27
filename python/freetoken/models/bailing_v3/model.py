@@ -2,7 +2,7 @@
 
 Pre-norm residual blocks exactly as HF's ``BailingMoeV3DecoderLayer``: ``x + attention(input_layernorm(x))``,
 then ``x + mlp(post_attention_layernorm(x))``; ``model.norm`` and the untied ``lm_head`` at the end. The MTP
-layer (checkpoint index ``num_hidden_layers``) is not built.
+layer (checkpoint index ``num_hidden_layers``) is built as ``mtp`` with ``--mtp on`` (``mtp.py``).
 """
 
 from __future__ import annotations
@@ -55,14 +55,25 @@ class BailingV3Model(BaseOP):
             [BailingV3DecoderLayer(config, i, prefix=f"{prefix}.layers.{i}") for i in range(config.num_layers)]
         )
         self.norm = RMSNorm(size=config.hidden_size, eps=config.rms_norm_eps)
+        # the MTP head drafts from the normed output: stash it on the batch (scheduler/mtp.py reads it)
+        self._mtp_streams = config.mtp_enabled
+
+    @property
+    def embed_tokens(self) -> VocabParallelEmbedding:
+        """The name the MTP scheduler looks the embedding up by."""
+        return self.word_embeddings
 
     def forward(self, input_ids: torch.Tensor, batch=None) -> torch.Tensor:
         """``batch``: the running batch (the global context's when omitted; the engine's logit-dump
         diagnostics pass it)."""
-        x = embed_input_ids(self.word_embeddings, input_ids, batch if batch is not None else get_global_ctx().batch)
+        batch = batch if batch is not None else get_global_ctx().batch
+        x = embed_input_ids(self.word_embeddings, input_ids, batch)
         for layer in self.layers.op_list:
             x = layer.forward(x)
-        return self.norm.forward(x)
+        x = self.norm.forward(x)
+        if self._mtp_streams:
+            batch.mtp_streams = x
+        return x
 
 
 class BailingV3ForCausalLM(BaseLLMModel):
@@ -75,12 +86,19 @@ class BailingV3ForCausalLM(BaseLLMModel):
             tied_embedding=self.model.word_embeddings if config.tie_word_embeddings else None,
             quant_config=config.quant, prefix="lm_head",
         )
+        if config.mtp_enabled:
+            from .mtp import BailingV3MTP
+
+            self.mtp = BailingV3MTP(config)
 
     def prepare_for_runtime(self) -> None:
-        """Post-load, pre-KV-sizing: the MLA layers' bmm-ready kv_b splits replace the checkpoint layout."""
+        """Post-load, pre-KV-sizing: the MLA layers' bmm-ready kv_b splits replace the checkpoint layout, and
+        the MTP head's experts are packed into banks."""
         for layer in self.model.layers.op_list:
             if isinstance(layer.attention, BailingV3Attention):
                 layer.attention.prepare_for_runtime()
+        if getattr(self, "mtp", None) is not None:
+            self.mtp.prepare_for_runtime()
         torch.cuda.empty_cache()
 
     def forward(self) -> torch.Tensor:

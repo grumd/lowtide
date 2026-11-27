@@ -36,7 +36,8 @@ class _Router(BaseOP):
 
 
 class BailingV3SparseBlock(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = "", experts=None):
+        """``experts``: a prebuilt routed-experts layer (the MTP head's resident ones) instead of the stack's."""
         args = config.bailing_args
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
@@ -44,7 +45,7 @@ class BailingV3SparseBlock(BaseOP):
         self.n_group = config.n_group
         self.topk_group = config.topk_group
         self.gate = _Router(config.num_experts, config.hidden_size)
-        self.experts = make_moe_layer(
+        self.experts = experts if experts is not None else make_moe_layer(
             config,
             layer_id=layer_id - config.first_k_dense_replace,
             activation=EXPERT_ACTIVATION,

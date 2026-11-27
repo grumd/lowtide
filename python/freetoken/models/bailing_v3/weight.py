@@ -163,6 +163,61 @@ def _iter_gated_mlp(r: _Reader, base: str) -> Iterator[tuple[str, torch.Tensor]]
     yield f"{base}.down_proj.weight", r.linear(f"{base}.down_proj")
 
 
+def _iter_mtp(r: _Reader, config) -> Iterator[tuple[str, torch.Tensor]]:
+    """The MTP head's state dict (``mtp.py``), unsharded: the checkpoint's layer ``num_hidden_layers``, dense
+    bf16 plus the routed experts' NVFP4 pieces stacked per role (this rank's intermediate slice, quant-side
+    globals inverted as ``nvfp4_expert_spec`` reads the stack's)."""
+    from freetoken.models.nvfp4_banks import _tp_expert_geometry, _tp_slice_piece
+
+    args: BailingV3Args = config.bailing_args
+    n = len(args.layer_types)
+    base = f"model.layers.{n}"
+
+    def mtp_name(name: str) -> str:
+        return "mtp.layer." + name.removeprefix(f"{base}.")
+
+    for norm in ("enorm", "hnorm", "final_layernorm"):
+        yield f"mtp.{norm}.weight", r.tensor(f"{base}.{norm}.weight", torch.bfloat16)
+    yield "mtp.eh_proj.weight", r.linear(f"{base}.eh_proj")
+    for norm in ("input_layernorm", "post_attention_layernorm"):
+        yield f"mtp.layer.{norm}.weight", r.tensor(f"{base}.{norm}.weight", torch.bfloat16)
+    for name, w in _iter_mla(r, args, n):
+        yield mtp_name(name), w
+    yield "mtp.layer.mlp.gate.weight", r.tensor(f"{base}.mlp.gate.weight", torch.bfloat16)
+    yield "mtp.layer.mlp.gate.expert_bias", r.tensor(f"{base}.mlp.gate.expert_bias", torch.float32)
+    if config.shared_expert_intermediate_size:
+        for name, w in _iter_gated_mlp(r, f"{base}.mlp.shared_experts"):
+            yield mtp_name(name), w
+    _, _, lo, hi = _tp_expert_geometry(config)
+    kinds = {"": "weight_packed", "_scale": "weight_scale", "_global": "weight_global_scale"}
+    for proj in ("gate", "up", "down"):
+        for suffix, kind in kinds.items():
+            rows = []
+            for e in range(config.num_experts):
+                t = r.src.get(f"{base}.mlp.experts.{e}.{proj}_proj.{kind}")
+                rows.append((1.0 / t.float()).reshape(1) if suffix == "_global" else _tp_slice_piece(proj, t, lo, hi))
+            yield f"mtp.layer.mlp.experts.{proj}{suffix}", torch.stack(rows).to(r.device)
+
+
+def iter_ftw_extra(model_path: str, config, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """FTW replay hook (``--mtp on``): the MTP head from the FTW's raw checkpoint bytes, sliced for this rank."""
+    from freetoken.checkpoint.ftw import iter_ftw_weights
+    from freetoken.models.hy4.weight import _DictSource
+
+    if not config.mtp_enabled:
+        return
+    prefix = f"model.layers.{len(config.bailing_args.layer_types)}."
+    tensors = {k: v.clone() for k, v in iter_ftw_weights(model_path, kinds=(RAW_FTW_KIND,), keep=lambda k: k.startswith(prefix))}
+    if not tensors:
+        raise FileNotFoundError(f"{model_path}: --mtp on needs the MTP layer, but the FTW has no {prefix}* {RAW_FTW_KIND!r} entries")
+    src = _DictSource(tensors)
+    tp = get_tp_info()
+    for name, w in _iter_mtp(_Reader(src, device), config):
+        yield name, shard_dense(name, w, config, tp)
+    if unread := sorted(set(tensors) - set(src.reads)):
+        raise ValueError(f"FTW MTP entries left unread: {unread[:8]}")
+
+
 def classify(name: str, config) -> str:
     """``dense`` (iter_dense reads it), ``experts`` (iter_expert_pieces), or ``skip``."""
     if name.startswith(SKIP_PREFIXES):
@@ -225,6 +280,10 @@ def iter_weights(
     src = CheckpointSource(download_hf_weight(model_path))
     try:
         yield from iter_dense(src, config, device)
+        if config.mtp_enabled:
+            tp = get_tp_info()
+            for name, w in _iter_mtp(_Reader(src, device), config):
+                yield name, shard_dense(name, w, config, tp)
     finally:
         src.close()
 
@@ -349,6 +408,7 @@ __all__ = [
     "adjust_hf_config",
     "ftw_side_owns",
     "ftw_side_tensors",
+    "iter_ftw_extra",
     "shard_ftw_weight",
     "classify",
     "dequant_fp8",
