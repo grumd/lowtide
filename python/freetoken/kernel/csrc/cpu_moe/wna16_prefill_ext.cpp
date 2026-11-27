@@ -13,7 +13,7 @@ struct Wna16CpuPrefill {
   int num_experts;
 
   Wna16CpuPrefill(int threads, std::vector<int> cpus, int hidden, int inter, int down_groups, int k_off,
-                  int num_experts_)
+                  int num_experts_, bool step)
       : num_experts(num_experts_) {
     TORCH_CHECK(hidden % 128 == 0 && inter % 64 == 0 && (2 * inter) % 64 == 0, "unsupported wna16 shape");
     TORCH_CHECK(k_off % 8 == 0, "down k_off must be a multiple of 8");
@@ -21,6 +21,7 @@ struct Wna16CpuPrefill {
     d.I = inter;
     d.dG = down_groups;
     d.k_off = k_off;
+    d.step = step;
     d.gu_qw_s = int64_t(hidden / 8) * 2 * inter;
     d.gu_qz_s = int64_t(hidden / 128) * (2 * inter / 8);
     d.gu_sc_s = int64_t(hidden / 128) * 2 * inter;
@@ -37,8 +38,10 @@ struct Wna16CpuPrefill {
   }
 
   void set_layer(int layer, torch::Tensor gu_qw, torch::Tensor gu_qz, torch::Tensor gu_sc, torch::Tensor dn_qw,
-                 torch::Tensor dn_qz, torch::Tensor dn_sc) {
+                 torch::Tensor dn_qz, torch::Tensor dn_sc, double limit) {
     const int64_t E = num_experts;
+    // this layer's clamp limit (+inf: none; silu ignores it)
+    TORCH_CHECK(limit > 0, "the clamp limit must be positive (+inf for none)");
     check_bank(gu_qw, at::kInt, d.gu_qw_s, E, "gate_up");
     check_bank(gu_qz, at::kInt, d.gu_qz_s, E, "gate_up_zero");
     check_bank(gu_sc, at::kHalf, d.gu_sc_s, E, "gate_up_scale");
@@ -48,7 +51,7 @@ struct Wna16CpuPrefill {
     ex->set_layer(layer, wna16cpu::Layer{gu_qw.data_ptr<int32_t>(), gu_qz.data_ptr<int32_t>(),
                                          reinterpret_cast<const uint16_t*>(gu_sc.data_ptr<at::Half>()),
                                          dn_qw.data_ptr<int32_t>(), dn_qz.data_ptr<int32_t>(),
-                                         reinterpret_cast<const uint16_t*>(dn_sc.data_ptr<at::Half>())});
+                                         reinterpret_cast<const uint16_t*>(dn_sc.data_ptr<at::Half>()), float(limit)});
   }
 
   // y[T, H] (bf16, or fp32 unrounded) = sum over routes with ids >= 0 of weight * expert(x); returns
@@ -85,9 +88,11 @@ struct Wna16CpuPrefill {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<Wna16CpuPrefill>(m, "Wna16CpuPrefill")
-      .def(py::init<int, std::vector<int>, int, int, int, int, int>(), py::arg("threads"), py::arg("cpus"),
-           py::arg("hidden"), py::arg("inter"), py::arg("down_groups"), py::arg("k_off"), py::arg("num_experts"))
-      .def("set_layer", &Wna16CpuPrefill::set_layer)
+      .def(py::init<int, std::vector<int>, int, int, int, int, int, bool>(), py::arg("threads"), py::arg("cpus"),
+           py::arg("hidden"), py::arg("inter"), py::arg("down_groups"), py::arg("k_off"), py::arg("num_experts"),
+           py::arg("step") = false)
+      .def("set_layer", &Wna16CpuPrefill::set_layer, py::arg("layer"), py::arg("gu_qw"), py::arg("gu_qz"),
+           py::arg("gu_sc"), py::arg("dn_qw"), py::arg("dn_qz"), py::arg("dn_sc"), py::arg("limit"))
       .def("forward", &Wna16CpuPrefill::forward, py::arg("layer"), py::arg("x"), py::arg("ids"), py::arg("w"),
            py::arg("y"), py::arg("precise") = false)
       .def_property_readonly("threads", &Wna16CpuPrefill::threads);

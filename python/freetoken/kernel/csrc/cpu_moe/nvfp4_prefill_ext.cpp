@@ -1,8 +1,6 @@
 // Python binding for the CPU NVFP4 prefill expert executor (nvfp4_cpu.h).
 #include <torch/extension.h>
 
-#include <cmath>
-#include <limits>
 #include <memory>
 
 #include "nvfp4_cpu.h"
@@ -15,17 +13,15 @@ struct Nvfp4CpuPrefill {
   int num_experts;
 
   Nvfp4CpuPrefill(int threads, std::vector<int> cpus, int hidden, int inter, int num_experts_, bool clamp,
-                  double alpha, double limit, bool step)
+                  double alpha, bool step)
       : num_experts(num_experts_) {
     TORCH_CHECK(hidden % 64 == 0 && inter % 64 == 0, "unsupported nvfp4 shape (hidden and inter must be multiples of 64)");
-    TORCH_CHECK(!clamp || limit > 0, "the swiglu clamp needs a positive limit");
     TORCH_CHECK(!(clamp && step), "swiglu_clamp and swiglustep are exclusive");
     d.H = hidden;
     d.I = inter;
     d.clamp = clamp;
     d.step = step;
     d.alpha = float(alpha);
-    d.limit = float(limit);
     d.gu_p_s = int64_t(2 * inter) * (hidden / 2);
     d.gu_s_s = int64_t(2 * inter) * (hidden / 16);
     d.gu_g_s = 2 * inter;
@@ -44,10 +40,9 @@ struct Nvfp4CpuPrefill {
   void set_layer(int layer, torch::Tensor gu_p, torch::Tensor gu_s, torch::Tensor gu_g, torch::Tensor dn_p,
                  torch::Tensor dn_s, torch::Tensor dn_g, double limit) {
     const int64_t E = num_experts;
-    // a NaN limit (the default) keeps the executor's; swiglustep layers pass their own (+inf: none)
-    const float lim = std::isnan(limit) ? d.limit : float(limit);
-    TORCH_CHECK(!d.clamp || lim > 0, "the swiglu clamp needs a positive limit");
-    TORCH_CHECK(!d.step || lim > 0, "the swiglustep clamp needs a positive limit (+inf for none)");
+    // this layer's clamp limit (+inf: none; silu ignores it)
+    const float lim = float(limit);
+    TORCH_CHECK(lim > 0, "the clamp limit must be positive (+inf for none)");
     check_bank(gu_p, 1, d.gu_p_s, E, "gate_up");
     check_bank(gu_s, 1, d.gu_s_s, E, "gate_up_scale");
     check_bank(gu_g, 4, d.gu_g_s, E, "gate_up_global");
@@ -91,12 +86,12 @@ struct Nvfp4CpuPrefill {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<Nvfp4CpuPrefill>(m, "Nvfp4CpuPrefill")
-      .def(py::init<int, std::vector<int>, int, int, int, bool, double, double, bool>(), py::arg("threads"),
+      .def(py::init<int, std::vector<int>, int, int, int, bool, double, bool>(), py::arg("threads"),
            py::arg("cpus"), py::arg("hidden"), py::arg("inter"), py::arg("num_experts"), py::arg("clamp") = false,
-           py::arg("alpha") = 1.0, py::arg("limit") = 0.0, py::arg("step") = false)
+           py::arg("alpha") = 1.0, py::arg("step") = false)
       .def("set_layer", &Nvfp4CpuPrefill::set_layer, py::arg("layer"), py::arg("gu_p"), py::arg("gu_s"),
            py::arg("gu_g"), py::arg("dn_p"), py::arg("dn_s"), py::arg("dn_g"),
-           py::arg("limit") = std::numeric_limits<double>::quiet_NaN())
+           py::arg("limit"))
       .def("forward", &Nvfp4CpuPrefill::forward, py::arg("layer"), py::arg("x"), py::arg("ids"), py::arg("w"),
            py::arg("y"), py::arg("precise") = false)
       .def_property_readonly("threads", &Nvfp4CpuPrefill::threads);

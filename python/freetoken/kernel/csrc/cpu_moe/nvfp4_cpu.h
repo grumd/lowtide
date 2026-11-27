@@ -39,7 +39,7 @@ struct Dims {
   // clamp (swiglu_clamp): g = min(gate, limit); g * sigmoid(alpha * g) * clamp(up, +-limit)
   // step (swiglustep): min(silu(gate), limit) * clamp(up, +-limit); the limit is per layer (Layer::limit)
   bool clamp = false, step = false;
-  float alpha = 1.0f, limit = 0.0f;
+  float alpha = 1.0f;
 };
 
 constexpr int MT = 8;  // tokens per tile: a chunk is unpacked once for all of them

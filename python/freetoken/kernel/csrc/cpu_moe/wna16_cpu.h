@@ -65,11 +65,14 @@ struct Layer {
   const int32_t* dn_qw;
   const int32_t* dn_qz;
   const uint16_t* dn_sc;
+  float limit;  // this layer's clamp limit (+inf: none)
 };
 
 struct Dims {
   int H, I, dG, k_off;
   int64_t gu_qw_s, gu_qz_s, gu_sc_s, dn_qw_s, dn_qz_s, dn_sc_s;  // per-expert strides (elements)
+  // step (swiglustep): min(silu(gate), limit) * clamp(up, +-limit), the limit per layer (Layer::limit)
+  bool step = false;
 };
 
 constexpr int MT = 4;  // tokens per register tile
@@ -211,14 +214,18 @@ void expert_tile(const Layer& L, const Dims& d, int e, const Route* rt, const ui
                   s.xs.data() + g, G1, gu, N1);
   }
 
-  // silu(gate) * up, bf16 at the GPU's store points; group sums for the down epilogue
+  // silu(gate) * up (or swiglustep), bf16 at the GPU's store points; group sums for the down epilogue
   uint16_t* hb = s.hb.data();
   uint32_t* h = s.h.data();
+  const float lim = L.limit;
   for (int m = 0; m < M; ++m) {
     for (int i = 0; i < I; ++i) {
       const float gt = precise ? gu[m * N1 + i] : round_bf16(gu[m * N1 + i]);
       const float up = precise ? gu[m * N1 + I + i] : round_bf16(gu[m * N1 + I + i]);
-      hb[m * I + i] = f32_to_bf16(gt / (1.0f + std::exp(-gt)) * up);
+      if (d.step)  // the GPU expression (kernel/triton/activation.py SWIGLUSTEP)
+        hb[m * I + i] = f32_to_bf16(std::min(gt / (1.0f + std::exp(-gt)), lim) * std::min(std::max(up, -lim), lim));
+      else
+        hb[m * I + i] = f32_to_bf16(gt / (1.0f + std::exp(-gt)) * up);
     }
     pack_pairs(hb + m * I, I, h + m * (I / 2));
     for (int gi = 0; gi < d.dG; ++gi) {

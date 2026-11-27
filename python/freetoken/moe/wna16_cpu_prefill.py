@@ -77,18 +77,25 @@ def rank_cpus(threads: int, rank: int, world: int) -> list[int]:
     return [mine[i % len(mine)] for i in range(threads)]
 
 
-class Wna16CpuPrefill:
-    """Thin owner of the C++ executor plus the pinned staging buffers for one rank."""
+def _limit(limit: float | None) -> float:
+    return float("inf") if limit is None else float(limit)
 
+
+class Wna16CpuPrefill:
+    """Thin owner of the C++ executor plus the pinned staging buffers for one rank. Every layer
+    takes its own clamp limit (``set_layer``)."""
+
+    BANK_ROLES = ("gate_up", "gate_up_zero", "gate_up_scale", "down", "down_zero", "down_scale")
     # expert activations the kernel computes (the engine's capability check)
-    ACTIVATIONS = ("silu",)
+    ACTIVATIONS = ("silu", "swiglustep")
 
     def __init__(self, *, hidden: int, inter: int, down_groups: int, k_off: int, num_experts: int,
                  top_k: int, max_tokens: int, threads: int, cpus: list[int], activation: str = "silu") -> None:
         _check_activation(self, activation)
         ext = load_extension()
-        self._init_buffers(ext.Wna16CpuPrefill(threads, cpus, hidden, inter, down_groups, k_off, num_experts),
-                           hidden, top_k, max_tokens)
+        impl = ext.Wna16CpuPrefill(threads, cpus, hidden, inter, down_groups, k_off, num_experts,
+                                   step=activation == "swiglustep")
+        self._init_buffers(impl, hidden, top_k, max_tokens)
         logger.info(f"wna16 CPU prefill experts: {threads} threads on cpus {cpus}")
 
     def _init_buffers(self, impl, hidden: int, top_k: int, max_tokens: int) -> None:
@@ -124,10 +131,10 @@ class Wna16CpuPrefill:
                 f"({1e3 * st['cpu_s'] / n:.2f} ms); GPU still busy after the CPU in "
                 f"{st['gpu_busy']}/{n} layers; {1e3 * (_now() - st['t0']):.0f} ms layer 0 -> last")
 
-    def set_layer(self, layer_id: int, banks: dict[str, torch.Tensor]) -> None:
+    def set_layer(self, layer_id: int, banks: dict[str, torch.Tensor], limit: float | None = None) -> None:
+        """``limit``: this layer's clamp limit (None: none)."""
         self.last_layer = max(getattr(self, "last_layer", 0), layer_id)
-        self.impl.set_layer(layer_id, banks["gate_up"], banks["gate_up_zero"], banks["gate_up_scale"],
-                            banks["down"], banks["down_zero"], banks["down_scale"])
+        self.impl.set_layer(layer_id, *(banks[r] for r in self.BANK_ROLES), limit=_limit(limit))
 
     def forward(self, layer_id: int, x: torch.Tensor, ids: torch.Tensor, w: torch.Tensor,
                 y: torch.Tensor) -> int:
@@ -143,22 +150,13 @@ class Nvfp4CpuPrefill(Wna16CpuPrefill):
     ACTIVATIONS = ("silu", "swiglu_clamp", "swiglustep")
 
     def __init__(self, *, hidden: int, inter: int, num_experts: int, top_k: int, max_tokens: int,
-                 threads: int, cpus: list[int], activation: str = "silu", alpha: float = 1.0,
-                 limit: float | None = None) -> None:
+                 threads: int, cpus: list[int], activation: str = "silu", alpha: float = 1.0) -> None:
         _check_activation(self, activation)
-        clamp = activation == "swiglu_clamp"
         ext = load_nvfp4_extension()
-        impl = ext.Nvfp4CpuPrefill(threads, cpus, hidden, inter, num_experts, clamp=clamp, alpha=float(alpha),
-                                   limit=float("inf") if limit is None else float(limit),
-                                   step=activation == "swiglustep")
+        impl = ext.Nvfp4CpuPrefill(threads, cpus, hidden, inter, num_experts, clamp=activation == "swiglu_clamp",
+                                   alpha=float(alpha), step=activation == "swiglustep")
         self._init_buffers(impl, hidden, top_k, max_tokens)
         logger.info(f"nvfp4 CPU prefill experts: {threads} threads on cpus {cpus}")
-
-    def set_layer(self, layer_id: int, banks: dict[str, torch.Tensor], limit: float | None = ...) -> None:
-        """``limit``: this layer's clamp limit (None: none); left out, the executor's."""
-        self.last_layer = max(getattr(self, "last_layer", 0), layer_id)
-        lim = {} if limit is ... else {"limit": float("inf") if limit is None else float(limit)}
-        self.impl.set_layer(layer_id, *(banks[r] for r in self.BANK_ROLES), **lim)
 
 
 __all__ = ["Nvfp4CpuPrefill", "Wna16CpuPrefill", "cpu_supported", "load_extension", "load_nvfp4_extension",

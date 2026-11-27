@@ -139,8 +139,8 @@ def test_cpu_prefill_clamp_matches_exact_math(T):
     b, x, ids, w = _case(T, T)
     ids[0, 1] = -1  # a GPU route
     ex = Nvfp4CpuPrefill(hidden=H, inter=I, num_experts=6, top_k=4, max_tokens=16, threads=3, cpus=[],
-                         activation="swiglu_clamp", alpha=1.0, limit=LIMIT)
-    ex.set_layer(0, b)
+                         activation="swiglu_clamp", alpha=1.0)
+    ex.set_layer(0, b, limit=LIMIT)
     y = torch.empty(T, H)
     ex.forward(0, x, ids, w, y)
     ref, bind = _exact(b, x, ids, w)
@@ -157,7 +157,7 @@ def test_cpu_prefill_refuses_what_it_cannot_compute():
 
     common = dict(num_experts=2, top_k=1, max_tokens=4, threads=1, cpus=[])
     with pytest.raises(NotImplementedError, match="swigluoai"):
-        Nvfp4CpuPrefill(hidden=H, inter=I, activation="swigluoai", alpha=1.702, limit=7.0, **common)
+        Nvfp4CpuPrefill(hidden=H, inter=I, activation="swigluoai", alpha=1.702, **common)
     with pytest.raises(NotImplementedError, match="swiglu_clamp"):
         Wna16CpuPrefill(hidden=H, inter=I, down_groups=12, k_off=0, activation="swiglu_clamp", **common)
 
@@ -247,8 +247,8 @@ class _Recorder:
         self.kwargs = kwargs
         _Recorder.built.append(self)
 
-    def set_layer(self, layer_id, banks):
-        pass
+    def set_layer(self, layer_id, banks, limit=None):
+        self.limits = {**getattr(self, "limits", {}), layer_id: limit}
 
 
 def _prefill_cache(roles):
@@ -273,7 +273,8 @@ def test_engine_cpu_prefill_is_on_for_hy4_nvfp4(monkeypatch):
     (rec,) = _Recorder.built
     assert cache.cpu_prefill is rec and cache.cpu_prefill_fetch == 0.35
     k = rec.kwargs
-    assert (k["hidden"], k["inter"], k["activation"], k["alpha"], k["limit"]) == (1536, 1536, "swiglu_clamp", 1.0, 10.0)
+    assert (k["hidden"], k["inter"], k["activation"], k["alpha"]) == (1536, 1536, "swiglu_clamp", 1.0)
+    assert rec.limits == {0: 10.0}
 
 
 @pytest.mark.parametrize("roles,activation,want", [
@@ -346,7 +347,7 @@ def test_engine_passes_the_clamp_to_the_cpu_decode_executor(monkeypatch):
     config = SimpleNamespace(tp_info=SimpleNamespace(rank=0, size=1), cpu_threads=4, max_running_req=1)
     eng.Engine._maybe_init_cpu_decode(host, config, cache, [ex])
     kw = built[0]
-    assert (kw["activation"], kw["swiglu_alpha"], kw["swiglu_limit"], kw["fmt"]) == ("swiglu_clamp", 1.0, 10.0, "nvfp4")
+    assert (kw["activation"], kw["swiglu_alpha"], kw["swiglu_limit"], kw["fmt"]) == ("swiglu_clamp", 1.0, [10.0], "nvfp4")
     assert built[1] == ("fetch", 0.2) and cache.cpu_decode is not None
 
 
@@ -365,7 +366,7 @@ def _cpu_prefill(rows: int):
 
     cpus = physical_core_cpus()
     return Nvfp4CpuPrefill(hidden=H, inter=I, num_experts=512, top_k=16, max_tokens=rows, threads=len(cpus),
-                           cpus=cpus, activation="swiglu_clamp", alpha=1.0, limit=LIMIT)
+                           cpus=cpus, activation="swiglu_clamp", alpha=1.0)
 
 
 def _cpu_decoder(cache, bs: int):
@@ -399,7 +400,7 @@ def test_cpu_prefill_real_layers(real_layers):
     rl = real_layers
     ex = _cpu_prefill(rl.layers[0].lat.shape[0])
     for lay in rl.layers:
-        ex.set_layer(lay.bank, _host_banks(rl, lay))
+        ex.set_layer(lay.bank, _host_banks(rl, lay), limit=LIMIT)
         T = lay.lat.shape[0]
         y = torch.empty(T, H)
         ex.forward(lay.bank, lay.lat.cpu(), lay.ids.cpu(), lay.w.cpu(), y)
@@ -456,7 +457,7 @@ def test_hybrid_merge_and_cpu_decode_real_layers(real_layers, monkeypatch):
 
     cpu = _cpu_prefill(T)
     for lay in rl.layers:
-        cpu.set_layer(lay.bank, _host_banks(rl, lay))
+        cpu.set_layer(lay.bank, _host_banks(rl, lay), limit=LIMIT)
     cache.cpu_prefill = cpu
     for fetch in (0.0, 0.35):
         cache.cpu_prefill_fetch = fetch
@@ -515,7 +516,7 @@ def test_cpu_paths_carry_the_clamp_on_scaled_input(real_layers):
     T = x.shape[0]
 
     ex = _cpu_prefill(T)
-    ex.set_layer(0, _host_banks(rl, lay))
+    ex.set_layer(0, _host_banks(rl, lay), limit=LIMIT)
     y = torch.empty(T, H)
     ex.forward(0, x.cpu(), lay.ids.cpu(), lay.w.cpu(), y)
     pre = y.to(torch.bfloat16)

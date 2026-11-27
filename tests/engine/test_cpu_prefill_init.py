@@ -23,7 +23,7 @@ class _Executor:
         self.kwargs, self.layers = kwargs, {}
         _Executor.built.append(self)
 
-    def set_layer(self, layer_id, banks):
+    def set_layer(self, layer_id, banks, limit=None):
         self.layers[layer_id] = sorted(banks)
 
 
@@ -39,11 +39,12 @@ def _setup(monkeypatch, fetch=0.35, threads=2, activation="silu", avx512_bf16=Tr
         decode_target="gpu", cpu_layer_ids=frozenset(), verify_cpu=False, num_experts=E, num_layers=L,
         cpu_prefill=None, cpu_prefill_fetch=0.35,
     )
-    layer = SimpleNamespace(num_experts=E, top_k=TOP_K, activation=activation, apply_router_weight_on_input=False,
-                            interleaved=False, has_bias=False, alpha=1.0, limit=None)
+    layers = [SimpleNamespace(layer_id=i, num_experts=E, top_k=TOP_K, activation=activation,
+                              apply_router_weight_on_input=False, interleaved=False, has_bias=False, alpha=1.0,
+                              limit=None) for i in range(L)]
     eng = Engine.__new__(Engine)
     eng.config = SimpleNamespace(moe_prefill_fetch=fetch, cpu_threads=threads, tp_info=SimpleNamespace(rank=0, size=1))
-    eng._maybe_init_wna16_cpu_prefill(cache, [layer] * L)
+    eng._maybe_init_wna16_cpu_prefill(cache, layers)
     return cache
 
 

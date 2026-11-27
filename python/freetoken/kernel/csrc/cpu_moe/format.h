@@ -37,11 +37,10 @@ struct MoeParams {
   int H = 0, I = 0;
   int act = ACT_SILU;
   float swiglu_alpha = 1.0f;
-  float swiglu_limit = INFINITY;  // +inf == no clamp
-  // Per-layer limits (indexed like the executor's layers); empty: swiglu_limit on every layer.
-  std::vector<float> layer_limit;
+  // One clamp limit per layer, indexed like the executor's layers (+inf == no clamp).
+  std::vector<float> swiglu_limits;
 
-  float limit(int layer) const { return layer_limit.empty() ? swiglu_limit : layer_limit[layer]; }
+  float limit(int layer) const { return swiglu_limits[layer]; }
 };
 
 // What cpu_executor.py passes for one format, by name: banks map canonical roles (gate_up, gate_up_scale, ...) to per-layer tables, options hold small integers.

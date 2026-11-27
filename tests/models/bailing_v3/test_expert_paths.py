@@ -294,6 +294,57 @@ def test_cpu_prefill_per_layer_limits(T):
     assert e < 1e-4 and _rel(y1, clamp_first) > 0.02 and _rel(y1, unclamped) > 0.05
 
 
+def _w4a16_exact(banks, x, ids, w, kind, limit, H_w):
+    """f64 W4A16 expert sum, rounded to bf16 where the kernel stores (gate/up, activation, each weighted route)."""
+    from tests.moe.test_wna16_cpu_prefill import _dequant
+
+    bf = lambda t: t.to(torch.bfloat16).double()  # noqa: E731
+    y = torch.zeros(x.shape[0], H_w, dtype=torch.float64)
+    for t in range(x.shape[0]):
+        for k in range(ids.shape[1]):
+            e = int(ids[t, k])
+            if e < 0:
+                continue
+            wgu = _dequant(banks["gate_up"][e], banks["gate_up_zero"][e], banks["gate_up_scale"][e], 0).double()
+            wdn = _dequant(banks["down"][e], banks["down_zero"][e], banks["down_scale"][e], 0).double()
+            gu = bf(x[t].double() @ wgu)
+            g, u = gu[: gu.shape[0] // 2], gu[gu.shape[0] // 2 :]
+            y[t] += bf(float(w[t, k]) * (bf(_act(g, u, kind, limit)) @ wdn))
+    return y
+
+
+@needs_avx512
+def test_w4a16_cpu_prefill_per_layer_limits():
+    """The W4A16 CPU prefill with swiglustep: layer 0 without a limit (== the silu kernel bit for bit),
+    layer 1 with one (vs f64, far from both mutants)."""
+    from tests.moe.test_wna16_cpu_prefill import H as H_w, _banks as w4_banks
+    from freetoken.moe.wna16_cpu_prefill import Wna16CpuPrefill
+
+    g = torch.Generator().manual_seed(5)
+    inter, E, T, topk = 192, 6, 9, 3
+    b0, b1 = w4_banks(g, inter, 2, E), w4_banks(g, inter, 2, E)
+    x = (torch.randn(T, H_w, generator=g) * 4.0).to(torch.bfloat16)  # large enough for the clamp to bind
+    ids = torch.randint(0, E, (T, topk), generator=g, dtype=torch.int32)
+    ids[2, 1] = -1
+    w = torch.rand(T, topk, generator=g)
+    common = dict(hidden=H_w, inter=inter, down_groups=2, k_off=0, num_experts=E, top_k=topk, max_tokens=16,
+                  threads=1, cpus=[])
+    step = Wna16CpuPrefill(activation="swiglustep", **common)
+    step.set_layer(0, b0, limit=None)
+    step.set_layer(1, b1, limit=LIMIT)
+    silu = Wna16CpuPrefill(**common)
+    silu.set_layer(0, b0)
+    y0, y0_silu, y1 = (torch.empty(T, H_w) for _ in range(3))
+    step.forward(0, x, ids, w, y0)
+    silu.forward(0, x, ids, w, y0_silu)
+    step.forward(1, x, ids, w, y1)
+    assert torch.equal(_bits(y0), _bits(y0_silu))
+    ref = _w4a16_exact(b1, x, ids, w, "swiglustep", LIMIT, H_w)
+    clamp_first = _w4a16_exact(b1, x, ids, w, "swiglu_clamp", LIMIT, H_w)
+    unclamped = _w4a16_exact(b1, x, ids, w, "silu", None, H_w)
+    assert _rel(y1, ref) < 1e-4 and _rel(y1, clamp_first) > 0.02 and _rel(y1, unclamped) > 0.05
+
+
 # --- engine gates and kernel selection -----------------------------------------------------------
 
 
@@ -352,17 +403,43 @@ def test_engine_cpu_prefill_gets_each_layers_limit(monkeypatch):
     assert rec.limits == {0: {"limit": None}, 1: {"limit": None}, 2: {"limit": 4.0}}
 
 
-def test_engine_cpu_prefill_keeps_one_limit_when_layers_agree(monkeypatch):
+def test_engine_cpu_prefill_passes_a_limit_per_layer_always(monkeypatch):
+    """Layers that agree still get their limit one by one; the constructor takes none."""
     cache, _ = _prefill(monkeypatch, [_layer(0, 4.0), _layer(1, 4.0)])
     (rec,) = _Recorder.built
-    assert rec.kwargs["limit"] == 4.0 and rec.limits == {0: {}, 1: {}}
+    assert "limit" not in rec.kwargs and rec.limits == {0: {"limit": 4.0}, 1: {"limit": 4.0}}
 
 
-def test_engine_cpu_prefill_refuses_mixed_activations(monkeypatch):
-    """A silu first layer used to decide for every layer; a clamped later layer is now refused."""
-    cache, log = _prefill(monkeypatch, [_layer(0, None, "silu"), _layer(1, 4.0, "swiglu_clamp")])
-    assert not hasattr(cache, "cpu_prefill") and not _Recorder.built
-    assert any("CPU prefill off" in m and "disagree" in m for m in log.lines), log.lines
+def test_engine_w4a16_cpu_prefill_gets_each_layers_limit(monkeypatch):
+    """The W4A16 CPU prefill takes swiglustep with a limit per layer, like the NVFP4 one."""
+    import freetoken.engine.engine as eng
+    from freetoken.moe import wna16_cpu_prefill as wcp
+
+    built = []
+
+    class Rec(_Recorder):
+        BANK_ROLES = wcp.Wna16CpuPrefill.BANK_ROLES
+        ACTIVATIONS = wcp.Wna16CpuPrefill.ACTIVATIONS
+
+        def __init__(self, **kwargs):
+            self.kwargs, self.limits = kwargs, {}
+            built.append(self)
+
+    monkeypatch.setattr(eng, "logger", _Log())
+    monkeypatch.setattr(wcp, "cpu_supported", lambda: True)
+    monkeypatch.setattr(wcp, "Wna16CpuPrefill", Rec)
+    layers = [_layer(1, 4.0), _layer(0, None)]
+    shapes = {"gate_up": (512, H // 8, 2 * I), "gate_up_zero": (512, H // 128, 2 * I // 8),
+              "gate_up_scale": (512, H // 128, 2 * I), "down": (512, I // 8, H),
+              "down_zero": (512, 6, H // 8), "down_scale": (512, 6, H)}
+    cache = SimpleNamespace(bank_sources={r: [torch.empty(s, dtype=torch.int32)] * 2 for r, s in shapes.items()},
+                            num_experts=512, num_layers=2, decode_target="gpu", cpu_layer_ids=[], verify_cpu=False)
+    host = SimpleNamespace(config=SimpleNamespace(moe_prefill_fetch=0.35, cpu_threads=2,
+                                                  tp_info=SimpleNamespace(rank=0, size=1)))
+    eng.Engine._maybe_init_wna16_cpu_prefill(host, cache, layers)
+    (rec,) = built
+    assert cache.cpu_prefill is rec and rec.kwargs["activation"] == "swiglustep"
+    assert rec.limits == {0: {"limit": None}, 1: {"limit": 4.0}}
 
 
 def _decode(monkeypatch, layers):
@@ -398,25 +475,6 @@ def test_engine_cpu_assisted_decode_gets_each_layers_limit(monkeypatch):
     _, built, _ = _decode(monkeypatch, [_layer(1, 4.0, kernel=k), _layer(0, None, kernel=k)])
     (kw,) = built
     assert (kw["activation"], kw["swiglu_limit"], kw["fmt"]) == ("swiglustep", [None, 4.0], "nvfp4")
-
-
-def test_engine_cpu_assisted_decode_checks_every_layer(monkeypatch):
-    """A first layer the split serves no longer decides for a later one it cannot serve."""
-    from freetoken.layers.quantization.moe.nvfp4 import TritonNvfp4MoEKernel
-
-    k = TritonNvfp4MoEKernel()
-    layers = [_layer(0, None, "silu", k), _layer(1, 7.0, "swigluoai", k)]
-    cache, built, log = _decode(monkeypatch, layers)
-    assert not built and not hasattr(cache, "cpu_decode")
-    assert any("--moe-decode-fetch ignored" in m and "disagree" in m for m in log.lines), log.lines
-
-
-def test_engine_cpu_executor_refuses_mixed_activations():
-    import freetoken.engine.engine as eng
-
-    with pytest.raises(NotImplementedError, match="disagree"):
-        eng.Engine._init_cpu_moe_executor(SimpleNamespace(), SimpleNamespace(), SimpleNamespace(),
-                                          [_layer(0, None, "silu"), _layer(1, 4.0)])
 
 
 def test_marlin_and_b12x_refuse_swiglustep(monkeypatch):

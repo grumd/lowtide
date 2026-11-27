@@ -19,6 +19,7 @@ import os
 import threading
 import time
 import weakref
+from collections.abc import Sequence
 
 import torch
 
@@ -176,7 +177,7 @@ class CpuMoeExecutor:
         activation_dtype: torch.dtype = torch.bfloat16,
         graph_enabled: bool = True,
         swiglu_alpha: float = 1.702,
-        swiglu_limit: float | None | list[float | None] = None,
+        swiglu_limit: float | None | Sequence[float | None] = None,
         layer_formats: list[tuple[str, dict[str, int]]] | None = None,
         fmt: str | None = None,
         cpus: list[int] | None = None,
@@ -190,9 +191,9 @@ class CpuMoeExecutor:
         the first is the coordinator's, which with ``coordinator_joins`` also computes. ``out_fp32``
         returns the expert sum unrounded (fp32 ``y``). ``w4a8``: nvfp4 GEMVs on int8 activations
         (VNNI) instead of fp32 ones, lossy. ``w4a16_down_k_off``: w4a16 only, the offset of this
-        rank's down band inside its first quantization group (0 without TP). ``swiglu_limit`` may be
-        a list with one limit per layer (by bank layer id; None: no clamp) for experts whose clamp
-        differs between layers."""
+        rank's down band inside its first quantization group (0 without TP). ``swiglu_limit``: the
+        clamp limit of every layer (by bank layer id; None: no clamp), or one value for all of them;
+        the extension always gets one limit per layer."""
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
 
@@ -240,13 +241,9 @@ class CpuMoeExecutor:
                 )
 
         self.num_layers = int(cache.num_layers)
-        per_layer = {}
-        if isinstance(swiglu_limit, (list, tuple)):
-            if len(swiglu_limit) != self.num_layers:
-                raise ValueError(f"CPU MoE: {len(swiglu_limit)} clamp limits for {self.num_layers} layers")
-            # an older extension has no layer_limits argument and fails here instead of clamping wrong
-            per_layer = {"layer_limits": [float("inf") if v is None else float(v) for v in swiglu_limit]}
-            swiglu_limit = None
+        limits = list(swiglu_limit) if isinstance(swiglu_limit, (list, tuple)) else [swiglu_limit] * self.num_layers
+        if len(limits) != self.num_layers:
+            raise ValueError(f"CPU MoE: {len(limits)} clamp limits for {self.num_layers} layers")
         bank_layers, self.num_experts = cache.bank_sources, int(cache.num_experts)
         if getattr(cache, "pooled", False):
             # every layer reads the one host pool, and routes carry pool rows (OffloadMoeCache.cpu_banks)
@@ -346,14 +343,13 @@ class CpuMoeExecutor:
             formats=formats,
             layer_formats=[specs.index(k) for k in keys],
             swiglu_alpha=float(swiglu_alpha),
-            swiglu_limit=float(swiglu_limit) if swiglu_limit is not None else float("inf"),
+            swiglu_limits=[float("inf") if v is None else float(v) for v in limits],
             core_ids=core_ids,
             x_ptr=self._io["x"].data_ptr(),
             ids_ptr=self._io["ids"].data_ptr(),
             w_ptr=self._io["w"].data_ptr(),
             y_ptr=self._io["y"].data_ptr(),
             y_fp32=self.out_fp32,
-            **per_layer,
         )
         self.num_threads = nthreads
         self.core_ids = core_ids
