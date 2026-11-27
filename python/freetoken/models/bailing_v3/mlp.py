@@ -24,10 +24,10 @@ class BailingV3MLP(BaseOP):
         self.limit = limit
 
     @nvtx_annotate("MLP")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, reduce: bool = True) -> torch.Tensor:
         gate_up = self.gate_up_proj.forward(x)
         gated = silu_and_mul(gate_up) if self.limit is None else swiglustep_and_mul(gate_up, limit=self.limit)
-        return self.down_proj.forward(gated)
+        return self.down_proj.forward(gated, reduce=reduce)
 
 
 __all__ = ["BailingV3MLP"]

@@ -124,6 +124,7 @@ class MoELayer(BaseOP):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         reduce: bool = True,
+        during_copy: Callable[[], None] | None = None,
     ) -> torch.Tensor:
         """Expert compute for an externally computed routing decision (``TopK``).
 
@@ -138,6 +139,8 @@ class MoELayer(BaseOP):
         ``hidden_states`` may also be overwritten by the expert kernel. Compute
         shared branches that need the original input before calling this method.
         """
+        if during_copy is not None:
+            during_copy()
         out = self._resident_gemm(hidden_states, topk_weights, topk_ids)
         return self._maybe_all_reduce(out) if reduce else out
 
@@ -267,6 +270,7 @@ class OffloadMoELayer(MoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         reduce: bool = True,
+        during_copy: Callable[[], None] | None = None,
     ) -> torch.Tensor:
         """Expert compute for an externally computed routing decision (``TopK``).
 
@@ -276,13 +280,16 @@ class OffloadMoELayer(MoELayer):
         rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
 
         ``hidden_states`` may also be overwritten by the expert kernel. Compute
-        shared branches that need the original input before calling this method.
+        shared branches that need the original input before calling this method, or
+        pass them as ``during_copy`` (see ``forward``).
         """
         ctx = get_global_ctx()
         if ctx.batch.is_prefill and not self._fetch_routed_only(hidden_states):
+            if during_copy is not None:
+                during_copy()
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
-            out = self._decode_routed(hidden_states, topk_weights, topk_ids)
+            out = self._decode_routed(hidden_states, topk_weights, topk_ids, during_copy)
         return self._maybe_all_reduce(out) if reduce else out
 
     def decode_forward(

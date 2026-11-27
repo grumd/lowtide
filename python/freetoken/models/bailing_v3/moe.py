@@ -22,6 +22,10 @@ from .mlp import BailingV3MLP
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
+# Token rows up to which the shared expert runs while the routed experts' copy is in flight (a decode
+# step or a speculative verify window).
+_OVERLAP_ROWS = 8
+
 
 class _Router(BaseOP):
     """``mlp.gate``: the bf16 router weight and its fp32 selection bias (checkpoint names)."""
@@ -68,10 +72,19 @@ class BailingV3SparseBlock(BaseOP):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         topk_weights, topk_ids = self.route(hidden_states)
-        # the routed kernels may overwrite hidden_states; the shared expert reads it first
-        shared = self.shared_experts.forward(hidden_states) if self.shared_experts is not None else None
-        out = self.experts.routed_forward(hidden_states, topk_weights, topk_ids)
-        return out if shared is None else out + shared
+        if self.shared_experts is None:
+            return self.experts.routed_forward(hidden_states, topk_weights, topk_ids)
+        # the routed kernels may overwrite hidden_states: the shared expert reads it before them, while the
+        # routed experts' copy is in flight on a decode-sized batch; one TP all-reduce for both
+        shared = []
+        overlap = hidden_states.shape[0] <= _OVERLAP_ROWS and hidden_states.is_cuda and self.experts.overlaps_decode_copy()
+        run_shared = lambda: shared.append(self.shared_experts.forward(hidden_states, reduce=False))  # noqa: E731
+        if not overlap:
+            run_shared()
+        out = self.experts.routed_forward(
+            hidden_states, topk_weights, topk_ids, reduce=False, during_copy=run_shared if overlap else None,
+        )
+        return self.experts._maybe_all_reduce(out + shared[0])
 
 
 __all__ = ["BailingV3SparseBlock"]
