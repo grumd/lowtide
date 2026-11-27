@@ -819,7 +819,7 @@ class NgramSpecManager:
 
         dv = getattr(eng, "draft_vocab", None)
         if dv is not None and reply:
-            dv.observe([m.next_token for m in reply])
+            dv.observe([t for m in reply for t in m.next_tokens])
         if reply:
             used, total = sched._kv_usage_pages()
             mamba_used, mamba_total = sched._mamba_slot_usage() or (0, 0)
